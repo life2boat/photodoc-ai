@@ -1,12 +1,12 @@
 import React, { useState } from 'react';
-import { Camera, Printer, Wand2, Image as ImageIcon, MessageSquare, Star, ShieldCheck, Clock } from 'lucide-react';
+import { Camera, Printer, Wand2, Image as ImageIcon, Star, ShieldCheck, Clock } from 'lucide-react';
 
 // Импортируем все рабочие виджеты
 import { PhotoDocWidget } from './components/PhotoDocWidget';
 import { PhotoPrintForm } from './components/PhotoPrintForm';
 // import { RestoreWidget } from './components/RestoreWidget'; // Временно отключено
 import PolaroidWidget from './components/PolaroidWidget';
-import AssistantWidget from './components/AssistantWidget';
+import ServiceCalculator from './components/ServiceCalculator'; // Добавлен наш новый калькулятор
 
 export default function App() {
   const [activeService, setActiveService] = useState('docs');
@@ -119,8 +119,12 @@ export default function App() {
         </div>
       </section>
 
-      {/* Интерактивный AI чат-виджет */}
-      <AssistantWidget />
+      {/* Секция Калькулятора */}
+      <section className="py-16 px-4 bg-gray-900/30">
+        <div className="max-w-6xl mx-auto">
+          <ServiceCalculator />
+        </div>
+      </section>
 
       {/* Подвал (Footer) */}
       <footer className="py-12 border-t border-gray-800">
