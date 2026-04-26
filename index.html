@@ -1,0 +1,474 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="icon" href="data:;base64,iVBORw0KGgo=">
+    <title>Фото на документы, печать фото и реставрация — Барнаул | PhotoDoc AI</title>
+    <meta name="description" content="Профессиональная печать фотографий, срочное фото на документы и реставрация старых снимков в Барнауле. Быстрый онлайн-заказ.">
+    <link rel="stylesheet" href="style.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        /* Стили для секции "Наши услуги" */
+        .services-section {
+            background-color: #222; /* Темный фон секции */
+            color: #fff; /* Светлый текст */
+            padding: 60px 0; /* Вертикальные отступы */
+        }
+
+        .services-section .container {
+            max-width: 1200px; /* Максимальная ширина контейнера */
+            margin: 0 auto; /* Центрирование контейнера */
+            padding: 0 20px; /* Горизонтальные отступы */
+        }
+
+        .section-title { /* Обновлено: теперь используется .section-title */
+            text-align: center; /* Заголовок по центру */
+            font-size: 2.5em; /* Размер заголовка */
+            margin-bottom: 40px; /* Отступ снизу */
+            color: #fff; /* Цвет заголовка */
+        }
+
+        .services-grid {
+            display: grid; /* Использование CSS Grid */
+            /* Автоматическое размещение колонок, минимум 280px, максимум 1fr */
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 30px; /* Отступы между карточками */
+            justify-content: center; /* Центрирование карточек */
+        }
+
+        .service-card {
+            background-color: #333; /* Более светлый темный фон для карточек */
+            border: 2px solid #555; /* Начальный цвет рамки */
+            border-radius: 8px; /* Скругленные углы */
+            padding: 30px;
+            text-align: center;
+            transition: transform 0.3s ease, border-color 0.3s ease; /* Плавный переход для эффектов наведения */
+            cursor: pointer; /* Курсор-указатель */
+        }
+
+        .service-card:hover {
+            transform: scale(1.05); /* Увеличение при наведении */
+            border-color: #FFD700; /* Желтая рамка при наведении */
+        }
+
+        .service-card .service-title { /* Обновлено: теперь используется .service-title */
+            font-size: 1.5em;
+            margin-bottom: 15px;
+            color: #FFD700; /* Желтый цвет для заголовков карточек */
+        }
+
+        .service-card .service-desc { /* Обновлено: теперь используется .service-desc */
+            font-size: 1em;
+            line-height: 1.6;
+            color: #ccc; /* Светло-серый цвет для текста */
+            margin-bottom: 20px; /* Добавлен отступ снизу для ссылки */
+        }
+
+        /* Стили для иконок услуг (уже были в style.css, но для наглядности) */
+        /*
+        .service-icon {
+            width: 60px;
+            height: 60px;
+            background-color: var(--accent-yellow);
+            border-radius: 50%;
+            margin: 0 auto 20px auto;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 2em;
+            color: #222;
+        }
+        */
+
+        /* Новые стили для ссылок "Узнать детали" */
+        .service-link {
+            display: inline-block;
+            color: var(--accent-yellow);
+            text-decoration: none;
+            font-weight: 600;
+            font-size: 0.95em;
+            transition: color 0.2s ease, transform 0.2s ease;
+        }
+
+        .service-link:hover {
+            color: var(--accent-hover);
+            transform: translateX(5px); /* Небольшой сдвиг вправо при наведении */
+        }
+
+        /* Стили для секции "Заказать фотопечать" */
+        .order-form-section {
+            background-color: #1a1a1a; /* Еще темнее фон для контраста */
+            color: #fff;
+            padding: 80px 0;
+        }
+
+        .order-form-title {
+            text-align: center;
+            font-size: 2.8em;
+            margin-bottom: 50px;
+            color: #FFD700; /* Желтый заголовок */
+        }
+
+        .order-form {
+            max-width: 700px;
+            margin: 0 auto;
+            background-color: #222; /* Фон формы */
+            padding: 40px;
+            border-radius: 10px;
+            box-shadow: 0 5px 15px rgba(0, 0, 0, 0.3);
+        }
+
+        .form-group {
+            margin-bottom: 25px;
+        }
+
+        .form-group label {
+            display: block;
+            margin-bottom: 10px;
+            font-size: 1.1em;
+            color: #eee;
+        }
+
+        .form-group input[type="text"],
+        .form-group input[type="tel"],
+        .form-group select {
+            width: 100%;
+            padding: 12px 15px;
+            border: 1px solid #444;
+            border-radius: 6px;
+            background-color: #333;
+            color: #fff;
+            font-size: 1em;
+            box-sizing: border-box; /* Учитываем padding и border в ширине */
+            transition: border-color 0.3s ease, box-shadow 0.3s ease;
+        }
+
+        .form-group input[type="text"]:focus,
+        .form-group input[type="tel"]:focus,
+        .form-group select:focus {
+            border-color: #FFD700;
+            outline: none;
+            box-shadow: 0 0 0 3px rgba(255, 215, 0, 0.3);
+        }
+
+        .form-group small {
+            display: block;
+            margin-top: 5px;
+            color: #aaa;
+            font-size: 0.9em;
+        }
+
+        /* Drop Zone */
+        .drop-zone {
+            border: 2px dashed #FFD700; /* Желтая пунктирная рамка */
+            border-radius: 8px;
+            padding: 40px 20px;
+            text-align: center;
+            cursor: pointer;
+            transition: background-color 0.3s ease, border-color 0.3s ease;
+            background-color: #2a2a2a;
+            position: relative; /* Для позиционирования fileList */
+        }
+
+        .drop-zone:hover {
+            background-color: #3a3a3a;
+            border-color: #fff;
+        }
+
+        .drop-zone p {
+            margin: 0;
+            font-size: 1.1em;
+            color: #ccc;
+        }
+
+        .drop-zone .browse-files {
+            color: #FFD700;
+            font-weight: bold;
+            text-decoration: underline;
+        }
+
+        .file-list {
+            margin-top: 20px;
+            text-align: left;
+            font-size: 0.9em;
+            color: #aaa;
+        }
+
+        /* Paper Options */
+        .paper-options {
+            display: flex;
+            gap: 15px;
+            margin-top: 10px;
+        }
+
+        .paper-options input[type="radio"] {
+            display: none; /* Скрываем стандартные радио-кнопки */
+        }
+
+        .paper-option-label {
+            flex: 1; /* Распределяем пространство равномерно */
+            background-color: #333;
+            color: #eee;
+            padding: 12px 20px;
+            border: 2px solid #555;
+            border-radius: 6px;
+            cursor: pointer;
+            transition: background-color 0.3s ease, border-color 0.3s ease, color 0.3s ease;
+            text-align: center;
+            font-weight: 500;
+        }
+
+        .paper-options input[type="radio"]:checked + .paper-option-label {
+            background-color: #FFD700; /* Желтый фон при выборе */
+            border-color: #FFD700;
+            color: #222; /* Темный текст на желтом фоне */
+        }
+
+        .paper-option-label:hover {
+            background-color: #444;
+            border-color: #FFD700;
+        }
+
+        /* Submit Button */
+        .btn-submit {
+            display: block;
+            width: 100%;
+            padding: 15px 25px;
+            background-color: #FFD700; /* Желтая кнопка */
+            color: #222; /* Темный текст */
+            border: none;
+            border-radius: 8px;
+            font-size: 1.2em;
+            font-weight: bold;
+            cursor: pointer;
+            transition: background-color 0.3s ease, transform 0.2s ease;
+            margin-top: 30px;
+        }
+
+        .btn-submit:hover {
+            background-color: #e6c200; /* Чуть темнее желтый при наведении */
+            transform: translateY(-2px); /* Небольшой подъем */
+        }
+
+        /* Responsive adjustments for form */
+        @media (max-width: 768px) {
+            .order-form {
+                padding: 30px;
+            }
+            .order-form-title {
+                font-size: 2.2em;
+            }
+            .paper-options {
+                flex-direction: column; /* Столбец на маленьких экранах */
+            }
+            .paper-option-label {
+                flex: none; /* Отключаем flex-grow */
+            }
+        }
+    </style>
+</head>
+<body>
+
+    <header class="main-header">
+        <div class="container">
+            <a href="#" class="logo">PhotoDoc <span class="accent-text">AI</span></a>
+            <nav class="main-nav">
+                <ul>
+                    <li><a href="#services">Услуги</a></li>
+                    <li><a href="#order">Печать</a></li>
+                    <li><a href="#restore">Реставрация</a></li>
+                    <li><a href="#contacts">Контакты</a></li>
+                </ul>
+            </nav>
+            <button class="burger-menu" aria-label="Открыть меню"><span class="burger-line"></span><span class="burger-line"></span><span class="burger-line"></span></button>
+            <div class="header-cta">
+                <a href="tel:+79998887766" class="phone-link">+7 (999) 888-77-66</a>
+            </div>
+        </div>
+    </header>
+
+    <main>
+        <section class="hero-section">
+            <div class="container hero-container">
+                <div class="hero-content">
+                    <h1 class="hero-title">Фото на документы за 5 минут.</h1>
+                    <p class="hero-subtitle">В центре Барнаула. Также: онлайн-печать фото и профессиональная реставрация семейных архивов.</p>
+                    <div class="hero-buttons">
+                        <button onclick="document.getElementById('order').scrollIntoView({behavior: 'smooth'})" class="btn btn-primary">Заказать онлайн</button>
+                        <button onclick="document.getElementById('services').scrollIntoView({behavior: 'smooth'})" class="btn btn-secondary" style="background: transparent; border: 1px solid rgba(255,255,255,0.3); color: #fff;">Узнать больше →</button>
+                    </div>
+                </div>
+                <div class="hero-image-placeholder"></div>
+            </div>
+        </section>
+
+        <section id="services" class="services-section">
+            <div class="container">
+                <h2 class="section-title">Наши услуги</h2>
+                <div class="services-grid">
+                    <div class="service-card">
+                        <div class="service-icon">📸</div>
+                        <h3 class="service-title">Фото на документы</h3>
+                        <p class="service-desc">Сделаем за 5 минут по всем стандартам (паспорт, визы, справки). С легкой ретушью.</p>
+                        <a href="#order" class="service-link">Узнать детали →</a>
+                    </div>
+                    <div class="service-card">
+                        <div class="service-icon">🖨️</div>
+                        <h3 class="service-title">Печать фотографий</h3>
+                        <p class="service-desc">Любые форматы, качественная фотобумага. Загружайте прямо с телефона.</p>
+                        <a href="#order" class="service-link">Заказать онлайн →</a>
+                    </div>
+                    <div class="service-card">
+                        <div class="service-icon">✨</div>
+                        <h3 class="service-title">Реставрация</h3>
+                        <p class="service-desc">Вернем жизнь старым снимкам: уберем трещины, заломы и бережно восстановим цвет.</p>
+                        <a href="#restore" class="service-link">Посмотреть до/после →</a>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <section id="restore" class="restore-section">
+            <div class="container">
+                <h2 class="section-title">Магия реставрации</h2>
+                <p class="slider-hint">Потяните ползунок, чтобы увидеть результат работы</p>
+                
+                <div class="before-after-wrapper">
+                    <div class="image-after">
+                        <img src="https://images.unsplash.com/photo-1544005313-94ddf0286df2?q=80&w=800&auto=format&fit=crop" alt="После">
+                    </div>
+                    
+                    <div class="image-before">
+                        <img src="https://images.unsplash.com/photo-1544005313-94ddf0286df2?q=80&w=800&auto=format&fit=crop" alt="До">
+                    </div>
+                    
+                    <input type="range" min="0" max="100" value="50" id="slider" class="ba-slider">
+                    
+                    <div class="slider-button"></div>
+                </div>
+            </div>
+        </section>
+
+        <section id="order" class="order-form-section">
+            <div class="container">
+                <h2 class="order-form-title">Заказать фотопечать</h2>
+                <div class="form-wrapper">
+                    <form id="uploadForm" class="order-form" name="photoOrderForm">
+                        <div class="form-tabs" role="tablist">
+                            <div class="form-tab active" data-type="print" role="tab" tabindex="0">📸 Печать фото</div>
+                            <div class="form-tab" data-type="document" role="tab" tabindex="0">🪪 На документы</div>
+                            <div class="form-tab" data-type="restoration" role="tab" tabindex="0">✨ Реставрация</div>
+                        </div>
+                        <input type="hidden" id="orderType" name="orderType" value="print">
+                    
+                        <div class="form-group">
+                            <label for="userName">Ваше имя:</label>
+                            <input type="text" id="userName" name="userName" placeholder="Иван" required>
+                        </div>
+                        <div class="form-group">
+                            <label for="phone">Телефон:</label>
+                            <input type="tel" id="phone" name="userPhone" placeholder="+7 (999) 888-77-66" pattern="\+7\s?\(?\d{3}\)?[\s\.\-]?\d{3}[\s\.\-]?\d{2}[\s\.\-]?\d{2}" required>
+                        </div>
+                    
+                        <div id="printFields" class="dynamic-block active">
+                            <div class="form-group">
+                                <label for="format">Формат печати:</label>
+                                <select id="format" name="format">
+                                    <option value="9x13">9x13 см</option>
+                                    <option value="10x15" selected>10x15 см (Стандарт)</option>
+                                    <option value="13x18">13x18 см</option>
+                                    <option value="15x21">15x21 см (А5)</option>
+                                    <option value="A4">A4 (21x29.7 см)</option>
+                                </select>
+                            </div>
+                            <div class="form-group">
+                                <label>Тип бумаги:</label>
+                                <div class="paper-options">
+                                    <input type="radio" id="matte" name="paperType" value="matte" checked>
+                                    <label for="matte" class="paper-option-label">Матовая</label>
+                                    <input type="radio" id="glossy" name="paperType" value="glossy">
+                                    <label for="glossy" class="paper-option-label">Глянцевая</label>
+                                </div>
+                            </div>
+
+                            <div class="form-group">
+                                <label>Режим кадрирования:</label>
+                                <div class="paper-options" style="flex-wrap: wrap;">
+                                    <input type="radio" id="cropFill" name="cropMode" value="fill" checked>
+                                    <label for="cropFill" class="paper-option-label" title="Фото заполнит всю бумагу. Часть изображения по краям обрежется.">Без полей</label>
+                                    
+                                    <input type="radio" id="cropFit" name="cropMode" value="fit">
+                                    <label for="cropFit" class="paper-option-label" title="Фото поместится целиком, но по краям останутся белые полосы.">С полями</label>
+                                    
+                                    <input type="radio" id="cropAuto" name="cropMode" value="auto">
+                                    <label for="cropAuto" class="paper-option-label" title="Мы сами выберем лучший вариант, чтобы не обрезать важные детали.">На усмотрение оператора</label>
+                                </div>
+                                <small>Без полей — фото заполнит лист (края обрежутся). С полями — фото целиком (белые рамки).</small>
+                            </div>
+                        </div>
+                    
+                        <div id="documentFields" class="dynamic-block" style="display: none;">
+                            <div class="form-group" style="grid-column: span 2;">
+                                <label for="documentFormat">Тип документа:</label>
+                                <select id="documentFormat" name="documentFormat">
+                                    <option value="passport">Паспорт РФ (35х45 мм)</option>
+                                    <option value="visa_schengen">Шенгенская виза (35х45 мм)</option>
+                                    <option value="3x4">Фото 3х4 см</option>
+                                    <option value="4x6">Фото 4х6 см</option>
+                                    <option value="9x12">Фото 9х12 см</option>
+                                </select>
+                            </div>
+                        </div>
+                    
+                        <div id="restorationFields" class="dynamic-block" style="display: none;">
+                            <div class="form-group" style="grid-column: span 2;">
+                                <label for="restorationComment">Пожелания к реставрации:</label>
+                                <textarea id="restorationComment" name="restorationComment" rows="3" placeholder="Например: сделать цветной..."></textarea>
+                            </div>
+                        </div>
+                    
+                        <div class="form-group" style="grid-column: span 2;">
+                            <label>Загрузите фотографии:</label>
+                            
+                            <div id="batchControls" class="batch-controls" style="display: none; margin-bottom: 15px; background: rgba(255,255,255,0.05); padding: 10px; border-radius: 8px;">
+                                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+                                    <span id="batchCounter" style="color: var(--accent-yellow); font-size: 0.9em;">Блок: 0 / 10</span>
+                                    <span id="totalCounter" style="color: #fff; font-weight: bold; font-size: 0.9em;">Всего к отправке: 0 / 100</span>
+                                </div>
+                                <button type="button" id="confirmBatchBtn" class="btn btn-secondary" style="width: 100%;">✅ Подтвердить эти фото и добавить еще</button>
+                            </div>
+                    
+                            <div class="drop-zone" id="dropZone">
+                                <p>Перетащите файлы сюда или <span class="highlight">выберите на компьютере</span></p>
+                                <input type="file" id="fileInput" multiple accept="image/jpeg, image/png, image/jpg" style="display: none;">
+                                <div id="previewGallery" class="preview-gallery"></div>
+                            </div>
+                        </div>
+                    
+                        <button type="submit" id="submitBtn" class="btn btn-primary" style="grid-column: span 2; width: 100%;">Отправить заявку</button>
+                    </form>
+                </div>
+            </div>
+        </section>
+    </main>
+<div id="toast-container"></div>
+<script src="script.js"></script>
+<div id="ai-chat-widget" class="chat-widget">
+    <div class="chat-header">
+        <div class="chat-title">✨ PhotoDoc AI Помощник</div>
+        <button id="close-chat" class="chat-close-btn">×</button>
+    </div>
+    <div id="chat-messages" class="chat-messages">
+        <div class="message ai-message">Привет! Я знаю все цены и форматы. О чем рассказать?</div>
+    </div>
+    <div class="chat-input-area">
+        <input type="text" id="chat-input" placeholder="Ваш вопрос..." autocomplete="off">
+        <button id="send-chat" class="chat-send-btn">➤</button>
+    </div>
+</div>
+<button id="open-chat-btn" class="open-chat-btn">💬</button>
+</body>
+</html>

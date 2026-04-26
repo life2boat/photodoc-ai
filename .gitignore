@@ -1,0 +1,16 @@
+photos/
+.env
+logs.txt
+venv/
+temp_uploads/
+backend/uploads/
+backend/weights/
+backend/gfpgan/weights/
+frontend/public/models/
+node_modules/
+venv/
+*.pth
+# Игнорируем веса нейросетей
+*.pth
+backend/gfpgan/
+backend/weights/

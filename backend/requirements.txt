@@ -1,0 +1,12 @@
+# FastAPI and server
+fastapi>=0.100.0
+uvicorn>=0.22.0
+python-multipart>=0.0.6
+
+# API Clients & Utilities
+httpx>=0.25.0
+openai>=1.3.0
+pydantic>=2.0.0
+pydantic-settings>=2.0.0
+sqlalchemy>=2.0.0
+jinja2>=3.1.2

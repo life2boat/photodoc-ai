@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Панель администратора - Заказы</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif; background: #f8fafc; margin: 0; padding: 32px; color: #333; }
+    h1 { margin-top: 0; margin-bottom: 24px; color: #1e293b; }
+    .card { background: #fff; border-radius: 12px; padding: 24px; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06); overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; white-space: nowrap; }
+    th, td { padding: 14px 16px; border-bottom: 1px solid #e2e8f0; text-align: left; font-size: 14px; }
+    th { background: #007bff; color: white; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; font-size: 13px; }
+    tr:hover { background-color: #f1f5f9; }
+    .status { display: inline-block; padding: 4px 12px; border-radius: 999px; background: #dbeafe; color: #1e40af; font-weight: 500; font-size: 13px; }
+    .comment-cell { white-space: normal; min-width: 250px; color: #475569; line-height: 1.5; }
+    .btn-download { display: inline-block; padding: 8px 16px; background: #10b981; color: white; text-decoration: none; border-radius: 6px; font-weight: 600; font-size: 13px; transition: all 0.2s; box-shadow: 0 1px 2px rgba(0,0,0,0.05); }
+    .btn-download:hover { background: #059669; transform: translateY(-1px); }
+    .btn-download:active { transform: translateY(0); }
+    .status-select {
+        padding: 6px 10px;
+        border-radius: 6px;
+        border: 1px solid #e2e8f0;
+        background: #fff;
+        font-size: 13px;
+        font-weight: 500;
+        cursor: pointer;
+        outline: none;
+    }
+    .status-new { background: #dbeafe; color: #1e40af; }
+    .status-processing { background: #fef3c7; color: #92400e; }
+    .status-done { background: #d1fae5; color: #065f46; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Список заказов</h1>
+    <table>
+      <thead>
+        <tr>
+          <th>ID</th>
+          <th>Дата создания</th>
+          <th>Клиент</th>
+          <th>Телефон</th>
+          <th>Детали заказа (Формат, Бумага, Цена)</th>
+          <th>Файлы (шт)</th>
+          <th>Статус</th>
+          <th>Действия</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for order in orders %}
+        <tr>
+          <td><strong>{{ order.id }}</strong></td>
+          <td>{{ order.created_at.strftime('%d.%m.%Y %H:%M') }}</td>
+          <td>{{ order.name }}</td>
+          <td>{{ order.phone }}</td>
+          <td class="comment-cell">{{ order.comment }}</td>
+          <td><strong>{{ order.files|length }}</strong></td>
+          <td>
+            <select class="status-select status-{{ order.status }}" onchange="updateStatus({{ order.id }}, this.value)">
+              <option value="new" {% if order.status == 'new' %}selected{% endif %}>Новый</option>
+              <option value="processing" {% if order.status == 'processing' %}selected{% endif %}>В работе</option>
+              <option value="done" {% if order.status == 'done' %}selected{% endif %}>Готов</option>
+            </select>
+          </td>
+          <td>
+            <a href="/admin/orders/{{ order.id }}/download" class="btn-download">Скачать ZIP</a>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <script>
+  async function updateStatus(orderId, newStatus) {
+      try {
+          const response = await fetch(`/admin/orders/${orderId}/status`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ status: newStatus })
+          });
+          if (response.ok) {
+              window.location.reload(); 
+          } else {
+              alert('Ошибка при обновлении статуса');
+          }
+      } catch (e) {
+          console.error(e);
+          alert('Ошибка сети');
+      }
+  }
+  </script>
+</body>
+</html>
