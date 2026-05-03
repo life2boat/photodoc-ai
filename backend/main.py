@@ -1,38 +1,25 @@
 import os
+import logging
+import sqlite3
+import httpx
+import smtplib
+import urllib.parse
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks, HTTPException
+from typing import List
+from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
+
+# Загрузка переменных окружения
 load_dotenv()
 
-import shutil
-import traceback
-import io
-import zipfile
-from pathlib import Path
-from datetime import datetime
-from typing import Literal
-from fastapi import FastAPI, Depends, UploadFile, File, Form, Request, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
-from fastapi.templating import Jinja2Templates
-from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy.orm import Session
-from sqlalchemy import desc
-from pydantic import BaseModel
-from openai import AsyncOpenAI
+# Настройка базового логирования
+logging.basicConfig(level=logging.INFO)
 
-from database import Base, engine, get_db
-from models import Order, OrderFile
+app = FastAPI()
 
-BASE_DIR = Path(__file__).resolve().parent
-UPLOAD_DIR = BASE_DIR / "uploads"
-UPLOAD_DIR.mkdir(exist_ok=True)
-
-# Инициализация ИИ-клиента
-ai_client = AsyncOpenAI(
-    api_key=os.getenv("VSEGPT_API_KEY"),
-    base_url=os.getenv("VSEGPT_BASE_URL")
-)
-
-app = FastAPI(title="PhotoDoc AI - Business Edition")
-
+# Настройка CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -41,155 +28,222 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
-Base.metadata.create_all(bind=engine)
+# --- Инициализация базы данных ---
+def init_db():
+    conn = sqlite3.connect("orders.db")
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT,
+            phone TEXT,
+            comment TEXT,
+            filename TEXT
+        )
+    ''')
+    conn.commit()
+    conn.close()
 
-class StatusUpdate(BaseModel):
-    status: str
+init_db()
 
-class ChatMessage(BaseModel):
-    role: Literal["user", "assistant", "system"]
-    content: str
+# Создаем папку для локальных загрузок
+UPLOAD_DIR = "uploads"
+os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-class ChatRequest(BaseModel):
-    messages: list[ChatMessage]
+# --- Фоновая задача 1: Отправка Email ---
+def send_order_email(order_id: int, name: str, phone: str, comment: str, format: str = "Не указан", paper: str = "Не указана", crop: str = "Не указано"):
+    smtp_server = os.getenv("SMTP_SERVER")
+    smtp_port = int(os.getenv("SMTP_PORT", 465))
+    smtp_user = os.getenv("SMTP_USER")
+    smtp_password = os.getenv("SMTP_PASSWORD")
+    email_to = os.getenv("EMAIL_TO")
 
-class ChatResponse(BaseModel):
-    reply: str
+    if not all([smtp_server, smtp_user, smtp_password, email_to]):
+        logging.error("Не все настройки SMTP заданы в .env")
+        return
 
-# --- ИИ-КОНСУЛЬТАНТ (Чат) ---
-@app.post("/api/chat", response_model=ChatResponse)
-async def chat_endpoint(payload: ChatRequest):
+    msg = MIMEMultipart()
+    msg["From"] = smtp_user
+    msg["To"] = email_to
+    msg["Subject"] = f"Новый заказ #{order_id} | PhotoDoc AI"
+    
+    safe_folder_name = f"Заказ_{order_id}_{name.replace(' ', '_')}"
+    raw_path = f"PhotoDoc_Orders/{safe_folder_name}"
+    safe_url_path = urllib.parse.quote(raw_path)
+    yandex_disk_link = f"https://disk.yandex.ru/client/disk/{safe_url_path}"
+    
+    body = f"Новый заказ!\nНомер: {order_id}\nИмя: {name}\nТелефон: {phone}\nФормат: {format}\nБумага: {paper}\nКадрирование: {crop}\nКомментарий: {comment}\n\nСсылка на Яндекс.Диск: {yandex_disk_link}"
+    msg.attach(MIMEText(body, "plain"))
+
     try:
-        if not payload.messages:
-            return JSONResponse(
-                status_code=400,
-                content={"reply": "История сообщений пуста."}
-            )
-
-        # 1. Системный промпт с зашитыми бизнес-правилами
-        system_message = {
-            "role": "system",
-            "content": (
-                "Ты вежливый виртуальный консультант фотостудии PhotoDoc. "
-                "Твоя цель — помогать клиентам и направлять их к оформлению заказа. "
-                "Актуальные цены: Любое фото на документы (3х4, 3.5х4.5, 4х6, 9х12) стоит ровно 300 рублей. "
-                "Печать фото: 10х15 - 20 руб, А4 - 70 руб. Реставрация фото рассчитывается индивидуально. "
-                "Отвечай кратко, приветливо и только по делу."
-            )
-        }
-
-        # 2. Формируем итоговый список сообщений: система + история от клиента
-        api_messages = [system_message] + [{"role": msg.role, "content": msg.content} for msg in payload.messages]
-
-        # 3. Асинхронный запрос к нейросети
-        response = await ai_client.chat.completions.create(
-            model="openai/gpt-4o-mini",  # Базовая, быстрая модель VSEGPT
-            messages=api_messages,
-            max_tokens=300,
-            temperature=0.7
-        )
-        
-        # 4. Извлекаем текст ответа и возвращаем строго по контракту
-        reply_text = response.choices[0].message.content
-        return ChatResponse(reply=reply_text)
-
+        with smtplib.SMTP_SSL(smtp_server, smtp_port) as server:
+            server.login(smtp_user, smtp_password)
+            server.send_message(msg)
+        logging.info(f"Email для заказа {order_id} успешно отправлен.")
     except Exception as e:
-        # Логируем детальную ошибку в терминал сервера для администратора
-        print("!!! ОШИБКА ИНТЕГРАЦИИ VSEGPT !!!")
-        traceback.print_exc()
-        
-        # Возвращаем безопасный JSON с текстом ошибки для отображения в UI фронтенда
-        return JSONResponse(
-            status_code=500, 
-            content={"reply": "Простите, у меня возникли временные неполадки. Пожалуйста, оформите заказ напрямую через форму!"}
-        )
+        logging.error(f"Ошибка при отправке Email: {e}")
 
-# --- ПРИЕМ ЗАКАЗОВ (Печать, Документы, Реставрация, Полароид) ---
+# --- Вспомогательная функция для Яндекс.Диска ---
+def ensure_yandex_folder(token: str, path: str):
+    import httpx
+    headers = {"Authorization": f"OAuth {token}"}
+    parts = [p for p in path.strip("/").split("/") if p]
+    current_path = ""
+    for part in parts:
+        current_path = f"{current_path}/{part}" if current_path else part
+        try:
+            httpx.put(
+                "https://cloud-api.yandex.net/v1/disk/resources",
+                headers=headers,
+                params={"path": current_path},
+                timeout=10
+            )
+        except Exception:
+            pass # Игнорируем ошибки (например, 409 если папка уже есть)
+
+# --- Фоновая задача 2: Загрузка на Яндекс.Диск ---
+def upload_to_yandex_disk(local_file_path: str, remote_folder_path: str, remote_file_name: str):
+    import os, logging
+    import httpx
+
+    token = os.getenv("YANDEX_DISK_TOKEN")
+    if not token:
+        logging.error("YANDEX_DISK_TOKEN не задан в .env")
+        return
+
+    ensure_yandex_folder(token, remote_folder_path)
+
+    headers = {"Authorization": f"OAuth {token}"}
+    remote_path = f"{remote_folder_path}/{remote_file_name}"
+
+    try:
+        # Шаг 1: получаем URL для загрузки
+        # Примечание: API Яндекса требует, чтобы родительская папка существовала.
+        # Если папки PhotoDoc_Orders нет, сервер может вернуть ошибку 409. 
+        # В таком случае просто создай её один раз руками в вебе Я.Диска.
+        upload_url_response = httpx.get(
+            "https://cloud-api.yandex.net/v1/disk/resources/upload",
+            headers=headers,
+            params={"path": remote_path, "overwrite": "true"},
+            timeout=30
+        )
+        upload_url_response.raise_for_status()
+        href = upload_url_response.json().get("href")
+
+        if not href:
+            logging.error(f"Яндекс.Диск не вернул href: {upload_url_response.text}")
+            return
+
+        # Шаг 2: загружаем файл по полученному URL
+        with open(local_file_path, "rb") as f:
+            put_response = httpx.put(href, content=f.read(), timeout=60)
+            put_response.raise_for_status()
+
+        logging.info(f"Файл {remote_file_name} успешно загружен на Яндекс.Диск в папку PhotoDoc_Orders/")
+
+    except httpx.HTTPStatusError as e:
+        logging.error(f"Ошибка HTTP при загрузке на Яндекс.Диск: {e.response.status_code} — {e.response.text}")
+    except Exception as e:
+        logging.error(f"Неизвестная ошибка при загрузке на Яндекс.Диск: {e}")
+
+# --- Фоновая задача 3: Загрузка инфо-файла на Яндекс.Диск ---
+def upload_info_to_yandex_disk(order_id: int, name: str, phone: str, format: str, paper: str, crop: str, comment: str, remote_folder_path: str):
+    import os, logging
+    import httpx
+
+    token = os.getenv("YANDEX_DISK_TOKEN")
+    if not token:
+        return
+
+    ensure_yandex_folder(token, remote_folder_path)
+
+    order_info_text = f"""Заказ №: {order_id}
+Имя: {name}
+Телефон: {phone}
+Формат: {format}
+Бумага: {paper}
+Кадрирование: {crop}
+Комментарий: {comment}"""
+
+    headers = {"Authorization": f"OAuth {token}"}
+    info_file_path = f"{remote_folder_path}/info.txt"
+
+    try:
+        res = httpx.get(
+            "https://cloud-api.yandex.net/v1/disk/resources/upload",
+            headers=headers,
+            params={"path": info_file_path, "overwrite": "true"},
+            timeout=30
+        )
+        if res.status_code == 200:
+            upload_url = res.json().get("href")
+            if upload_url:
+                httpx.put(upload_url, content=order_info_text.encode('utf-8'), timeout=30)
+                logging.info(f"Файл info.txt успешно загружен на Яндекс.Диск (Заказ {order_id})")
+        else:
+            logging.error(f"Яндекс.Диск вернул ошибку при получении ссылки для info.txt: {res.text}")
+    except Exception as e:
+        logging.error(f"Ошибка при загрузке info.txt на Яндекс.Диск: {e}")
+
+# --- Эндпоинт приема заказа ---
 @app.post("/api/order")
 async def create_order(
+    background_tasks: BackgroundTasks,
     name: str = Form(...),
     phone: str = Form(...),
-    comment: str = Form(None),
-    files: list[UploadFile] = File(default=[]),
-    db: Session = Depends(get_db),
+    comment: str = Form(""),
+    format: str = Form("Не указан"),
+    paper: str = Form("Не указана"),
+    crop: str = Form("Не указано"),
+    files: List[UploadFile] = File(...)
 ):
-    order = Order(
-        name=name,
-        phone=phone,
-        comment=comment,
-        source="web_site",
-        status="new",
-        created_at=datetime.utcnow()
-    )
-    db.add(order)
-    db.commit()
-    db.refresh(order)
-    
-    order_dir = UPLOAD_DIR / str(order.id)
-    order_dir.mkdir(parents=True, exist_ok=True)
-    
-    for f in files:
-        file_path = order_dir / f.filename
-        with file_path.open("wb") as buffer:
-            shutil.copyfileobj(f.file, buffer)
+    try:
+        # 1. Сохраняем данные в SQLite для получения номера заказа
+        filenames = ", ".join([f.filename for f in files])
+        conn = sqlite3.connect("orders.db")
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO orders (name, phone, comment, filename) VALUES (?, ?, ?, ?)",
+            (name, phone, comment, filenames)
+        )
+        conn.commit()
+        order_id = cursor.lastrowid
+        conn.close()
+
+        # 2. Формируем имена для локального сохранения и облака
+        safe_name = name.replace(" ", "_")
+        safe_settings = f"{format}_{paper}_{crop}".replace(" ", "_")
+        remote_folder_path = f"PhotoDoc_Orders/Заказ_{order_id}_{safe_name}/{safe_settings}"
+
+        for file in files:
+            safe_filename = file.filename.replace(" ", "_")
+            local_filename = f"{order_id}_{safe_filename}"
+            local_file_path = os.path.join(UPLOAD_DIR, local_filename)
             
-        db_file = OrderFile(
-            order_id=order.id,
-            filename=f.filename,
-            path=str(file_path),
-            mime_type=f.content_type
-        )
-        db.add(db_file)
-    
-    db.commit()
-    return {"ok": True, "order_id": order.id}
+            # 3. Сохраняем физический файл на жесткий диск
+            with open(local_file_path, "wb") as f:
+                content = await file.read()
+                f.write(content)
 
-# --- АДМИН-ПАНЕЛЬ ---
-@app.get("/admin", response_class=HTMLResponse)
-def admin_panel(request: Request, db: Session = Depends(get_db)):
-    orders = db.query(Order).order_by(desc(Order.created_at)).all()
-    return templates.TemplateResponse(
-        request=request, 
-        name="admin.html", 
-        context={"request": request, "orders": orders}
-    )
+            # 4. Формируем имя файла для Яндекс.Диска
+            remote_file_name = f"{order_id}_{safe_filename}"
 
-@app.get("/admin/orders/{order_id}/download")
-def download_zip(order_id: int, db: Session = Depends(get_db)):
-    order = db.query(Order).filter(Order.id == order_id).first()
-    if not order:
-        raise HTTPException(status_code=404, detail="Заказ не найден")
+            # 5. Передаем работу в фоновые задачи (для каждого файла)
+            background_tasks.add_task(upload_to_yandex_disk, local_file_path, remote_folder_path, remote_file_name)
+            
+        # Фоновая задача для Email выполняется один раз на весь заказ
+        background_tasks.add_task(send_order_email, order_id, name, phone, comment, format, paper, crop)
 
-    zip_buffer = io.BytesIO()
-    with zipfile.ZipFile(zip_buffer, "w") as zip_file:
-        for f in order.files:
-            p = Path(f.path)
-            if p.exists():
-                zip_file.write(p, arcname=f.filename)
-        
-        order_info_text = (
-            f"=== ИНФОРМАЦИЯ О ЗАКАЗЕ №{order.id} ===\n"
-            f"Дата: {order.created_at.strftime('%Y-%m-%d %H:%M')}\n"
-            f"Клиент: {order.name}\n"
-            f"Телефон: {order.phone}\n"
-            f"Детали:\n{order.comment}\n"
-            f"===================================\n"
-        )
-        zip_file.writestr("order_info.txt", order_info_text.encode('utf-8'))
-    
-    zip_buffer.seek(0)
-    return StreamingResponse(
-        zip_buffer, 
-        media_type="application/x-zip-compressed", 
-        headers={"Content-Disposition": f"attachment; filename=Order_{order_id}.zip"}
-    )
+        # Фоновая задача для текстового файла с деталями заказа
+        background_tasks.add_task(upload_info_to_yandex_disk, order_id, name, phone, format, paper, crop, comment, remote_folder_path)
 
-@app.post("/admin/orders/{order_id}/status")
-def update_status(order_id: int, data: StatusUpdate, db: Session = Depends(get_db)):
-    order = db.query(Order).filter(Order.id == order_id).first()
-    if order:
-        order.status = data.status
-        db.commit()
-        return {"ok": True}
-    raise HTTPException(status_code=404, detail="Order not found")
+        # 6. Моментально отвечаем фронтенду
+        return {
+            "ok": True, 
+            "message": "Заказ успешно создан", 
+            "order_id": order_id
+        }
+
+    except Exception as e:
+        logging.error(f"Критическая ошибка при создании заказа: {e}")
+        raise HTTPException(status_code=500, detail="Внутренняя ошибка сервера")

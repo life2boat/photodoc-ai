@@ -46,7 +46,7 @@ const PhotoPreview = ({ photo, onRemove }) => {
   );
 };
 
-export function PhotoPrintForm() {
+export function PhotoPrintForm({ onSuccess, onReset }) {
   const [photos, setPhotos] = useState([]);
   const [format, setFormat] = useState('10x15');
   const [paperType, setPaperType] = useState('matte');
@@ -56,6 +56,7 @@ export function PhotoPrintForm() {
   const [successMessage, setSuccessMessage] = useState(null);
   const [userName, setUserName] = useState('');
   const [userPhone, setUserPhone] = useState('');
+  const [orderId, setOrderId] = useState(null);
 
   const fileInputRef = useRef(null);
 
@@ -91,6 +92,7 @@ export function PhotoPrintForm() {
 
   const handleSubmit = async (e) => {
     e.preventDefault();
+    e.stopPropagation(); // Отключаем всплытие эвента к родительским формам
     if (photos.length === 0 || !isConfirmed) return;
 
     setIsLoading(true);
@@ -104,20 +106,27 @@ export function PhotoPrintForm() {
     const orderDetails = `Формат: ${formatMap[format]} | Бумага: ${paperMap[paperType]} | Кадрирование: ${cropMap[cropMode]} | Сумма: ${totalPrice} руб.`;
     formData.append('comment', orderDetails);
 
+    formData.append('format', formatMap[format]);
+    formData.append('paper', paperMap[paperType]);
+    formData.append('crop', cropMap[cropMode]);
+
     // Добавляем файлы
     photos.forEach(file => {
       formData.append('files', file);
     });
 
     try {
-      const response = await fetch('http://localhost:8000/api/orders', {
+      const response = await fetch('http://localhost:8000/api/order', {
         method: 'POST',
         // Заголовок Content-Type браузер подставит сам!
         body: formData,
       });
 
       if (response.ok) {
-        setSuccessMessage('Заказ успешно оформлен!');
+        const data = await response.json();
+        setOrderId(data.order_id);
+        setSuccessMessage('Заказ сформирован!');
+        if (onSuccess) onSuccess();
         setPhotos([]);
         setFormat('10x15');
         setPaperType('matte');
@@ -142,11 +151,16 @@ export function PhotoPrintForm() {
     return (
       <div className="bg-green-50 border border-green-200 text-green-800 rounded-xl p-8 text-center space-y-4">
         <CheckCircle className="w-16 h-16 mx-auto text-green-500" />
-        <h2 className="text-2xl font-bold">Спасибо!</h2>
-        <p className="text-green-700">{successMessage}</p>
-        <button onClick={() => setSuccessMessage(null)} className="mt-4 px-6 py-2 bg-green-600 text-white rounded-full hover:bg-green-700 transition-colors">
-          Оформить новый заказ
-        </button>
+        <h2 className="text-2xl font-bold">Ваш заказ №{orderId} сформирован!</h2>
+        <p className="text-green-700">Перейдите к оплате для запуска в печать.</p>
+        <div className="flex flex-col sm:flex-row gap-4 justify-center mt-6">
+          <button type="button" onClick={() => alert('Здесь будет редирект на ЮKassa/Robokassa')} className="px-8 py-3 bg-yellow-400 text-black font-bold rounded-full hover:bg-yellow-500 transition-colors shadow-sm">
+            Перейти к оплате
+          </button>
+          <button type="button" onClick={() => { setSuccessMessage(null); setOrderId(null); if (onReset) onReset(); }} className="px-6 py-3 bg-gray-200 text-gray-800 font-medium rounded-full hover:bg-gray-300 transition-colors">
+            Оформить новый заказ
+          </button>
+        </div>
       </div>
     );
   }

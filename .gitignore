@@ -14,3 +14,13 @@ venv/
 *.pth
 backend/gfpgan/
 backend/weights/
+
+# Playwright
+/test-results/
+/playwright-report/
+/blob-report/
+/playwright/.cache/
+/playwright/.auth/
+
+# Настройки редактора и локальные секреты
+.vscode/

@@ -4,17 +4,19 @@ import { Camera, Printer, Wand2, Image as ImageIcon, Star, ShieldCheck, Clock } 
 // Импортируем все рабочие виджеты
 import { PhotoDocWidget } from './components/PhotoDocWidget';
 import { PhotoPrintForm } from './components/PhotoPrintForm';
-// import { RestoreWidget } from './components/RestoreWidget'; // Временно отключено
 import PolaroidWidget from './components/PolaroidWidget';
-import ServiceCalculator from './components/ServiceCalculator'; // Добавлен наш новый калькулятор
+import ServiceCalculator from './components/ServiceCalculator'; 
+import { RestoreWidget } from './components/RestoreWidget'; 
 
 export default function App() {
   const [activeService, setActiveService] = useState('docs');
+  const [isOrderSuccess, setIsOrderSuccess] = useState(false);
 
+  // Услуги для витрины (Реставрация включена)
   const services = [
     { id: 'docs', title: 'Фото на документы', icon: Camera },
     { id: 'print', title: 'Печать фото', icon: Printer },
-    // { id: 'restore', title: 'Реставрация фото', icon: Wand2 }, // Временно отключено
+    { id: 'restore', title: 'Реставрация фото', icon: Wand2 },
     { id: 'polaroid', title: 'Печать Polaroid', icon: ImageIcon },
   ];
 
@@ -25,9 +27,9 @@ export default function App() {
         <div className="text-xl font-extrabold tracking-tight">
           PhotoDoc<span className="text-yellow-400">.</span>
         </div>
-        <a href="mailto:hello@photodoc.ai" className="text-sm font-medium text-gray-400 hover:text-white transition-colors">
+        <button onClick={() => document.getElementById('contacts')?.scrollIntoView({ behavior: 'smooth' })} className="text-sm font-medium text-gray-400 hover:text-white transition-colors cursor-pointer">
           Связаться с нами
-        </a>
+        </button>
       </header>
 
       {/* Hero Секция (Главный экран) */}
@@ -45,7 +47,7 @@ export default function App() {
             <button onClick={() => document.getElementById('services-section')?.scrollIntoView({ behavior: 'smooth' })} className="px-8 py-4 bg-yellow-400 text-black font-bold rounded-full transition-transform hover:scale-105 w-full sm:w-auto">
               Начать работу
             </button>
-            <button className="px-8 py-4 bg-transparent border border-gray-800 text-white font-medium rounded-full transition-colors hover:bg-gray-900 hover:border-gray-700 w-full sm:w-auto">
+            <button onClick={() => document.getElementById('calculator-section')?.scrollIntoView({ behavior: 'smooth' })} className="px-8 py-4 bg-transparent border border-gray-800 text-white font-medium rounded-full transition-colors hover:bg-gray-900 hover:border-gray-700 w-full sm:w-auto cursor-pointer">
               Узнать больше
             </button>
           </div>
@@ -95,7 +97,10 @@ export default function App() {
               return (
                 <button
                   key={service.id}
-                  onClick={() => setActiveService(service.id)}
+                  onClick={() => {
+                    setActiveService(service.id);
+                    setIsOrderSuccess(false);
+                  }}
                   className={`group flex flex-col items-center text-center p-8 rounded-3xl cursor-pointer transition-all duration-300 border ${
                     isActive
                       ? 'bg-yellow-400 border-yellow-400 text-black'
@@ -111,28 +116,40 @@ export default function App() {
 
           {/* Рабочий виджет */}
           <div className="max-w-4xl mx-auto bg-gray-900 rounded-3xl border border-gray-800 p-6 md:p-12 min-h-[500px]">
-            {activeService === 'docs' && <PhotoDocWidget />}
-            {activeService === 'print' && <PhotoPrintForm />}
-            {/* {activeService === 'restore' && <RestoreWidget />} */}
-            {activeService === 'polaroid' && <PolaroidWidget />}
+            {activeService === 'docs' && <PhotoDocWidget onSuccess={() => setIsOrderSuccess(true)} onReset={() => setIsOrderSuccess(false)} />}
+            {activeService === 'print' && <PhotoPrintForm onSuccess={() => setIsOrderSuccess(true)} onReset={() => setIsOrderSuccess(false)} />}
+            {activeService === 'polaroid' && <PolaroidWidget onSuccess={() => setIsOrderSuccess(true)} onReset={() => setIsOrderSuccess(false)} />}
+            {activeService === 'restore' && <RestoreWidget onSuccess={() => setIsOrderSuccess(true)} onReset={() => setIsOrderSuccess(false)} />}
           </div>
         </div>
       </section>
 
       {/* Секция Калькулятора */}
-      <section className="py-16 px-4 bg-gray-900/30">
-        <div className="max-w-6xl mx-auto">
-          <ServiceCalculator />
-        </div>
-      </section>
+      {!isOrderSuccess && (
+        <section id="calculator-section" className="py-16 px-4 bg-gray-900/30 border-t border-gray-800">
+          <div className="max-w-6xl mx-auto">
+            <ServiceCalculator />
+          </div>
+        </section>
+      )}
 
       {/* Подвал (Footer) */}
-      <footer className="py-12 border-t border-gray-800">
-        <div className="max-w-6xl mx-auto px-4 flex flex-col md:flex-row justify-between items-center gap-6">
-          <p className="text-gray-500 text-sm">© 2026 PhotoDoc AI. Все права защищены.</p>
-          <div className="flex gap-8 text-sm">
-            <a href="#" className="text-gray-400 hover:text-white transition-colors font-medium">Политика конфиденциальности</a>
-            <a href="#" className="text-gray-400 hover:text-white transition-colors font-medium">Контакты</a>
+      <footer id="contacts" className="py-12 border-t border-gray-800">
+        <div className="max-w-6xl mx-auto px-4 flex flex-col md:flex-row justify-between items-center md:items-start gap-10 md:gap-6">
+          <div className="flex flex-col items-center md:items-start gap-4">
+            <p className="text-gray-500 text-sm">© 2026 PhotoDoc AI. Все права защищены.</p>
+            <a href="#" className="text-gray-400 hover:text-yellow-400 transition-colors font-medium text-sm py-2 md:py-0">Политика конфиденциальности</a>
+          </div>
+          <div className="flex flex-col items-center md:items-end gap-4 md:gap-2 text-base md:text-sm">
+            <a href="tel:+79132138126" className="text-gray-400 hover:text-yellow-400 transition-colors font-medium p-2 md:p-0">
+              +7 (913) 213-81-26
+            </a>
+            <a href="tel:+79132130605" className="text-gray-400 hover:text-yellow-400 transition-colors font-medium p-2 md:p-0">
+              +7 (913) 213-06-05
+            </a>
+            <a href="mailto:mdot22@yandex.ru" className="text-gray-400 hover:text-yellow-400 transition-colors font-medium p-2 md:p-0">
+              mdot22@yandex.ru
+            </a>
           </div>
         </div>
       </footer>

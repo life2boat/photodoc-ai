@@ -45,7 +45,7 @@ const FilePreview = ({ file, onRemove }) => {
   );
 };
 
-export function PhotoDocWidget() {
+export function PhotoDocWidget({ onSuccess, onReset }) {
   const [files, setFiles] = useState([]);
   const [isLoading, setIsLoading] = useState(false);
   const [isSuccess, setIsSuccess] = useState(false);
@@ -89,7 +89,7 @@ export function PhotoDocWidget() {
     });
 
     try {
-      const apiResponse = await fetch('http://localhost:8000/api/orders', {
+      const apiResponse = await fetch('http://localhost:8000/api/order', {
         method: 'POST',
         body: formData,
       });
@@ -102,6 +102,7 @@ export function PhotoDocWidget() {
       const data = await apiResponse.json();
       setOrderId(data.order_id || '...');
       setIsSuccess(true);
+      if (onSuccess) onSuccess();
     } catch (err) {
       console.error(err);
       setError(err.message || 'Ошибка соединения с сервером');
@@ -118,6 +119,7 @@ export function PhotoDocWidget() {
     setUserComment('');
     setError(null);
     setOrderId(null);
+    if (onReset) onReset();
     if (fileInputRef.current) {
       fileInputRef.current.value = "";
     }

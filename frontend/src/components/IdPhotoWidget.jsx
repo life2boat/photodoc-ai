@@ -38,7 +38,7 @@ const FilePreview = ({ file, onRemove }) => {
   );
 };
 
-export default function IdPhotoWidget() {
+export default function IdPhotoWidget({ onSuccess, onReset }) {
   const [files, setFiles] = useState([]);
   const [isLoading, setIsLoading] = useState(false);
   const [isSuccess, setIsSuccess] = useState(false);
@@ -83,7 +83,7 @@ export default function IdPhotoWidget() {
     });
 
     try {
-      const apiResponse = await fetch('http://localhost:8000/api/orders', {
+      const apiResponse = await fetch('http://localhost:8000/api/order', {
         method: 'POST',
         body: formData,
       });
@@ -96,6 +96,7 @@ export default function IdPhotoWidget() {
       const data = await apiResponse.json();
       setOrderId(data.order_id || '...');
       setIsSuccess(true);
+      if (onSuccess) onSuccess();
     } catch (err) {
       console.error(err);
       setError(err.message || 'Ошибка соединения с сервером');
@@ -112,6 +113,7 @@ export default function IdPhotoWidget() {
     setUserComment('');
     setError(null);
     setOrderId(null);
+    if (onReset) onReset();
     if (fileInputRef.current) {
       fileInputRef.current.value = "";
     }
