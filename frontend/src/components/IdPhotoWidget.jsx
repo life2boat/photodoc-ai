@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useMemo } from 'react';
 import { UploadCloud, Loader2, Trash2, X } from 'lucide-react';
 
 const PHOTO_FORMATS = [
@@ -9,19 +9,17 @@ const PHOTO_FORMATS = [
 ];
 
 const FilePreview = ({ file, onRemove }) => {
-  const [previewUrl, setPreviewUrl] = useState(null);
+  const previewUrl = useMemo(() => URL.createObjectURL(file), [file]);
 
   useEffect(() => {
-    const url = URL.createObjectURL(file);
-    setPreviewUrl(url);
-    return () => URL.revokeObjectURL(url);
-  }, [file]);
+    return () => URL.revokeObjectURL(previewUrl);
+  }, [previewUrl]);
 
   return (
     <div className="relative group aspect-square">
       {previewUrl && (
         <img
-          src={previewUrl} // eslint-disable-line
+          src={previewUrl}
           alt="preview"
           className="w-full h-full object-cover rounded-lg border border-neutral-200 shadow-sm"
         />

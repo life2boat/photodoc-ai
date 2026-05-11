@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useMemo } from 'react';
 import { UploadCloud, Maximize, Minimize, UserCog, CheckCircle, Loader2, X } from 'lucide-react';
 
 const PRICES = {
@@ -17,19 +17,17 @@ const PRICES = {
 };
 
 const PhotoPreview = ({ photo, onRemove }) => {
-  const [previewUrl, setPreviewUrl] = useState(null);
+  const previewUrl = useMemo(() => URL.createObjectURL(photo), [photo]);
 
   useEffect(() => {
-    const url = URL.createObjectURL(photo);
-    setPreviewUrl(url);
-    return () => URL.revokeObjectURL(url);
-  }, [photo]);
+    return () => URL.revokeObjectURL(previewUrl);
+  }, [previewUrl]);
 
   return (
     <div className="relative group aspect-square">
       {previewUrl && (
         <img
-          src={previewUrl} // eslint-disable-line
+          src={previewUrl}
           alt="preview"
           className="w-full h-full object-cover rounded-xl border border-gray-200 shadow-sm"
         />
@@ -245,10 +243,10 @@ export function PhotoPrintForm({ onSuccess, onReset }) {
         <div>
           <label className="block text-sm font-medium text-gray-400 mb-2">Режим кадрирования</label>
           <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-            {[{ id: 'fill', icon: Maximize, desc: 'Фото заполнит бумагу, края обрежутся' }, { id: 'fit', icon: Minimize, desc: 'Фото поместится целиком, останутся белые поля' }, { id: 'auto', icon: UserCog, desc: 'Мы сами выберем лучший вариант' }].map(({ id, icon: Icon, desc }) => (
+            {[{ id: 'fill', icon: Maximize, desc: 'Фото заполнит бумагу, края обрежутся' }, { id: 'fit', icon: Minimize, desc: 'Фото поместится целиком, останутся белые поля' }, { id: 'auto', icon: UserCog, desc: 'Мы сами выберем лучший вариант' }].map(({ id, icon, desc }) => (
               <div key={id} onClick={() => setCropMode(id)} className={`relative flex flex-col p-4 cursor-pointer rounded-xl border-2 transition-all ${cropMode === id ? 'border-yellow-400 bg-yellow-400/10' : 'border-gray-700 bg-gray-800 hover:border-gray-600'}`}>
                 <div className="flex items-center mb-2">
-                  <Icon className={`w-5 h-5 mr-2 ${cropMode === id ? 'text-yellow-400' : 'text-gray-400'}`} />
+                  {React.createElement(icon, { className: `w-5 h-5 mr-2 ${cropMode === id ? 'text-yellow-400' : 'text-gray-400'}` })}
                   <span className={`font-semibold ${cropMode === id ? 'text-yellow-300' : 'text-gray-300'}`}>{cropMap[id]}</span>
                 </div>
                 <p className="text-xs text-gray-500 leading-relaxed">{desc}</p>

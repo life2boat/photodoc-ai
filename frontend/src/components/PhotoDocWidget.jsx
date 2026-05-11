@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useMemo } from 'react';
 import { UploadCloud, Loader2, Trash2, X } from 'lucide-react';
 
 const DOC_PRICES = {
@@ -16,19 +16,17 @@ const DOC_FORMATS = [
 ];
 
 const FilePreview = ({ file, onRemove }) => {
-  const [previewUrl, setPreviewUrl] = useState(null);
+  const previewUrl = useMemo(() => URL.createObjectURL(file), [file]);
 
   useEffect(() => {
-    const url = URL.createObjectURL(file);
-    setPreviewUrl(url);
-    return () => URL.revokeObjectURL(url);
-  }, [file]);
+    return () => URL.revokeObjectURL(previewUrl);
+  }, [previewUrl]);
 
   return (
     <div className="relative group aspect-square">
       {previewUrl && (
         <img
-          src={previewUrl} // eslint-disable-line
+          src={previewUrl}
           alt="preview"
           className="w-full h-full object-cover rounded-lg border border-neutral-200 shadow-sm"
         />
@@ -50,7 +48,6 @@ export function PhotoDocWidget({ onSuccess, onReset }) {
   const [isLoading, setIsLoading] = useState(false);
   const [isSuccess, setIsSuccess] = useState(false);
   const [error, setError] = useState(null);
-  const [orderId, setOrderId] = useState(null);
 
   const [userName, setUserName] = useState('');
   const [userPhone, setUserPhone] = useState('');
@@ -99,8 +96,7 @@ export function PhotoDocWidget({ onSuccess, onReset }) {
         throw new Error(err?.detail || 'Ошибка при отправке заказа');
       }
 
-      const data = await apiResponse.json();
-      setOrderId(data.order_id || '...');
+      await apiResponse.json();
       setIsSuccess(true);
       if (onSuccess) onSuccess();
     } catch (err) {
@@ -118,7 +114,6 @@ export function PhotoDocWidget({ onSuccess, onReset }) {
     setUserPhone('');
     setUserComment('');
     setError(null);
-    setOrderId(null);
     if (onReset) onReset();
     if (fileInputRef.current) {
       fileInputRef.current.value = "";

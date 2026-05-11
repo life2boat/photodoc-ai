@@ -1,20 +1,18 @@
-import React, { useState, useRef, useEffect } from "react";
+import React, { useState, useRef, useEffect, useMemo } from "react";
 import { UploadCloud, Loader2, Image as ImageIcon, Trash2, X } from "lucide-react";
 
 const FilePreview = ({ file, onRemove }) => {
-  const [previewUrl, setPreviewUrl] = useState(null);
+  const previewUrl = useMemo(() => URL.createObjectURL(file), [file]);
 
   useEffect(() => {
-    const url = URL.createObjectURL(file);
-    setPreviewUrl(url);
-    return () => URL.revokeObjectURL(url);
-  }, [file]);
+    return () => URL.revokeObjectURL(previewUrl);
+  }, [previewUrl]);
 
   return (
     <div className="relative group aspect-square">
       {previewUrl && (
         <img
-          src={previewUrl} // eslint-disable-line
+          src={previewUrl}
           alt="preview"
           className="w-full h-full object-cover rounded-lg border border-neutral-200 shadow-sm"
         />
@@ -94,8 +92,8 @@ export function RestoreWidget({ onSuccess, onReset }) {
     setError(null);
     
     const formData = new FormData();
-    formData.append("client_name", clientName);
-    formData.append("client_phone", clientPhone);
+    formData.append("name", clientName);
+    formData.append("phone", clientPhone);
     formData.append("category", "Реставрация фото");
     formData.append("service_name", serviceName);
     formData.append("total_price", totalPrice);
