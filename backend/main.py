@@ -4,12 +4,17 @@ import sqlite3
 import httpx
 import smtplib
 import urllib.parse
+import hashlib
+from decimal import Decimal, InvalidOperation
+from datetime import datetime
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks, HTTPException, Request
+from fastapi.responses import PlainTextResponse, JSONResponse
 from typing import List
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
+from pydantic import BaseModel
 
 # Загрузка переменных окружения
 load_dotenv()
@@ -38,7 +43,13 @@ def init_db():
             name TEXT,
             phone TEXT,
             comment TEXT,
-            filename TEXT
+            filename TEXT,
+            status TEXT DEFAULT 'new',
+            payment_status TEXT DEFAULT 'unpaid',
+            payment_amount TEXT,
+            payment_method TEXT,
+            robokassa_inv_id TEXT,
+            paid_at TEXT
         )
     ''')
     conn.commit()
@@ -46,9 +57,178 @@ def init_db():
 
 init_db()
 
+
+def ensure_orders_schema():
+    conn = sqlite3.connect("orders.db")
+    cursor = conn.cursor()
+    cursor.execute("PRAGMA table_info(orders)")
+    columns = {row[1] for row in cursor.fetchall()}
+    extra_columns = {
+        "status": "TEXT DEFAULT 'new'",
+        "payment_status": "TEXT DEFAULT 'unpaid'",
+        "payment_amount": "TEXT",
+        "payment_method": "TEXT",
+        "robokassa_inv_id": "TEXT",
+        "paid_at": "TEXT",
+    }
+    for column_name, column_sql in extra_columns.items():
+        if column_name not in columns:
+            cursor.execute(f"ALTER TABLE orders ADD COLUMN {column_name} {column_sql}")
+    conn.commit()
+    conn.close()
+
+
+ensure_orders_schema()
+
 # Создаем папку для локальных загрузок
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+
+def format_robokassa_amount(value: float | int | str) -> str:
+    try:
+        amount = Decimal(str(value))
+    except (InvalidOperation, ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="Invalid amount")
+
+    normalized = amount.normalize()
+    amount_str = format(normalized, "f")
+    if "." in amount_str:
+        amount_str = amount_str.rstrip("0").rstrip(".")
+    return amount_str or "0"
+
+
+def update_order_payment(order_id: int, payment_amount: str, payment_status: str, payment_method: str = "robokassa"):
+    conn = sqlite3.connect("orders.db")
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        UPDATE orders
+        SET payment_amount = ?, payment_status = ?, payment_method = ?, status = ?, robokassa_inv_id = ?, paid_at = ?
+        WHERE id = ?
+        """,
+        (
+            payment_amount,
+            payment_status,
+            payment_method,
+            "paid" if payment_status == "paid" else "awaiting_payment",
+            str(order_id),
+            datetime.utcnow().isoformat() if payment_status == "paid" else None,
+            order_id,
+        ),
+    )
+    conn.commit()
+    updated = cursor.rowcount
+    conn.close()
+    return updated
+
+
+def get_order_payment_amount(order_id: int):
+    conn = sqlite3.connect("orders.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT payment_amount FROM orders WHERE id = ?", (order_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+
+class PaymentCreateRequest(BaseModel):
+    order_id: int | str
+    amount: float | int
+
+
+@app.post("/api/payment/create")
+async def create_payment(payment: PaymentCreateRequest):
+    merchant_login = os.getenv("ROBOKASSA_MERCHANT_LOGIN")
+    password1 = os.getenv("ROBOKASSA_PASSWORD1")
+    is_test = os.getenv("ROBOKASSA_IS_TEST", "1")
+
+    if not merchant_login or not password1:
+        raise HTTPException(status_code=500, detail="Robokassa settings are not configured")
+
+    try:
+        order_id_int = int(str(payment.order_id))
+    except ValueError:
+        raise HTTPException(status_code=400, detail="order_id must be an integer")
+
+    amount = format_robokassa_amount(payment.amount)
+    updated = update_order_payment(order_id_int, amount, "pending")
+    if not updated:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    order_id = str(order_id_int)
+    signature = hashlib.md5(
+        f"{merchant_login}:{amount}:{order_id}:{password1}".encode("utf-8")
+    ).hexdigest()
+    params = {
+        "MerchantLogin": merchant_login,
+        "OutSum": amount,
+        "InvId": order_id,
+        "Description": f"Оплата_заказа_{order_id}",
+        "SignatureValue": signature,
+        "IsTest": is_test,
+    }
+    payment_url = "https://auth.robokassa.ru/Merchant/Index.aspx?" + urllib.parse.urlencode(params)
+    return {"payment_url": payment_url}
+
+
+def verify_robokassa_signature(out_sum: str, inv_id: str, signature: str, password: str) -> bool:
+    expected = hashlib.md5(f"{out_sum}:{inv_id}:{password}".encode("utf-8")).hexdigest()
+    return expected.lower() == signature.lower()
+
+
+async def read_robokassa_payload(request: Request):
+    payload = dict(request.query_params)
+    if request.method.upper() == "POST":
+        form_data = await request.form()
+        payload.update(dict(form_data))
+    return payload
+
+
+@app.api_route("/api/payment/robokassa/result", methods=["GET", "POST"])
+async def robokassa_result(request: Request):
+    password2 = os.getenv("ROBOKASSA_PASSWORD2")
+    if not password2:
+        raise HTTPException(status_code=500, detail="Robokassa password2 is not configured")
+
+    payload = await read_robokassa_payload(request)
+    out_sum = payload.get("OutSum")
+    inv_id = payload.get("InvId")
+    signature = payload.get("SignatureValue")
+
+    if not out_sum or inv_id is None or not signature:
+        raise HTTPException(status_code=400, detail="Missing Robokassa payload")
+
+    try:
+        order_id = int(str(inv_id))
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid order id")
+
+    if not verify_robokassa_signature(str(out_sum), str(inv_id), str(signature), password2):
+        raise HTTPException(status_code=400, detail="Invalid signature")
+
+    stored_amount = get_order_payment_amount(order_id)
+    expected_amount = format_robokassa_amount(stored_amount or out_sum)
+    if format_robokassa_amount(out_sum) != expected_amount:
+        raise HTTPException(status_code=400, detail="Amount mismatch")
+
+    updated = update_order_payment(order_id, expected_amount, "paid")
+    if not updated:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    return PlainTextResponse(f"OK{order_id}")
+
+
+@app.api_route("/api/payment/robokassa/success", methods=["GET", "POST"])
+async def robokassa_success(request: Request):
+    payload = await read_robokassa_payload(request)
+    return JSONResponse(
+        {
+            "ok": True,
+            "order_id": payload.get("InvId"),
+            "message": "Платеж подтвержден",
+        }
+    )
 
 # --- Фоновая задача 1: Отправка Email ---
 def send_order_email(order_id: int, name: str, phone: str, comment: str, format: str = "Не указан", paper: str = "Не указана", crop: str = "Не указано"):

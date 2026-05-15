@@ -1,5 +1,6 @@
-import React, { useState, useRef, useEffect, useMemo } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import { UploadCloud, Loader2, Trash2, X } from 'lucide-react';
+import { redirectToPayment } from '../lib/robokassa';
 
 const DOC_PRICES = {
   '3x4': 300,
@@ -16,11 +17,17 @@ const DOC_FORMATS = [
 ];
 
 const FilePreview = ({ file, onRemove }) => {
-  const previewUrl = useMemo(() => URL.createObjectURL(file), [file]);
+  const [previewUrl, setPreviewUrl] = useState('');
 
   useEffect(() => {
-    return () => URL.revokeObjectURL(previewUrl);
-  }, [previewUrl]);
+    const objectUrl = URL.createObjectURL(file);
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setPreviewUrl(objectUrl);
+
+    return () => {
+      URL.revokeObjectURL(objectUrl);
+    };
+  }, [file]);
 
   return (
     <div className="relative group aspect-square">
@@ -48,6 +55,8 @@ export function PhotoDocWidget({ onSuccess, onReset }) {
   const [isLoading, setIsLoading] = useState(false);
   const [isSuccess, setIsSuccess] = useState(false);
   const [error, setError] = useState(null);
+  const [orderId, setOrderId] = useState(null);
+  const [paymentAmount, setPaymentAmount] = useState(0);
 
   const [userName, setUserName] = useState('');
   const [userPhone, setUserPhone] = useState('');
@@ -96,7 +105,9 @@ export function PhotoDocWidget({ onSuccess, onReset }) {
         throw new Error(err?.detail || 'Ошибка при отправке заказа');
       }
 
-      await apiResponse.json();
+      const data = await apiResponse.json();
+      setOrderId(data.order_id || '...');
+      setPaymentAmount(price);
       setIsSuccess(true);
       if (onSuccess) onSuccess();
     } catch (err) {
@@ -114,6 +125,8 @@ export function PhotoDocWidget({ onSuccess, onReset }) {
     setUserPhone('');
     setUserComment('');
     setError(null);
+    setOrderId(null);
+    setPaymentAmount(0);
     if (onReset) onReset();
     if (fileInputRef.current) {
       fileInputRef.current.value = "";
@@ -123,11 +136,20 @@ export function PhotoDocWidget({ onSuccess, onReset }) {
   if (isSuccess) {
     return (
       <div className="bg-green-50 border border-green-200 text-green-800 rounded-xl p-8 text-center space-y-4 animate-in fade-in zoom-in duration-300 max-w-2xl mx-auto">
-        <h2 className="text-2xl font-bold">✅ Заказ принят!</h2>
+        <h2 className="text-2xl font-bold">✅ Заказ №{orderId} принят!</h2>
         <p className="text-green-700">Мы подготовим фото по стандартам и свяжемся с вами в течение 15 минут.</p>
-        <button onClick={handleReset} className="mt-4 px-6 py-3 bg-green-600 text-white font-medium rounded-full hover:bg-green-700 transition-colors">
-          Оформить еще один заказ
-        </button>
+        <div className="flex flex-col sm:flex-row gap-4 justify-center mt-6">
+          <button
+            type="button"
+            onClick={() => redirectToPayment(orderId, paymentAmount)}
+            className="px-8 py-3 bg-yellow-400 text-black font-bold rounded-full hover:bg-yellow-500 transition-colors shadow-sm"
+          >
+            Перейти к оплате
+          </button>
+          <button onClick={handleReset} className="px-6 py-3 bg-green-600 text-white font-medium rounded-full hover:bg-green-700 transition-colors">
+            Оформить еще один заказ
+          </button>
+        </div>
       </div>
     );
   }

@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { CheckCircle } from 'lucide-react';
+import { redirectToPayment } from '../lib/robokassa';
 
 export default function PolaroidWidget({ onSuccess, onReset }) {
   const [photos, setPhotos] = useState([]);
@@ -10,6 +11,7 @@ export default function PolaroidWidget({ onSuccess, onReset }) {
   const [userPhone, setUserPhone] = useState('');
   const [isSuccess, setIsSuccess] = useState(false);
   const [orderId, setOrderId] = useState(null);
+  const [paymentAmount, setPaymentAmount] = useState(0);
   
   const PRICE_PER_PHOTO = 50;
 
@@ -107,6 +109,7 @@ export default function PolaroidWidget({ onSuccess, onReset }) {
       if (response.ok) {
         const data = await response.json();
         setOrderId(data.order_id || '...');
+        setPaymentAmount(photos.length * PRICE_PER_PHOTO);
         setIsSuccess(true);
         if (onSuccess) onSuccess();
         photos.forEach(p => URL.revokeObjectURL(p.url));
@@ -132,10 +135,14 @@ export default function PolaroidWidget({ onSuccess, onReset }) {
         <h2 className="text-2xl font-bold">Ваш заказ №{orderId} сформирован!</h2>
         <p className="text-green-700">Перейдите к оплате для запуска в печать.</p>
         <div className="flex flex-col sm:flex-row gap-4 justify-center mt-6">
-          <button type="button" onClick={() => alert('Здесь будет редирект на ЮKassa/Robokassa')} className="px-8 py-3 bg-yellow-400 text-black font-bold rounded-full hover:bg-yellow-500 transition-colors shadow-sm">
+          <button
+            type="button"
+            onClick={() => redirectToPayment(orderId, paymentAmount)}
+            className="px-8 py-3 bg-yellow-400 text-black font-bold rounded-full hover:bg-yellow-500 transition-colors shadow-sm"
+          >
             Перейти к оплате
           </button>
-          <button type="button" onClick={() => { setIsSuccess(false); setOrderId(null); if (onReset) onReset(); }} className="px-6 py-3 bg-gray-200 text-gray-800 font-medium rounded-full hover:bg-gray-300 transition-colors">
+          <button type="button" onClick={() => { setIsSuccess(false); setOrderId(null); setPaymentAmount(0); if (onReset) onReset(); }} className="px-6 py-3 bg-gray-200 text-gray-800 font-medium rounded-full hover:bg-gray-300 transition-colors">
             Оформить новый заказ
           </button>
         </div>
