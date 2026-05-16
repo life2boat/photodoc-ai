@@ -1,6 +1,8 @@
 import React, { useState, useRef, useEffect } from "react";
 import { UploadCloud, Loader2, Image as ImageIcon, Trash2, X } from "lucide-react";
 import { redirectToPayment } from "../lib/robokassa";
+import { API_BASE_URL } from "../config";
+import { reachGoal } from "../lib/analytics";
 
 const FilePreview = ({ file, onRemove }) => {
   const [previewUrl, setPreviewUrl] = useState("");
@@ -21,12 +23,17 @@ const FilePreview = ({ file, onRemove }) => {
         <img
           src={previewUrl}
           alt="preview"
+          width="320"
+          height="320"
+          loading="lazy"
+          decoding="async"
           className="w-full h-full object-cover rounded-lg border border-neutral-200 shadow-sm"
         />
       )}
       <button
         type="button"
         onClick={onRemove}
+        aria-label="Удалить файл"
         className="absolute -top-2 -right-2 bg-red-500 text-white rounded-full p-1 opacity-0 group-hover:opacity-100 transition-opacity shadow-md hover:bg-red-600"
         title="Удалить фото"
       >
@@ -51,6 +58,7 @@ export function RestoreWidget({ onSuccess, onReset }) {
 
   const [clientName, setClientName] = useState("");
   const [clientPhone, setClientPhone] = useState("");
+  const [clientEmail, setClientEmail] = useState("");
   const [serviceName, setServiceName] = useState("");
   const [isSuccess, setIsSuccess] = useState(false);
   const [orderId, setOrderId] = useState(null);
@@ -90,7 +98,7 @@ export function RestoreWidget({ onSuccess, onReset }) {
   };
 
   const handleSubmitOrder = async () => {
-    if (selectedFiles.length === 0 || !clientName.trim() || !clientPhone.trim()) return;
+    if (selectedFiles.length === 0 || !clientName.trim() || !clientPhone.trim() || !clientEmail.trim()) return;
 
     if (!serviceName) {
       setError("Пожалуйста, выберите услугу");
@@ -103,6 +111,11 @@ export function RestoreWidget({ onSuccess, onReset }) {
     const formData = new FormData();
     formData.append("name", clientName);
     formData.append("phone", clientPhone);
+    formData.append("email", clientEmail);
+    formData.append("format", "Реставрация фото");
+    formData.append("paper", "Цифровая обработка");
+    formData.append("crop", serviceName);
+    formData.append("comment", `РЕСТАВРАЦИЯ ФОТО | Услуга: ${serviceName} | Сумма: ${totalPrice} руб.`);
     formData.append("category", "Реставрация фото");
     formData.append("service_name", serviceName);
     formData.append("total_price", totalPrice);
@@ -112,7 +125,7 @@ export function RestoreWidget({ onSuccess, onReset }) {
     });
 
     try {
-      const response = await fetch("/api/order", { // Единый эндпоинт: /api/order
+      const response = await fetch(`${API_BASE_URL}/api/order`, { // Единый эндпоинт: /api/order
         method: "POST",
         body: formData,
         // Заголовок Content-Type НЕ устанавливается, чтобы браузер сам сгенерировал boundary
@@ -127,10 +140,12 @@ export function RestoreWidget({ onSuccess, onReset }) {
       setOrderId(data.order_id || '...');
       setPaymentAmount(totalPrice);
       setIsSuccess(true);
+      reachGoal('ORDER_CREATED');
       if (onSuccess) onSuccess();
       setSelectedFiles([]);
       setClientName("");
       setClientPhone("");
+      setClientEmail("");
       setServiceName("");
     } catch (err) {
       setError(err.message);
@@ -145,6 +160,7 @@ export function RestoreWidget({ onSuccess, onReset }) {
     setError(null);
     setClientName("");
     setClientPhone("");
+    setClientEmail("");
     setServiceName("");
     setIsSuccess(false);
     setOrderId(null);
@@ -211,7 +227,7 @@ export function RestoreWidget({ onSuccess, onReset }) {
                 <button onClick={() => fileInputRef.current?.click()} disabled={isLoading} className="text-yellow-400 hover:text-yellow-300 text-sm font-medium transition-colors">
                   + Добавить
                 </button>
-                <button onClick={() => setSelectedFiles([])} disabled={isLoading} className="text-gray-500 hover:text-red-500 p-1 transition-colors" title="Удалить все">
+                <button onClick={() => setSelectedFiles([])} disabled={isLoading} className="text-gray-500 hover:text-red-500 p-1 transition-colors" title="Удалить все" aria-label="Удалить все фото">
                   <Trash2 className="w-5 h-5" />
                 </button>
               </div>
@@ -258,6 +274,10 @@ export function RestoreWidget({ onSuccess, onReset }) {
                 <label className="block text-sm font-medium text-gray-400 mb-1">Телефон *</label>
                 <input type="tel" value={clientPhone} onChange={(e) => setClientPhone(e.target.value)} placeholder="+7 (999) 000-00-00" disabled={isLoading} className="w-full border border-gray-700 rounded-lg px-4 py-2.5 focus:outline-none focus:ring-2 focus:ring-yellow-400 bg-gray-800 text-white disabled:opacity-50" />
               </div>
+              <div>
+                <label className="block text-sm font-medium text-gray-400 mb-1">Email для подтверждения *</label>
+                <input type="email" value={clientEmail} onChange={(e) => setClientEmail(e.target.value)} placeholder="ivan@example.ru" disabled={isLoading} className="w-full border border-gray-700 rounded-lg px-4 py-2.5 focus:outline-none focus:ring-2 focus:ring-yellow-400 bg-gray-800 text-white disabled:opacity-50" />
+              </div>
             </div>
             
             <div className="mt-2 pt-4 border-t border-gray-800 flex justify-between items-center">
@@ -265,7 +285,7 @@ export function RestoreWidget({ onSuccess, onReset }) {
               <span className="text-2xl font-bold text-yellow-400">{totalPrice} ₽</span>
             </div>
 
-            <button onClick={handleSubmitOrder} disabled={isLoading || selectedFiles.length === 0 || !clientName.trim() || !clientPhone.trim()} className="w-full mt-2 bg-yellow-400 text-black font-bold py-3.5 px-4 rounded-lg flex items-center justify-center hover:bg-yellow-300 transition-all disabled:bg-gray-500 disabled:text-gray-300 disabled:cursor-not-allowed">
+            <button onClick={handleSubmitOrder} disabled={isLoading || selectedFiles.length === 0 || !clientName.trim() || !clientPhone.trim() || !clientEmail.trim()} className="w-full mt-2 bg-yellow-400 text-black font-bold py-3.5 px-4 rounded-lg flex items-center justify-center hover:bg-yellow-300 transition-all disabled:bg-gray-500 disabled:text-gray-300 disabled:cursor-not-allowed">
               {isLoading ? ( <><Loader2 className="mr-2 h-5 w-5 animate-spin" /> Отправка...</> ) : ( 'Оформить заказ' )}
             </button>
           </div>

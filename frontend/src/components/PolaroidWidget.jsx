@@ -1,6 +1,8 @@
 import React, { useState, useEffect } from 'react';
 import { CheckCircle } from 'lucide-react';
 import { redirectToPayment } from '../lib/robokassa';
+import { API_BASE_URL } from '../config';
+import { reachGoal } from '../lib/analytics';
 
 export default function PolaroidWidget({ onSuccess, onReset }) {
   const [photos, setPhotos] = useState([]);
@@ -9,6 +11,7 @@ export default function PolaroidWidget({ onSuccess, onReset }) {
   const [draggingId, setDraggingId] = useState(null);
   const [userName, setUserName] = useState('');
   const [userPhone, setUserPhone] = useState('');
+  const [userEmail, setUserEmail] = useState('');
   const [isSuccess, setIsSuccess] = useState(false);
   const [orderId, setOrderId] = useState(null);
   const [paymentAmount, setPaymentAmount] = useState(0);
@@ -77,8 +80,8 @@ export default function PolaroidWidget({ onSuccess, onReset }) {
     e.preventDefault();
     e.stopPropagation(); // Отключаем всплытие эвента к родительским формам
     if (!isConfirmed || photos.length === 0) return;
-    if (!userName.trim() || !userPhone.trim()) {
-      alert("Пожалуйста, укажите ваше имя и телефон");
+    if (!userName.trim() || !userPhone.trim() || !userEmail.trim()) {
+      alert("Пожалуйста, укажите ваше имя, телефон и email");
       return;
     }
 
@@ -86,6 +89,7 @@ export default function PolaroidWidget({ onSuccess, onReset }) {
     const formData = new FormData();
     formData.append('name', userName); 
     formData.append('phone', userPhone);
+    formData.append('email', userEmail);
     formData.append('format', 'Polaroid');
     formData.append('paper', 'Глянцевая');
     formData.append('crop', 'С рамкой');
@@ -102,7 +106,7 @@ export default function PolaroidWidget({ onSuccess, onReset }) {
     photos.forEach(p => formData.append('files', p.file));
 
     try {
-      const response = await fetch('http://localhost:8000/api/order', {
+      const response = await fetch(`${API_BASE_URL}/api/order`, {
         method: 'POST',
         body: formData,
       });
@@ -111,12 +115,14 @@ export default function PolaroidWidget({ onSuccess, onReset }) {
         setOrderId(data.order_id || '...');
         setPaymentAmount(photos.length * PRICE_PER_PHOTO);
         setIsSuccess(true);
+        reachGoal('ORDER_CREATED');
         if (onSuccess) onSuccess();
         photos.forEach(p => URL.revokeObjectURL(p.url));
         setPhotos([]);
         setIsConfirmed(false);
         setUserName('');
         setUserPhone('');
+        setUserEmail('');
       } else {
         const errorData = await response.json();
         throw new Error(errorData.detail || "Ошибка сервера");
@@ -178,6 +184,10 @@ export default function PolaroidWidget({ onSuccess, onReset }) {
                 <img 
                   src={photo.url} 
                   alt="preview"
+                  width="288"
+                  height="288"
+                  loading="lazy"
+                  decoding="async"
                   draggable="false"
                   className="absolute max-w-none pointer-events-none origin-center"
                   style={{
@@ -259,6 +269,10 @@ export default function PolaroidWidget({ onSuccess, onReset }) {
               <label className="block text-sm font-medium text-gray-400 mb-1">Телефон *</label>
               <input type="tel" value={userPhone} onChange={(e) => setUserPhone(e.target.value)} placeholder="+7 (999) 000-00-00" disabled={isLoading} className="w-full bg-gray-900 border border-gray-800 text-white rounded-xl px-4 py-3 focus:outline-none focus:border-yellow-400 transition-colors" />
             </div>
+            <div>
+              <label className="block text-sm font-medium text-gray-400 mb-1">Email для подтверждения *</label>
+              <input type="email" value={userEmail} onChange={(e) => setUserEmail(e.target.value)} placeholder="ivan@example.ru" disabled={isLoading} className="w-full bg-gray-900 border border-gray-800 text-white rounded-xl px-4 py-3 focus:outline-none focus:border-yellow-400 transition-colors" />
+            </div>
           </div>
 
           <div className="flex items-center gap-4 mb-6 p-4 bg-gray-900 rounded-xl border border-gray-800">
@@ -275,7 +289,7 @@ export default function PolaroidWidget({ onSuccess, onReset }) {
 
           <button
             type="submit"
-            disabled={!isConfirmed || isLoading || !userName.trim() || !userPhone.trim()}
+            disabled={!isConfirmed || isLoading || !userName.trim() || !userPhone.trim() || !userEmail.trim()}
             className={`w-full py-4 rounded-xl font-bold text-lg transition-all duration-300 flex justify-center items-center gap-2 ${
               isConfirmed && !isLoading
                 ? 'bg-yellow-400 text-black hover:bg-yellow-500 shadow-lg hover:shadow-yellow-400/20 hover:scale-[1.02]'

@@ -1,6 +1,8 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { UploadCloud, Maximize, Minimize, UserCog, CheckCircle, Loader2, X } from 'lucide-react';
 import { redirectToPayment } from '../lib/robokassa';
+import { API_BASE_URL } from '../config';
+import { reachGoal } from '../lib/analytics';
 
 const PRICES = {
   format: {
@@ -36,12 +38,17 @@ const PhotoPreview = ({ photo, onRemove }) => {
         <img
           src={previewUrl}
           alt="preview"
+          width="320"
+          height="320"
+          loading="lazy"
+          decoding="async"
           className="w-full h-full object-cover rounded-xl border border-gray-200 shadow-sm"
         />
       )}
       <button
         type="button"
         onClick={onRemove}
+        aria-label="Удалить фото"
         className="absolute -top-2 -right-2 bg-red-500 text-white rounded-full p-1 opacity-0 group-hover:opacity-100 transition-opacity shadow-md hover:bg-red-600"
         title="Удалить фото"
       >
@@ -61,6 +68,7 @@ export function PhotoPrintForm({ onSuccess, onReset }) {
   const [successMessage, setSuccessMessage] = useState(null);
   const [userName, setUserName] = useState('');
   const [userPhone, setUserPhone] = useState('');
+  const [userEmail, setUserEmail] = useState('');
   const [orderId, setOrderId] = useState(null);
   const [paymentAmount, setPaymentAmount] = useState(0);
 
@@ -107,6 +115,7 @@ export function PhotoPrintForm({ onSuccess, onReset }) {
     // ВАЖНО: Названия ключей теперь строго совпадают с тем, что ждет FastAPI
     formData.append('name', userName);
     formData.append('phone', userPhone);
+    formData.append('email', userEmail);
     
     // Упаковываем остальные настройки в поле comment для админки
     const orderDetails = `Формат: ${formatMap[format]} | Бумага: ${paperMap[paperType]} | Кадрирование: ${cropMap[cropMode]} | Сумма: ${totalPrice} руб.`;
@@ -122,7 +131,7 @@ export function PhotoPrintForm({ onSuccess, onReset }) {
     });
 
     try {
-      const response = await fetch('http://localhost:8000/api/order', {
+      const response = await fetch(`${API_BASE_URL}/api/order`, {
         method: 'POST',
         // Заголовок Content-Type браузер подставит сам!
         body: formData,
@@ -133,6 +142,7 @@ export function PhotoPrintForm({ onSuccess, onReset }) {
         setOrderId(data.order_id);
         setPaymentAmount(totalPrice);
         setSuccessMessage('Заказ сформирован!');
+        reachGoal('ORDER_CREATED');
         if (onSuccess) onSuccess();
         setPhotos([]);
         setFormat('10x15');
@@ -141,6 +151,7 @@ export function PhotoPrintForm({ onSuccess, onReset }) {
         setIsConfirmed(false);
         setUserName('');
         setUserPhone('');
+        setUserEmail('');
       } else {
         const errorDetail = await response.json().catch(() => ({}));
         console.error('Ошибка сервера:', errorDetail);
@@ -188,6 +199,10 @@ export function PhotoPrintForm({ onSuccess, onReset }) {
           <div>
             <label className="block text-sm font-medium text-gray-400 mb-2">Телефон</label>
             <input type="tel" value={userPhone} onChange={(e) => setUserPhone(e.target.value)} placeholder="+7 (999) 000-00-00" className="w-full px-4 py-2 border border-gray-700 bg-gray-800 text-white rounded-lg focus:ring-2 focus:ring-yellow-400 focus:border-yellow-400 outline-none transition-colors" required />
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-gray-400 mb-2">Email для подтверждения</label>
+            <input type="email" value={userEmail} onChange={(e) => setUserEmail(e.target.value)} placeholder="ivan@example.ru" className="w-full px-4 py-2 border border-gray-700 bg-gray-800 text-white rounded-lg focus:ring-2 focus:ring-yellow-400 focus:border-yellow-400 outline-none transition-colors" required />
           </div>
         </div>
       </div>
@@ -288,7 +303,7 @@ export function PhotoPrintForm({ onSuccess, onReset }) {
           <span className="text-sm text-gray-300 select-none">Я проверил(а) параметры заказа и подтверждаю их правильность</span>
         </label>
 
-        <button type="submit" disabled={photos.length === 0 || !isConfirmed || isLoading || !userName.trim() || !userPhone.trim()} className="w-full mt-4 flex items-center justify-center py-3 px-4 border border-transparent rounded-lg shadow-sm text-sm font-bold text-black bg-yellow-400 hover:bg-yellow-300 disabled:bg-gray-500 disabled:text-gray-300 disabled:cursor-not-allowed transition-colors">
+        <button type="submit" disabled={photos.length === 0 || !isConfirmed || isLoading || !userName.trim() || !userPhone.trim() || !userEmail.trim()} className="w-full mt-4 flex items-center justify-center py-3 px-4 border border-transparent rounded-lg shadow-sm text-sm font-bold text-black bg-yellow-400 hover:bg-yellow-300 disabled:bg-gray-500 disabled:text-gray-300 disabled:cursor-not-allowed transition-colors">
           {isLoading && <Loader2 className="w-5 h-5 mr-2 animate-spin" />}
           {isLoading ? 'Отправка...' : 'Оформить заказ'}
         </button>

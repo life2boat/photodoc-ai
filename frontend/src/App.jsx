@@ -7,6 +7,7 @@ import { PhotoPrintForm } from './components/PhotoPrintForm';
 import PolaroidWidget from './components/PolaroidWidget';
 import ServiceCalculator from './components/ServiceCalculator'; 
 import { RestoreWidget } from './components/RestoreWidget'; 
+import heroImage from './assets/hero.png';
 
 export default function App() {
   const [activeService, setActiveService] = useState('docs');
@@ -51,11 +52,23 @@ export default function App() {
               Узнать больше
             </button>
           </div>
+          <div className="mt-16 mx-auto w-full max-w-4xl overflow-hidden rounded-3xl border border-gray-800 bg-gray-900 aspect-[16/9] shadow-2xl">
+            <img
+              src={heroImage}
+              alt="Фото на документы, печать и реставрация в PhotoDoc AI"
+              width="1200"
+              height="675"
+              loading="eager"
+              fetchPriority="high"
+              className="h-full w-full object-cover"
+            />
+          </div>
         </div>
       </section>
 
       {/* Блок преимуществ */}
       <section className="py-24 px-4 bg-gray-900/50 border-y border-gray-800">
+        <h2 className="sr-only">Преимущества PhotoDoc AI</h2>
         <div className="max-w-5xl mx-auto grid grid-cols-1 md:grid-cols-3 gap-16">
           <div className="flex flex-col items-center text-center space-y-5">
             <div className="w-14 h-14 bg-gray-900 rounded-2xl flex items-center justify-center border border-gray-800">

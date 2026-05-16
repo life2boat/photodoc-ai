@@ -5,7 +5,9 @@ import httpx
 import smtplib
 import urllib.parse
 import hashlib
-from decimal import Decimal, InvalidOperation
+import html
+from pathlib import Path
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from datetime import datetime
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -16,8 +18,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 from pydantic import BaseModel
 
+BASE_DIR = Path(__file__).resolve().parent
+DB_PATH = BASE_DIR / "orders.db"
+
 # Загрузка переменных окружения
-load_dotenv()
+load_dotenv(BASE_DIR / ".env")
 
 # Настройка базового логирования
 logging.basicConfig(level=logging.INFO)
@@ -35,13 +40,17 @@ app.add_middleware(
 
 # --- Инициализация базы данных ---
 def init_db():
-    conn = sqlite3.connect("orders.db")
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS orders (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT,
             phone TEXT,
+            email TEXT,
+            format TEXT,
+            paper TEXT,
+            crop TEXT,
             comment TEXT,
             filename TEXT,
             status TEXT DEFAULT 'new',
@@ -49,7 +58,8 @@ def init_db():
             payment_amount TEXT,
             payment_method TEXT,
             robokassa_inv_id TEXT,
-            paid_at TEXT
+            paid_at TEXT,
+            payment_email_sent_at TEXT
         )
     ''')
     conn.commit()
@@ -59,17 +69,22 @@ init_db()
 
 
 def ensure_orders_schema():
-    conn = sqlite3.connect("orders.db")
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("PRAGMA table_info(orders)")
     columns = {row[1] for row in cursor.fetchall()}
     extra_columns = {
         "status": "TEXT DEFAULT 'new'",
+        "email": "TEXT",
+        "format": "TEXT",
+        "paper": "TEXT",
+        "crop": "TEXT",
         "payment_status": "TEXT DEFAULT 'unpaid'",
         "payment_amount": "TEXT",
         "payment_method": "TEXT",
         "robokassa_inv_id": "TEXT",
         "paid_at": "TEXT",
+        "payment_email_sent_at": "TEXT",
     }
     for column_name, column_sql in extra_columns.items():
         if column_name not in columns:
@@ -81,25 +96,21 @@ def ensure_orders_schema():
 ensure_orders_schema()
 
 # Создаем папку для локальных загрузок
-UPLOAD_DIR = "uploads"
+UPLOAD_DIR = BASE_DIR / "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 
 def format_robokassa_amount(value: float | int | str) -> str:
     try:
-        amount = Decimal(str(value))
+        amount = Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
     except (InvalidOperation, ValueError, TypeError):
         raise HTTPException(status_code=400, detail="Invalid amount")
 
-    normalized = amount.normalize()
-    amount_str = format(normalized, "f")
-    if "." in amount_str:
-        amount_str = amount_str.rstrip("0").rstrip(".")
-    return amount_str or "0"
+    return format(amount, ".2f")
 
 
 def update_order_payment(order_id: int, payment_amount: str, payment_status: str, payment_method: str = "robokassa"):
-    conn = sqlite3.connect("orders.db")
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute(
         """
@@ -124,7 +135,7 @@ def update_order_payment(order_id: int, payment_amount: str, payment_status: str
 
 
 def get_order_payment_amount(order_id: int):
-    conn = sqlite3.connect("orders.db")
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("SELECT payment_amount FROM orders WHERE id = ?", (order_id,))
     row = cursor.fetchone()
@@ -132,9 +143,61 @@ def get_order_payment_amount(order_id: int):
     return row[0] if row else None
 
 
+def get_order_for_email(order_id: int):
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT id, name, phone, email, format, paper, crop, comment, filename, payment_email_sent_at
+        FROM orders
+        WHERE id = ?
+        """,
+        (order_id,),
+    )
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def mark_order_payment_email_sent(order_id: int):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE orders SET payment_email_sent_at = ? WHERE id = ?",
+        (datetime.utcnow().isoformat(), order_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def send_client_paid_email_and_mark(order_id: int, order: dict):
+    if order.get("payment_email_sent_at"):
+        logging.info(f"Клиентский Email для оплаченного заказа {order_id} уже отправлялся, повтор пропущен.")
+        return
+
+    sent = send_client_paid_email(
+        order_id,
+        order.get("name") or "",
+        order.get("email") or "",
+    )
+    if sent:
+        mark_order_payment_email_sent(order_id)
+
+
+def schedule_paid_order_email(background_tasks: BackgroundTasks, order_id: int):
+    order = get_order_for_email(order_id)
+    if not order:
+        logging.error(f"Заказ {order_id} не найден для отправки Email после оплаты.")
+        return
+
+    background_tasks.add_task(send_client_paid_email_and_mark, order_id, order)
+
+
 class PaymentCreateRequest(BaseModel):
     order_id: int | str
     amount: float | int
+    email: str | None = None
 
 
 @app.post("/api/payment/create")
@@ -142,6 +205,7 @@ async def create_payment(payment: PaymentCreateRequest):
     merchant_login = os.getenv("ROBOKASSA_MERCHANT_LOGIN")
     password1 = os.getenv("ROBOKASSA_PASSWORD1")
     is_test = os.getenv("ROBOKASSA_IS_TEST", "1")
+    is_test_value = "1" if str(is_test).strip().lower() in {"1", "true", "yes", "on"} else "0"
 
     if not merchant_login or not password1:
         raise HTTPException(status_code=500, detail="Robokassa settings are not configured")
@@ -151,14 +215,20 @@ async def create_payment(payment: PaymentCreateRequest):
     except ValueError:
         raise HTTPException(status_code=400, detail="order_id must be an integer")
 
+    order = get_order_for_email(order_id_int)
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+
     amount = format_robokassa_amount(payment.amount)
     updated = update_order_payment(order_id_int, amount, "pending")
     if not updated:
         raise HTTPException(status_code=404, detail="Order not found")
 
     order_id = str(order_id_int)
+    customer_email = (payment.email or order.get("email") or "").strip()
+    signature_source = f"{merchant_login}:{amount}:{order_id}:{password1}"
     signature = hashlib.md5(
-        f"{merchant_login}:{amount}:{order_id}:{password1}".encode("utf-8")
+        signature_source.encode("utf-8")
     ).hexdigest()
     params = {
         "MerchantLogin": merchant_login,
@@ -166,8 +236,11 @@ async def create_payment(payment: PaymentCreateRequest):
         "InvId": order_id,
         "Description": f"Оплата_заказа_{order_id}",
         "SignatureValue": signature,
-        "IsTest": is_test,
+        "IsTest": is_test_value,
     }
+    if customer_email:
+        params["Email"] = customer_email
+
     payment_url = "https://auth.robokassa.ru/Merchant/Index.aspx?" + urllib.parse.urlencode(params)
     return {"payment_url": payment_url}
 
@@ -175,6 +248,23 @@ async def create_payment(payment: PaymentCreateRequest):
 def verify_robokassa_signature(out_sum: str, inv_id: str, signature: str, password: str) -> bool:
     expected = hashlib.md5(f"{out_sum}:{inv_id}:{password}".encode("utf-8")).hexdigest()
     return expected.lower() == signature.lower()
+
+
+def get_robokassa_signature(out_sum: str, inv_id: str, password: str) -> str:
+    return hashlib.md5(f"{out_sum}:{inv_id}:{password}".encode("utf-8")).hexdigest()
+
+
+def log_robokassa_signature_check(endpoint_name: str, out_sum: str, inv_id: str, signature: str, password: str) -> bool:
+    expected = get_robokassa_signature(out_sum, inv_id, password)
+    is_valid = expected.lower() == (signature or "").lower()
+    logging.info(
+        "%s: проверка подписи %s. expected=%s received=%s",
+        endpoint_name,
+        "прошла" if is_valid else "НЕ прошла",
+        expected,
+        signature,
+    )
+    return is_valid
 
 
 async def read_robokassa_payload(request: Request):
@@ -186,82 +276,226 @@ async def read_robokassa_payload(request: Request):
 
 
 @app.api_route("/api/payment/robokassa/result", methods=["GET", "POST"])
-async def robokassa_result(request: Request):
+async def robokassa_result(request: Request, background_tasks: BackgroundTasks):
+    logging.info("Получен запрос на Result URL от Робокассы: method=%s", request.method)
     password2 = os.getenv("ROBOKASSA_PASSWORD2")
     if not password2:
+        logging.error("Result URL: ROBOKASSA_PASSWORD2 не настроен")
         raise HTTPException(status_code=500, detail="Robokassa password2 is not configured")
 
     payload = await read_robokassa_payload(request)
     out_sum = payload.get("OutSum")
     inv_id = payload.get("InvId")
     signature = payload.get("SignatureValue")
+    logging.info("Result URL: OutSum=%s InvId=%s SignatureValue=%s", out_sum, inv_id, signature)
 
     if not out_sum or inv_id is None or not signature:
+        logging.error("Result URL: не хватает параметров Robokassa payload=%s", payload)
         raise HTTPException(status_code=400, detail="Missing Robokassa payload")
 
     try:
         order_id = int(str(inv_id))
     except ValueError:
+        logging.error("Result URL: некорректный InvId=%s", inv_id)
         raise HTTPException(status_code=400, detail="Invalid order id")
 
-    if not verify_robokassa_signature(str(out_sum), str(inv_id), str(signature), password2):
+    if not log_robokassa_signature_check("Result URL", str(out_sum), str(inv_id), str(signature), password2):
         raise HTTPException(status_code=400, detail="Invalid signature")
 
     stored_amount = get_order_payment_amount(order_id)
     expected_amount = format_robokassa_amount(stored_amount or out_sum)
+    logging.info("Result URL: order_id=%s stored_amount=%s expected_amount=%s", order_id, stored_amount, expected_amount)
     if format_robokassa_amount(out_sum) != expected_amount:
+        logging.error("Result URL: сумма не совпала. received=%s expected=%s", format_robokassa_amount(out_sum), expected_amount)
         raise HTTPException(status_code=400, detail="Amount mismatch")
 
     updated = update_order_payment(order_id, expected_amount, "paid")
     if not updated:
+        logging.error("Result URL: заказ %s не найден для обновления статуса paid", order_id)
         raise HTTPException(status_code=404, detail="Order not found")
+    logging.info("Result URL: заказ №%s обновлен на статус paid", order_id)
+
+    schedule_paid_order_email(background_tasks, order_id)
+    logging.info("Result URL: задача отправки клиентского письма для заказа №%s поставлена в background_tasks", order_id)
 
     return PlainTextResponse(f"OK{order_id}")
 
 
 @app.api_route("/api/payment/robokassa/success", methods=["GET", "POST"])
-async def robokassa_success(request: Request):
+async def robokassa_success(request: Request, background_tasks: BackgroundTasks):
+    logging.info("Получен запрос на Success URL от Робокассы: method=%s", request.method)
+    password1 = os.getenv("ROBOKASSA_PASSWORD1")
+    if not password1:
+        logging.error("Success URL: ROBOKASSA_PASSWORD1 не настроен")
+        raise HTTPException(status_code=500, detail="Robokassa password1 is not configured")
+
     payload = await read_robokassa_payload(request)
+    out_sum = payload.get("OutSum")
+    inv_id = payload.get("InvId")
+    signature = payload.get("SignatureValue")
+    order_id = None
+    logging.info("Success URL: OutSum=%s InvId=%s SignatureValue=%s", out_sum, inv_id, signature)
+
+    if out_sum and inv_id is not None and signature:
+        try:
+            order_id = int(str(inv_id))
+        except ValueError:
+            logging.error("Success URL: некорректный InvId=%s", inv_id)
+            raise HTTPException(status_code=400, detail="Invalid order id")
+
+        if not log_robokassa_signature_check("Success URL", str(out_sum), str(inv_id), str(signature), password1):
+            raise HTTPException(status_code=400, detail="Invalid signature")
+
+        expected_amount = format_robokassa_amount(get_order_payment_amount(order_id) or out_sum)
+        logging.info("Success URL: order_id=%s expected_amount=%s", order_id, expected_amount)
+        if format_robokassa_amount(out_sum) != expected_amount:
+            logging.error("Success URL: сумма не совпала. received=%s expected=%s", format_robokassa_amount(out_sum), expected_amount)
+            raise HTTPException(status_code=400, detail="Amount mismatch")
+
+        updated = update_order_payment(order_id, expected_amount, "paid")
+        if not updated:
+            logging.error("Success URL: заказ %s не найден для обновления статуса paid", order_id)
+            raise HTTPException(status_code=404, detail="Order not found")
+        logging.info("Success URL: заказ №%s обновлен на статус paid", order_id)
+
+        schedule_paid_order_email(background_tasks, order_id)
+        logging.info("Success URL: задача отправки клиентского письма для заказа №%s поставлена в background_tasks", order_id)
+    else:
+        logging.warning("Success URL: параметры оплаты пришли не полностью, письмо клиенту не ставилось. payload=%s", payload)
+
     return JSONResponse(
         {
             "ok": True,
-            "order_id": payload.get("InvId"),
+            "order_id": order_id or payload.get("InvId"),
             "message": "Платеж подтвержден",
         }
     )
 
 # --- Фоновая задача 1: Отправка Email ---
-def send_order_email(order_id: int, name: str, phone: str, comment: str, format: str = "Не указан", paper: str = "Не указана", crop: str = "Не указано"):
+def create_email_message(sender: str, recipient: str, subject: str, text_body: str, html_body: str | None = None):
+    msg = MIMEMultipart("alternative") if html_body else MIMEMultipart()
+    msg["From"] = sender
+    msg["To"] = recipient
+    msg["Subject"] = subject
+    msg.attach(MIMEText(text_body, "plain", "utf-8"))
+    if html_body:
+        msg.attach(MIMEText(html_body, "html", "utf-8"))
+    return msg
+
+
+def build_yandex_disk_link(order_id: int, name: str):
+    safe_folder_name = f"Заказ_{order_id}_{(name or '').replace(' ', '_')}"
+    raw_path = f"PhotoDoc_Orders/{safe_folder_name}"
+    safe_url_path = urllib.parse.quote(raw_path)
+    return f"https://disk.yandex.ru/client/disk/{safe_url_path}"
+
+
+def send_admin_order_email(
+    order_id: int,
+    name: str,
+    phone: str,
+    client_email: str = "",
+    comment: str = "",
+    format: str = "Не указан",
+    paper: str = "Не указана",
+    crop: str = "Не указано",
+    filenames: str = "",
+    remote_folder_path: str = "",
+):
     smtp_server = os.getenv("SMTP_SERVER")
     smtp_port = int(os.getenv("SMTP_PORT", 465))
     smtp_user = os.getenv("SMTP_USER")
     smtp_password = os.getenv("SMTP_PASSWORD")
-    email_to = os.getenv("EMAIL_TO")
+    admin_email = os.getenv("EMAIL_TO")
+    client_email = (client_email or "").strip()
 
-    if not all([smtp_server, smtp_user, smtp_password, email_to]):
+    if not all([smtp_server, smtp_user, smtp_password, admin_email]):
         logging.error("Не все настройки SMTP заданы в .env")
-        return
-
-    msg = MIMEMultipart()
-    msg["From"] = smtp_user
-    msg["To"] = email_to
-    msg["Subject"] = f"Новый заказ #{order_id} | PhotoDoc AI"
-    
-    safe_folder_name = f"Заказ_{order_id}_{name.replace(' ', '_')}"
-    raw_path = f"PhotoDoc_Orders/{safe_folder_name}"
-    safe_url_path = urllib.parse.quote(raw_path)
-    yandex_disk_link = f"https://disk.yandex.ru/client/disk/{safe_url_path}"
-    
-    body = f"Новый заказ!\nНомер: {order_id}\nИмя: {name}\nТелефон: {phone}\nФормат: {format}\nБумага: {paper}\nКадрирование: {crop}\nКомментарий: {comment}\n\nСсылка на Яндекс.Диск: {yandex_disk_link}"
-    msg.attach(MIMEText(body, "plain"))
+        return False
 
     try:
+        yandex_disk_link = build_yandex_disk_link(order_id, name)
+        admin_body = (
+            f"Новый заказ!\n"
+            f"Номер: {order_id}\n"
+            f"Имя: {name}\n"
+            f"Телефон: {phone}\n"
+            f"Email клиента: {client_email or 'Не указан'}\n"
+            f"Формат: {format}\n"
+            f"Бумага: {paper}\n"
+            f"Кадрирование: {crop}\n"
+            f"Комментарий: {comment}\n"
+            f"Файлы: {filenames or 'Не указаны'}\n"
+            f"Папка на Яндекс.Диске: {remote_folder_path or 'Будет создана фоновой задачей'}\n\n"
+            f"Ссылка на Яндекс.Диск: {yandex_disk_link}"
+        )
+        admin_msg = create_email_message(
+            smtp_user,
+            admin_email,
+            f"Новый заказ #{order_id} | PhotoDoc AI",
+            admin_body,
+        )
+
         with smtplib.SMTP_SSL(smtp_server, smtp_port) as server:
             server.login(smtp_user, smtp_password)
-            server.send_message(msg)
-        logging.info(f"Email для заказа {order_id} успешно отправлен.")
+            server.send_message(admin_msg)
+
+        logging.info(f"Административный Email для заказа {order_id} успешно отправлен.")
+        return True
     except Exception as e:
-        logging.error(f"Ошибка при отправке Email: {e}")
+        logging.error(f"Ошибка при отправке административного Email: {e}")
+        return False
+
+
+def send_client_paid_email(order_id: int, name: str, client_email: str = ""):
+    smtp_server = os.getenv("SMTP_SERVER")
+    smtp_port = int(os.getenv("SMTP_PORT", 465))
+    smtp_user = os.getenv("SMTP_USER")
+    smtp_password = os.getenv("SMTP_PASSWORD")
+    client_email = (client_email or "").strip()
+
+    if not all([smtp_server, smtp_user, smtp_password]):
+        logging.error("Не все настройки SMTP заданы в .env")
+        return False
+
+    if not client_email:
+        logging.warning(f"Клиентский Email для заказа {order_id} не отправлен: email клиента не указан.")
+        return False
+
+    try:
+        client_text = (
+            f"Здравствуйте, {name or 'клиент'}!\n\n"
+            f"Спасибо за заказ в PhotoDoc AI. Ваш заказ №{order_id} успешно оплачен и взят в работу.\n"
+            f"Мы сообщим вам о готовности.\n\n"
+            f"С уважением,\nPhotoDoc AI"
+        )
+        safe_client_name = html.escape(name or "клиент")
+        client_html = f"""
+        <div style="font-family:Arial,sans-serif;color:#111827;line-height:1.6">
+          <h2 style="margin:0 0 16px;color:#111827">Спасибо за заказ в PhotoDoc AI!</h2>
+          <p>Здравствуйте, {safe_client_name}.</p>
+          <p>Ваш заказ <strong>№{order_id}</strong> успешно оплачен и взят в работу.</p>
+          <p>Мы сообщим вам о готовности.</p>
+          <p style="margin-top:24px;color:#6b7280">С уважением,<br>PhotoDoc AI</p>
+        </div>
+        """
+
+        with smtplib.SMTP_SSL(smtp_server, smtp_port) as server:
+            server.login(smtp_user, smtp_password)
+            client_msg = create_email_message(
+                smtp_user,
+                client_email,
+                f"Заказ №{order_id} оплачен | PhotoDoc AI",
+                client_text,
+                client_html,
+            )
+            server.send_message(client_msg)
+
+        logging.info(f"Клиентский Email для заказа {order_id} успешно отправлен на {client_email}.")
+        return True
+    except Exception as e:
+        logging.error(f"Ошибка при отправке клиентского Email: {e}")
+        return False
 
 # --- Вспомогательная функция для Яндекс.Диска ---
 def ensure_yandex_folder(token: str, path: str):
@@ -371,6 +605,7 @@ async def create_order(
     background_tasks: BackgroundTasks,
     name: str = Form(...),
     phone: str = Form(...),
+    email: str = Form(""),
     comment: str = Form(""),
     format: str = Form("Не указан"),
     paper: str = Form("Не указана"),
@@ -380,11 +615,14 @@ async def create_order(
     try:
         # 1. Сохраняем данные в SQLite для получения номера заказа
         filenames = ", ".join([f.filename for f in files])
-        conn = sqlite3.connect("orders.db")
+        conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         cursor.execute(
-            "INSERT INTO orders (name, phone, comment, filename) VALUES (?, ?, ?, ?)",
-            (name, phone, comment, filenames)
+            """
+            INSERT INTO orders (name, phone, email, format, paper, crop, comment, filename)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (name, phone, email.strip(), format, paper, crop, comment, filenames)
         )
         conn.commit()
         order_id = cursor.lastrowid
@@ -411,8 +649,20 @@ async def create_order(
             # 5. Передаем работу в фоновые задачи (для каждого файла)
             background_tasks.add_task(upload_to_yandex_disk, local_file_path, remote_folder_path, remote_file_name)
             
-        # Фоновая задача для Email выполняется один раз на весь заказ
-        background_tasks.add_task(send_order_email, order_id, name, phone, comment, format, paper, crop)
+        # Техническое письмо администратору отправляем сразу при создании заказа.
+        background_tasks.add_task(
+            send_admin_order_email,
+            order_id,
+            name,
+            phone,
+            email.strip(),
+            comment,
+            format,
+            paper,
+            crop,
+            filenames,
+            remote_folder_path,
+        )
 
         # Фоновая задача для текстового файла с деталями заказа
         background_tasks.add_task(upload_info_to_yandex_disk, order_id, name, phone, format, paper, crop, comment, remote_folder_path)

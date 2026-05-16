@@ -1,4 +1,6 @@
-const PAYMENT_API_URL = 'http://localhost:8000/api/payment/create';
+import { API_BASE_URL } from '../config';
+
+const PAYMENT_API_URL = `${API_BASE_URL}/api/payment/create`;
 
 export async function createPaymentUrl(orderId, amount) {
   const response = await fetch(PAYMENT_API_URL, {

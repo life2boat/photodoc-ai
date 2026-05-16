@@ -1,5 +1,7 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { MessageCircle, X, Send, Loader2 } from 'lucide-react';
+import { API_BASE_URL } from '../config';
+import { reachGoal } from '../lib/analytics';
 
 export default function AssistantWidget() {
   const [isOpen, setIsOpen] = useState(false);
@@ -22,11 +24,12 @@ export default function AssistantWidget() {
 
     const userText = input.trim();
     setMessages(prev => [...prev, { role: 'user', text: userText }]);
+    reachGoal('CHAT_MESSAGE_SENT');
     setInput('');
     setIsLoading(true);
 
     try {
-      const response = await fetch('http://localhost:8000/api/chat', {
+      const response = await fetch(`${API_BASE_URL}/api/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ message: userText })
@@ -50,6 +53,7 @@ export default function AssistantWidget() {
     return (
       <button
         onClick={() => setIsOpen(true)}
+        aria-label="Открыть чат"
         className="fixed bottom-8 right-8 z-50 w-16 h-16 bg-yellow-400 rounded-full shadow-lg transition-transform hover:scale-110 flex items-center justify-center"
         title="Открыть помощника"
       >
@@ -65,6 +69,7 @@ export default function AssistantWidget() {
         <span className="font-semibold tracking-wide">Консультант PhotoDoc</span>
         <button
           onClick={() => setIsOpen(false)}
+          aria-label="Закрыть чат"
           className="text-gray-400 hover:text-white transition-colors p-1"
           title="Закрыть чат"
         >
@@ -112,7 +117,7 @@ export default function AssistantWidget() {
             className="w-full pr-12 pl-4 py-3 bg-gray-950 border border-gray-700 rounded-full focus:bg-gray-900 focus:border-yellow-400 text-white placeholder-gray-500 outline-none transition-all text-sm"
             disabled={isLoading}
           />
-          <button onClick={sendMessage} disabled={!input.trim() || isLoading} className="absolute right-2 top-1/2 -translate-y-1/2 w-8 h-8 flex items-center justify-center bg-yellow-400 text-black rounded-full hover:bg-yellow-300 disabled:bg-gray-600 disabled:text-gray-400 disabled:cursor-not-allowed transition-colors shadow-sm">
+          <button onClick={sendMessage} disabled={!input.trim() || isLoading} aria-label="Отправить сообщение" className="absolute right-2 top-1/2 -translate-y-1/2 w-8 h-8 flex items-center justify-center bg-yellow-400 text-black rounded-full hover:bg-yellow-300 disabled:bg-gray-600 disabled:text-gray-400 disabled:cursor-not-allowed transition-colors shadow-sm">
             <Send size={16} className="-ml-0.5" />
           </button>
         </div>

@@ -1,6 +1,7 @@
 import { useState, useCallback, useEffect } from 'react';
 import { useDropzone } from 'react-dropzone';
 import { UploadCloud, ImageMinus, Download, LoaderCircle } from 'lucide-react';
+import { API_BASE_URL } from '../config';
 
 // Простой компонент для уведомлений (можно заменить на react-hot-toast или аналог)
 const Toast = ({ message, show, onClose }) => {
@@ -75,7 +76,7 @@ const RemoveBgWidget = () => {
 
     try {
       // Адрес должен совпадать с тем, где запущен FastAPI (обычно 8000)
-      const response = await fetch('http://127.0.0.1:8000/api/remove-bg', {
+      const response = await fetch(`${API_BASE_URL}/api/remove-bg`, {
         method: 'POST',
         body: formData,
       });
@@ -123,9 +124,10 @@ const RemoveBgWidget = () => {
             <input {...getInputProps()} />
             {previewUrl ? (
               <>
-                <img src={previewUrl} alt="Preview" className="max-h-full object-contain rounded-md" />
+                <img src={previewUrl} alt="Preview" width="320" height="320" loading="lazy" decoding="async" className="max-h-full object-contain rounded-md" />
                 <button 
                     onClick={(e) => { e.stopPropagation(); resetState(); }}
+                    aria-label="Удалить фото"
                     className="absolute top-2 right-2 bg-red-500 text-white rounded-full p-1.5 shadow-lg hover:bg-red-600 transition-transform transform hover:scale-110"
                     title="Удалить фото"
                 >
@@ -156,7 +158,7 @@ const RemoveBgWidget = () => {
               </div>
             )}
             {resultUrl && !isLoading && (
-              <img src={resultUrl} alt="Result" className="max-h-full max-w-full object-contain" />
+              <img src={resultUrl} alt="Result" width="320" height="320" loading="lazy" decoding="async" className="max-h-full max-w-full object-contain" />
             )}
             {!resultUrl && !isLoading && (
                 <p className="text-gray-500">Здесь появится результат</p>

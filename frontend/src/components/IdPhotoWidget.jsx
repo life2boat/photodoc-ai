@@ -1,6 +1,8 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { UploadCloud, Loader2, Trash2, X } from 'lucide-react';
 import { redirectToPayment } from '../lib/robokassa';
+import { API_BASE_URL } from '../config';
+import { reachGoal } from '../lib/analytics';
 
 const PHOTO_FORMATS = [
   { id: '3x4', label: '3х4 см (Медицинская книжка, удостоверения)', price: 300 },
@@ -28,12 +30,17 @@ const FilePreview = ({ file, onRemove }) => {
         <img
           src={previewUrl}
           alt="preview"
+          width="320"
+          height="320"
+          loading="lazy"
+          decoding="async"
           className="w-full h-full object-cover rounded-lg border border-neutral-200 shadow-sm"
         />
       )}
       <button
         type="button"
         onClick={onRemove}
+        aria-label="Удалить файл"
         className="absolute -top-2 -right-2 bg-red-500 text-white rounded-full p-1 opacity-0 group-hover:opacity-100 transition-opacity shadow-md hover:bg-red-600"
         title="Удалить фото"
       >
@@ -53,6 +60,7 @@ export default function IdPhotoWidget({ onSuccess, onReset }) {
 
   const [userName, setUserName] = useState('');
   const [userPhone, setUserPhone] = useState('');
+  const [userEmail, setUserEmail] = useState('');
   const [userComment, setUserComment] = useState('');
   const [selectedFormat, setSelectedFormat] = useState('3.5x4.5');
 
@@ -68,7 +76,7 @@ export default function IdPhotoWidget({ onSuccess, onReset }) {
   };
 
   const handleSubmitOrder = async () => {
-    if (files.length === 0 || !userName.trim() || !userPhone.trim()) return;
+    if (files.length === 0 || !userName.trim() || !userPhone.trim() || !userEmail.trim()) return;
     
     setIsLoading(true);
     setError(null);
@@ -80,6 +88,10 @@ export default function IdPhotoWidget({ onSuccess, onReset }) {
     const formData = new FormData();
     formData.append('name', userName);
     formData.append('phone', userPhone);
+    formData.append('email', userEmail);
+    formData.append('format', formatLabel);
+    formData.append('paper', 'Цифровая обработка');
+    formData.append('crop', 'По стандарту документа');
     
     const finalComment = `🪪 ФОТО НА ДОКУМЕНТЫ | Тип: ${formatLabel} | Сумма: ${price} руб.` + (userComment ? ` | Комментарий клиента: ${userComment}` : '');
     formData.append('comment', finalComment);
@@ -89,7 +101,7 @@ export default function IdPhotoWidget({ onSuccess, onReset }) {
     });
 
     try {
-      const apiResponse = await fetch('http://localhost:8000/api/order', {
+      const apiResponse = await fetch(`${API_BASE_URL}/api/order`, {
         method: 'POST',
         body: formData,
       });
@@ -103,6 +115,7 @@ export default function IdPhotoWidget({ onSuccess, onReset }) {
       setOrderId(data.order_id || '...');
       setPaymentAmount(price);
       setIsSuccess(true);
+      reachGoal('ORDER_CREATED');
       if (onSuccess) onSuccess();
     } catch (err) {
       console.error(err);
@@ -117,6 +130,7 @@ export default function IdPhotoWidget({ onSuccess, onReset }) {
     setIsSuccess(false);
     setUserName('');
     setUserPhone('');
+    setUserEmail('');
     setUserComment('');
     setError(null);
     setOrderId(null);
@@ -171,7 +185,7 @@ export default function IdPhotoWidget({ onSuccess, onReset }) {
                 <button onClick={() => fileInputRef.current?.click()} disabled={isLoading} className="text-yellow-400 hover:text-yellow-300 text-sm font-medium transition-colors">
                   + Добавить
                 </button>
-                <button onClick={handleReset} disabled={isLoading} className="text-gray-500 hover:text-red-500 p-1 transition-colors" title="Удалить все">
+                <button onClick={handleReset} disabled={isLoading} className="text-gray-500 hover:text-red-500 p-1 transition-colors" title="Удалить все" aria-label="Удалить все фото">
                   <Trash2 className="w-5 h-5" />
                 </button>
               </div>
@@ -211,10 +225,14 @@ export default function IdPhotoWidget({ onSuccess, onReset }) {
               <input type="tel" value={userPhone} onChange={(e) => setUserPhone(e.target.value)} placeholder="+7 (999) 000-00-00" disabled={isLoading} className="w-full border border-gray-700 rounded-lg px-4 py-2.5 focus:outline-none focus:ring-2 focus:ring-yellow-400 bg-gray-800 text-white disabled:opacity-50" />
             </div>
             <div>
+              <label className="block text-sm font-medium text-gray-400 mb-1">Email для подтверждения</label>
+              <input type="email" value={userEmail} onChange={(e) => setUserEmail(e.target.value)} placeholder="ivan@example.ru" disabled={isLoading} className="w-full border border-gray-700 rounded-lg px-4 py-2.5 focus:outline-none focus:ring-2 focus:ring-yellow-400 bg-gray-800 text-white disabled:opacity-50" />
+            </div>
+            <div>
               <label className="block text-sm font-medium text-gray-400 mb-1">Комментарий к заказу</label>
               <textarea value={userComment} onChange={(e) => setUserComment(e.target.value)} placeholder="Например: сделать в костюме, убрать прыщик" disabled={isLoading} className="w-full border border-gray-700 rounded-lg px-4 py-2.5 focus:outline-none focus:ring-2 focus:ring-yellow-400 bg-gray-800 text-white disabled:opacity-50 resize-none h-24" />
             </div>
-            <button onClick={handleSubmitOrder} disabled={isLoading || files.length === 0 || !userName.trim() || !userPhone.trim()} className="w-full mt-2 bg-yellow-400 text-black font-bold py-3.5 px-4 rounded-lg flex items-center justify-center hover:bg-yellow-300 transition-all disabled:bg-gray-500 disabled:text-gray-300 disabled:cursor-not-allowed">
+            <button onClick={handleSubmitOrder} disabled={isLoading || files.length === 0 || !userName.trim() || !userPhone.trim() || !userEmail.trim()} className="w-full mt-2 bg-yellow-400 text-black font-bold py-3.5 px-4 rounded-lg flex items-center justify-center hover:bg-yellow-300 transition-all disabled:bg-gray-500 disabled:text-gray-300 disabled:cursor-not-allowed">
               {isLoading ? ( <><Loader2 className="mr-2 h-5 w-5 animate-spin" /> Отправка...</> ) : ( 'Оформить заказ' )}
             </button>
           </div>
