@@ -181,8 +181,8 @@ export function RestoreWidget({ onSuccess, onReset }) {
   if (isSuccess) {
     return (
       <div className="bg-green-50 border border-green-200 text-green-800 rounded-xl p-8 text-center space-y-4 animate-in fade-in zoom-in duration-300 max-w-2xl mx-auto">
-        <h2 className="text-2xl font-bold">✅ Заказ №{orderId} принят!</h2>
-        <p className="text-green-700">Мы получили ваши фотографии и скоро приступим к работе.</p>
+        <h2 className="text-2xl font-bold animate-check-pop">✅ Фото успешно отправлено в обработку</h2>
+        <p className="text-green-700">Заказ №{orderId} принят. Мы получили ваши фотографии и скоро приступим к работе.</p>
         <div className="flex flex-col sm:flex-row gap-4 justify-center mt-6">
           <button
             type="button"
@@ -243,6 +243,12 @@ export function RestoreWidget({ onSuccess, onReset }) {
               </div>
             </div>
             <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 overflow-y-auto max-h-96 p-2">
+              {isLoading && (
+                <div className="col-span-full space-y-3 rounded-xl border border-white/10 bg-white/5 p-4">
+                  <div className="shimmer h-3 rounded-full bg-white/10" />
+                  <div className="shimmer h-3 w-2/3 rounded-full bg-white/10" />
+                </div>
+              )}
               {selectedFiles.map((f, index) => (
                 <FilePreview
                   key={index}

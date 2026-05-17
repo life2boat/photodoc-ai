@@ -71,6 +71,7 @@ export function PhotoPrintForm({ onSuccess, onReset }) {
   const [userEmail, setUserEmail] = useState('');
   const [orderId, setOrderId] = useState(null);
   const [paymentAmount, setPaymentAmount] = useState(0);
+  const [isDragging, setIsDragging] = useState(false);
 
   const fileInputRef = useRef(null);
 
@@ -97,11 +98,22 @@ export function PhotoPrintForm({ onSuccess, onReset }) {
   const pricePerPiece = (PRICES.format[format] || 0) + (PRICES.paper[paperType] || 0);
   const totalPrice = pricePerPiece * photos.length;
 
+  const addPhotos = (fileList) => {
+    const newFiles = Array.from(fileList || []).filter(file => file.type.startsWith('image/'));
+    if (newFiles.length === 0) return;
+    setPhotos(prev => [...prev, ...newFiles]);
+  };
+
   const handleFileSelect = (e) => {
     if (e.target.files && e.target.files.length > 0) {
-      const newFiles = Array.from(e.target.files).filter(file => file.type.startsWith('image/'));
-      setPhotos(prev => [...prev, ...newFiles]);
+      addPhotos(e.target.files);
     }
+  };
+
+  const handleDrop = (e) => {
+    e.preventDefault();
+    setIsDragging(false);
+    addPhotos(e.dataTransfer.files);
   };
 
   const handleSubmit = async (e) => {
@@ -169,8 +181,8 @@ export function PhotoPrintForm({ onSuccess, onReset }) {
     return (
       <div className="bg-green-50 border border-green-200 text-green-800 rounded-xl p-8 text-center space-y-4">
         <CheckCircle className="w-16 h-16 mx-auto text-green-500" />
-        <h2 className="text-2xl font-bold">Ваш заказ №{orderId} сформирован!</h2>
-        <p className="text-green-700">Перейдите к оплате для запуска в печать.</p>
+        <h2 className="text-2xl font-bold animate-check-pop">Фото успешно отправлено в обработку</h2>
+        <p className="text-green-700">Заказ №{orderId} сформирован. Перейдите к оплате для запуска в печать.</p>
         <div className="flex flex-col sm:flex-row gap-4 justify-center mt-6">
           <button
             type="button"
@@ -210,10 +222,13 @@ export function PhotoPrintForm({ onSuccess, onReset }) {
       <div className="space-y-4">
         <h3 className="text-lg font-semibold text-white border-b border-gray-800 pb-2">1. Загрузите фотографии</h3>
         <div
-          className="group relative cursor-pointer overflow-hidden rounded-3xl border border-dashed border-white/15 bg-[radial-gradient(circle_at_50%_0%,rgba(30,58,138,0.22),transparent_45%),linear-gradient(145deg,rgba(255,255,255,0.055),rgba(2,8,23,0.72))] p-10 text-center shadow-[inset_0_1px_0_rgba(255,255,255,0.06),0_0_40px_rgba(15,23,42,0.55)] backdrop-blur-xl transition-all duration-300 hover:-translate-y-1 hover:border-yellow-500/45 hover:shadow-[inset_0_1px_0_rgba(255,255,255,0.08),0_0_48px_rgba(202,138,4,0.10)]"
+          onDragOver={(e) => { e.preventDefault(); setIsDragging(true); }}
+          onDragLeave={(e) => { e.preventDefault(); setIsDragging(false); }}
+          onDrop={handleDrop}
+          className={`group relative cursor-pointer overflow-hidden rounded-3xl border border-dashed bg-[radial-gradient(circle_at_50%_0%,rgba(30,58,138,0.22),transparent_45%),linear-gradient(145deg,rgba(255,255,255,0.055),rgba(2,8,23,0.72))] p-10 text-center shadow-[inset_0_1px_0_rgba(255,255,255,0.06),0_0_40px_rgba(15,23,42,0.55)] backdrop-blur-xl transition-all duration-300 hover:-translate-y-1 hover:shadow-[inset_0_1px_0_rgba(255,255,255,0.08),0_0_48px_rgba(202,138,4,0.10)] ${isDragging ? 'border-yellow-500/60 bg-yellow-500/10' : 'border-white/15 hover:border-yellow-500/45'}`}
           onClick={() => fileInputRef.current?.click()}
         >
-          <div className="pointer-events-none absolute inset-x-10 top-0 h-px bg-gradient-to-r from-transparent via-yellow-500/35 to-transparent opacity-0 transition-opacity group-hover:opacity-100" />
+          <div className={`pointer-events-none absolute inset-x-10 top-0 h-px bg-gradient-to-r from-transparent via-yellow-500/35 to-transparent transition-opacity ${isDragging ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'}`} />
           <input type="file" ref={fileInputRef} onChange={handleFileSelect} accept="image/png, image/jpeg, image/webp" multiple className="hidden" />
           <div className="relative mx-auto mb-5 flex h-16 w-16 items-center justify-center rounded-2xl border border-yellow-500/20 bg-yellow-500/10 shadow-[0_0_28px_rgba(202,138,4,0.12)] transition-transform group-hover:scale-110">
             <UploadCloud className="w-8 h-8 text-yellow-300" />
@@ -222,10 +237,17 @@ export function PhotoPrintForm({ onSuccess, onReset }) {
           <p className="text-sm text-zinc-400 mt-2 leading-6">
             {photos.length > 0 ? <span className="text-yellow-400 font-bold">Выбрано файлов: {photos.length} шт.</span> : 'Поддерживаются JPG, PNG, WEBP'}
           </p>
+          <p className="text-xs text-zinc-500">Можно загрузить сразу несколько фотографий</p>
         </div>
 
         {photos.length > 0 && (
           <div className="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-5 gap-4 mt-6">
+            {isLoading && (
+              <div className="col-span-full space-y-3 rounded-xl border border-white/10 bg-white/5 p-4">
+                <div className="shimmer h-3 rounded-full bg-white/10" />
+                <div className="shimmer h-3 w-2/3 rounded-full bg-white/10" />
+              </div>
+            )}
             {photos.map((photo, index) => (
               <PhotoPreview
                 key={index}

@@ -40,6 +40,49 @@ export default function App() {
     { id: 'polaroid', title: 'Печать Polaroid', icon: ImageIcon },
   ];
 
+  const trustBadges = [
+    'Проверка специалистом',
+    'Соответствие ГОСТ и визовым требованиям',
+    'Готовность в течение 1–2 часов',
+    'Поддержка по email и телефону',
+  ];
+
+  const exampleCards = [
+    {
+      title: 'Паспорт',
+      subtitle: 'Фото 35×45 • Белый фон',
+      before: 'https://images.unsplash.com/photo-1544005313-94ddf0286df2?w=500&q=80',
+      after: 'https://images.unsplash.com/photo-1544005313-94ddf0286df2?w=500&q=80&auto=format&bg=fff',
+      mode: 'reveal',
+    },
+    {
+      title: 'Виза',
+      subtitle: 'Шенген • Ровный свет',
+      before: 'https://images.unsplash.com/photo-1544005313-94ddf0286df2?w=500&q=80',
+      after: 'https://images.unsplash.com/photo-1544005313-94ddf0286df2?w=500&q=80&auto=format&bg=fff',
+      mode: 'reveal',
+    },
+    {
+      title: 'Резюме',
+      subtitle: 'Деловой портрет • Чистый кадр',
+      image: 'https://images.unsplash.com/photo-1560250097-0b93528c311a?w=500&q=80',
+      mode: 'business',
+    },
+    {
+      title: 'Polaroid',
+      subtitle: 'Ретро-рамка • Атмосферная печать',
+      image: 'https://images.unsplash.com/photo-1528590547842-836798c8959f?w=500&q=80',
+      mode: 'polaroid',
+    },
+    {
+      title: 'Реставрация',
+      subtitle: 'Восстановление • Цвет и детали',
+      before: 'https://images.unsplash.com/photo-1506891536236-3e0789256d9e?w=500&q=80&grayscale=1',
+      after: 'https://images.unsplash.com/photo-1506891536236-3e0789256d9e?w=500&q=80',
+      mode: 'reveal',
+    },
+  ];
+
   return (
     <div className="min-h-screen bg-[#02040a] text-white font-sans selection:bg-yellow-400 selection:text-black">
       {/* Шапка */}
@@ -125,6 +168,14 @@ export default function App() {
             <span>✓ Более 5000 обработанных фото</span>
             <span>✓ Готовность за 5 минут</span>
             <span>✓ Поддержка всех типов документов</span>
+          </div>
+
+          <div className="mx-auto mt-10 grid max-w-5xl grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
+            {trustBadges.map((badge) => (
+              <div key={badge} className="rounded-2xl border border-white/10 bg-white/[0.04] px-4 py-3 text-sm font-medium text-zinc-200 backdrop-blur-xl">
+                ✓ {badge}
+              </div>
+            ))}
           </div>
         </div>
       </section>
@@ -254,6 +305,87 @@ export default function App() {
                 <div className="rounded-full border border-white/10 bg-black/30 px-3 py-2">Проверка вручную</div>
               </div>
             </aside>
+          </div>
+        </div>
+      </section>
+
+      <section id="examples-showcase" className="relative overflow-hidden px-4 py-24">
+        <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_50%_18%,rgba(30,58,138,0.18),transparent_36%),radial-gradient(circle_at_15%_72%,rgba(202,138,4,0.08),transparent_28%)]" />
+        <div className="relative mx-auto max-w-6xl">
+          <div className="mb-12 text-center">
+            <h2 className="text-3xl font-bold tracking-tighter text-white md:text-4xl">Примеры работ</h2>
+            <p className="mx-auto mt-4 max-w-2xl text-base leading-7 text-zinc-300">
+              Визуальные сценарии для самых популярных услуг: аккуратный свет, чистый фон и готовый результат без лишней суеты.
+            </p>
+          </div>
+
+          <div className="hide-scrollbar -mx-4 flex snap-x gap-4 overflow-x-auto px-4 pb-4 md:mx-0 md:grid md:grid-cols-5 md:overflow-visible md:px-0 md:pb-0">
+            {exampleCards.map((card) => (
+              <article
+                key={card.title}
+                className="group relative min-w-[78vw] snap-center overflow-hidden rounded-2xl border border-white/10 bg-white/5 backdrop-blur-md transition-all duration-300 ease-in-out hover:-translate-y-1 hover:border-yellow-500/30 hover:shadow-[0_0_44px_rgba(202,138,4,0.12)] sm:min-w-[360px] md:min-w-0"
+              >
+                <div className="relative aspect-[4/5] overflow-hidden bg-[radial-gradient(circle_at_50%_18%,rgba(255,255,255,0.10),transparent_26%),linear-gradient(145deg,#0a1020,#02040a)]">
+                  {card.mode === 'reveal' && (
+                    <>
+                      <img
+                        src={card.before}
+                        alt={`${card.title}: до обработки`}
+                        loading="lazy"
+                        className="h-full w-full object-cover transition-transform duration-500 ease-in-out group-hover:scale-[1.03]"
+                      />
+                      <img
+                        src={card.after}
+                        alt={`${card.title}: после обработки`}
+                        loading="lazy"
+                        className="absolute inset-0 h-full w-full object-cover opacity-0 transition-all duration-500 ease-in-out group-hover:opacity-100 group-hover:scale-[1.03]"
+                      />
+                      <div className="absolute left-3 top-3 rounded-full bg-zinc-950/70 px-3 py-1 text-xs font-semibold text-zinc-200 backdrop-blur-md transition-opacity duration-300 group-hover:opacity-0">
+                        До
+                      </div>
+                      <div className="absolute right-3 top-3 rounded-full bg-zinc-950/70 px-3 py-1 text-xs font-semibold text-white opacity-0 backdrop-blur-md transition-opacity duration-300 group-hover:opacity-100">
+                        После
+                      </div>
+                    </>
+                  )}
+
+                  {card.mode === 'business' && (
+                    <div className="relative h-full p-4">
+                      <img
+                        src={card.image}
+                        alt={card.title}
+                        loading="lazy"
+                        className="h-full w-full rounded-xl object-cover shadow-[0_18px_50px_rgba(0,0,0,0.35)] transition-transform duration-500 ease-in-out group-hover:scale-[1.025]"
+                      />
+                      <div className="absolute inset-x-6 bottom-6 rounded-xl border border-white/10 bg-black/45 px-4 py-3 backdrop-blur-md">
+                        <p className="text-xs font-semibold uppercase tracking-[0.18em] text-yellow-200/80">Business</p>
+                        <p className="mt-1 text-sm font-semibold text-white">Профессиональный портрет</p>
+                      </div>
+                    </div>
+                  )}
+
+                  {card.mode === 'polaroid' && (
+                    <div className="flex h-full items-center justify-center bg-[radial-gradient(circle_at_50%_42%,rgba(250,204,21,0.10),transparent_34%),linear-gradient(145deg,#08111f,#02040a)] p-7">
+                      <div className="rotate-3 bg-zinc-50 p-3 pb-10 shadow-lg transition-transform duration-500 ease-in-out group-hover:rotate-1 group-hover:scale-[1.03]">
+                        <img
+                          src={card.image}
+                          alt={card.title}
+                          loading="lazy"
+                          className="aspect-square w-full object-cover"
+                        />
+                        <div className="mt-4 h-2 rounded-full bg-zinc-200/80" />
+                      </div>
+                    </div>
+                  )}
+
+                  <div className="pointer-events-none absolute inset-0 bg-gradient-to-t from-black/45 via-transparent to-white/5 opacity-90" />
+                </div>
+                <div className="border-t border-white/10 bg-black/20 p-5">
+                  <h3 className="text-base font-semibold text-white">{card.title}</h3>
+                  <p className="mt-1 text-sm leading-6 text-zinc-400">{card.subtitle}</p>
+                </div>
+              </article>
+            ))}
           </div>
         </div>
       </section>

@@ -64,6 +64,7 @@ export function PhotoDocWidget({ onSuccess, onReset }) {
   const [error, setError] = useState(null);
   const [orderId, setOrderId] = useState(null);
   const [paymentAmount, setPaymentAmount] = useState(0);
+  const [isDragging, setIsDragging] = useState(false);
 
   const [userName, setUserName] = useState('');
   const [userPhone, setUserPhone] = useState('');
@@ -80,6 +81,20 @@ export function PhotoDocWidget({ onSuccess, onReset }) {
       setError(null);
       setIsSuccess(false);
     }
+  };
+
+  const addFiles = (fileList) => {
+    const newFiles = Array.from(fileList).filter(f => f.type.startsWith("image/"));
+    if (newFiles.length === 0) return;
+    setFiles(prev => [...prev, ...newFiles]);
+    setError(null);
+    setIsSuccess(false);
+  };
+
+  const handleDrop = (e) => {
+    e.preventDefault();
+    setIsDragging(false);
+    addFiles(e.dataTransfer.files);
   };
 
   const handleSubmitOrder = async () => {
@@ -150,8 +165,8 @@ export function PhotoDocWidget({ onSuccess, onReset }) {
   if (isSuccess) {
     return (
       <div className="bg-green-50 border border-green-200 text-green-800 rounded-xl p-8 text-center space-y-4 animate-in fade-in zoom-in duration-300 max-w-2xl mx-auto">
-        <h2 className="text-2xl font-bold">✅ Заказ №{orderId} принят!</h2>
-        <p className="text-green-700">Мы подготовим фото по стандартам и свяжемся с вами в течение 15 минут.</p>
+        <h2 className="text-2xl font-bold animate-check-pop">✅ Фото успешно отправлено в обработку</h2>
+        <p className="text-green-700">Заказ №{orderId} принят. Мы подготовим фото по стандартам и свяжемся с вами.</p>
         <div className="flex flex-col sm:flex-row gap-4 justify-center mt-6">
           <button
             type="button"
@@ -172,17 +187,21 @@ export function PhotoDocWidget({ onSuccess, onReset }) {
     <div className="w-full space-y-6 max-w-4xl mx-auto">
       {files.length === 0 ? (
         <div
-          className="group relative mx-auto max-w-3xl cursor-pointer overflow-hidden rounded-3xl border border-dashed border-white/15 bg-[radial-gradient(circle_at_50%_0%,rgba(30,58,138,0.22),transparent_45%),linear-gradient(145deg,rgba(255,255,255,0.055),rgba(2,8,23,0.72))] p-10 text-center shadow-[inset_0_1px_0_rgba(255,255,255,0.06),0_0_40px_rgba(15,23,42,0.55)] backdrop-blur-xl transition-all duration-300 hover:-translate-y-1 hover:border-yellow-500/45 hover:shadow-[inset_0_1px_0_rgba(255,255,255,0.08),0_0_48px_rgba(202,138,4,0.10)]"
+          onDragOver={(e) => { e.preventDefault(); setIsDragging(true); }}
+          onDragLeave={(e) => { e.preventDefault(); setIsDragging(false); }}
+          onDrop={handleDrop}
+          className={`group relative mx-auto max-w-3xl cursor-pointer overflow-hidden rounded-3xl border border-dashed bg-[radial-gradient(circle_at_50%_0%,rgba(30,58,138,0.22),transparent_45%),linear-gradient(145deg,rgba(255,255,255,0.055),rgba(2,8,23,0.72))] p-10 text-center shadow-[inset_0_1px_0_rgba(255,255,255,0.06),0_0_40px_rgba(15,23,42,0.55)] backdrop-blur-xl transition-all duration-300 hover:-translate-y-1 hover:shadow-[inset_0_1px_0_rgba(255,255,255,0.08),0_0_48px_rgba(202,138,4,0.10)] ${isDragging ? 'border-yellow-500/60 bg-yellow-500/10' : 'border-white/15 hover:border-yellow-500/45'}`}
           onClick={() => fileInputRef.current?.click()}
         >
-          <div className="pointer-events-none absolute inset-x-10 top-0 h-px bg-gradient-to-r from-transparent via-yellow-500/35 to-transparent opacity-0 transition-opacity group-hover:opacity-100" />
-          <input type="file" ref={fileInputRef} onChange={handleFileSelect} accept="image/png, image/jpeg, image/webp" multiple className="hidden" />
+          <div className={`pointer-events-none absolute inset-x-10 top-0 h-px bg-gradient-to-r from-transparent via-yellow-500/35 to-transparent transition-opacity ${isDragging ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'}`} />
+          <input type="file" ref={fileInputRef} onChange={(e) => addFiles(e.target.files)} accept="image/png, image/jpeg, image/webp" multiple className="hidden" />
           <div className="relative flex flex-col items-center justify-center text-zinc-300">
             <div className="mb-5 flex h-16 w-16 items-center justify-center rounded-2xl border border-yellow-500/20 bg-yellow-500/10 shadow-[0_0_28px_rgba(202,138,4,0.12)] transition-transform group-hover:scale-110">
               <UploadCloud className="w-8 h-8 text-yellow-300" />
             </div>
             <p className="font-semibold text-white">Нажмите для выбора фото</p>
             <p className="mt-2 text-sm leading-6 text-zinc-400">Можно загрузить сразу несколько фотографий</p>
+            <p className="text-xs text-zinc-500">Поддерживаются JPG, PNG, WEBP</p>
           </div>
         </div>
       ) : (
@@ -200,6 +219,12 @@ export function PhotoDocWidget({ onSuccess, onReset }) {
               </div>
             </div>
             <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 overflow-y-auto max-h-96 p-2">
+              {isLoading && (
+                <div className="col-span-full space-y-3 rounded-xl border border-white/10 bg-white/5 p-4">
+                  <div className="shimmer h-3 rounded-full bg-white/10" />
+                  <div className="shimmer h-3 w-2/3 rounded-full bg-white/10" />
+                </div>
+              )}
               {files.map((f, index) => (
                 <FilePreview
                   key={index}

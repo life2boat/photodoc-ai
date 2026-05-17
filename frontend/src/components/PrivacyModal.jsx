@@ -164,6 +164,9 @@ export default function PrivacyModal({ isOpen, onClose }) {
                 <li>
                   <strong className="text-gray-100">ИНН:</strong> 222500647581
                 </li>
+                <li>
+                  <strong className="text-gray-100">Email:</strong> mdot22@yandex.ru
+                </li>
               </ul>
             </section>
           </div>
