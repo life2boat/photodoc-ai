@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { CheckCircle } from 'lucide-react';
 import { redirectToPayment } from '../lib/robokassa';
 import { API_BASE_URL } from '../config';
-import { reachGoal } from '../lib/analytics';
+import { reachGoal } from '../lib/metrics';
 
 export default function PolaroidWidget({ onSuccess, onReset }) {
   const [photos, setPhotos] = useState([]);
@@ -15,8 +15,13 @@ export default function PolaroidWidget({ onSuccess, onReset }) {
   const [isSuccess, setIsSuccess] = useState(false);
   const [orderId, setOrderId] = useState(null);
   const [paymentAmount, setPaymentAmount] = useState(0);
+  const [printFormat, setPrintFormat] = useState('10x15');
   
-  const PRICE_PER_PHOTO = 50;
+  const PRICE_PER_PHOTO = 30;
+  const PRINT_FORMATS = [
+    { value: '9x13', label: '9x13 см' },
+    { value: '10x15', label: '10x15 см' }
+  ];
 
   // Очистка памяти при размонтировании согласно gemini.md
   useEffect(() => {
@@ -91,6 +96,7 @@ export default function PolaroidWidget({ onSuccess, onReset }) {
     formData.append('phone', userPhone);
     formData.append('email', userEmail);
     formData.append('format', 'Polaroid');
+    formData.append('print_format', printFormat);
     formData.append('paper', 'Глянцевая');
     formData.append('crop', 'С рамкой');
     
@@ -102,7 +108,7 @@ export default function PolaroidWidget({ onSuccess, onReset }) {
       offsetY: p.y
     }));
     
-    formData.append('comment', `Кадрирование: ${JSON.stringify(metaData)}`);
+    formData.append('comment', `Формат бумаги: ${printFormat} см | Кадрирование: ${JSON.stringify(metaData)}`);
     photos.forEach(p => formData.append('files', p.file));
 
     try {
@@ -123,6 +129,7 @@ export default function PolaroidWidget({ onSuccess, onReset }) {
         setUserName('');
         setUserPhone('');
         setUserEmail('');
+        setPrintFormat('10x15');
       } else {
         const errorData = await response.json();
         throw new Error(errorData.detail || "Ошибка сервера");
@@ -161,9 +168,11 @@ export default function PolaroidWidget({ onSuccess, onReset }) {
       <h2 className="text-2xl font-bold text-white mb-6">📸 Ретро Polaroid <span className="text-sm font-normal text-gray-500">(до 10 шт)</span></h2>
 
       {/* Кнопка загрузки */}
-      <label className="flex flex-col items-center justify-center w-full h-32 border-2 border-dashed border-gray-700 rounded-2xl cursor-pointer hover:border-yellow-400 hover:bg-gray-850 transition-all mb-8 group">
-        <span className="text-3xl mb-2 group-hover:scale-110 transition">➕</span>
-        <p className="text-sm text-gray-400">Добавить фотографии</p>
+      <label className="group relative mb-8 flex min-h-40 w-full cursor-pointer flex-col items-center justify-center overflow-hidden rounded-3xl border border-dashed border-white/15 bg-[radial-gradient(circle_at_50%_0%,rgba(30,58,138,0.22),transparent_45%),linear-gradient(145deg,rgba(255,255,255,0.055),rgba(2,8,23,0.72))] p-8 text-center shadow-[inset_0_1px_0_rgba(255,255,255,0.06),0_0_40px_rgba(15,23,42,0.55)] backdrop-blur-xl transition-all duration-300 hover:-translate-y-1 hover:border-yellow-500/45 hover:shadow-[inset_0_1px_0_rgba(255,255,255,0.08),0_0_48px_rgba(202,138,4,0.10)]">
+        <span className="pointer-events-none absolute inset-x-10 top-0 h-px bg-gradient-to-r from-transparent via-yellow-500/35 to-transparent opacity-0 transition-opacity group-hover:opacity-100" />
+        <span className="mb-4 flex h-14 w-14 items-center justify-center rounded-2xl border border-yellow-500/20 bg-yellow-500/10 text-3xl shadow-[0_0_28px_rgba(202,138,4,0.12)] transition-transform group-hover:scale-110">➕</span>
+        <p className="text-sm font-semibold text-white">Добавить фотографии</p>
+        <p className="mt-2 text-xs leading-5 text-zinc-400">До 10 снимков для ретро-печати</p>
         <input type="file" multiple accept="image/*" className="hidden" onChange={handleFileChange} />
       </label>
 
@@ -252,6 +261,41 @@ export default function PolaroidWidget({ onSuccess, onReset }) {
       {/* Блок подтверждения заказа (Итого) */}
       {photos.length > 0 && (
         <div className="mt-8 p-6 bg-gray-950 border border-gray-800 rounded-2xl shadow-xl">
+          <div className="mb-5">
+            <p className="text-sm font-medium text-gray-400 mb-3">Формат бумаги</p>
+            <div className="grid grid-cols-2 gap-3">
+              {PRINT_FORMATS.map((formatOption) => {
+                const isSelected = printFormat === formatOption.value;
+
+                return (
+                  <label
+                    key={formatOption.value}
+                    className={`flex items-center justify-center gap-2 rounded-xl border px-4 py-3 text-sm font-bold transition-colors cursor-pointer ${
+                      isSelected
+                        ? 'border-yellow-400 bg-yellow-400 text-black'
+                        : 'border-gray-800 bg-gray-900 text-gray-300 hover:border-yellow-400/70'
+                    }`}
+                  >
+                    <input
+                      type="radio"
+                      name="polaroid-print-format"
+                      value={formatOption.value}
+                      checked={isSelected}
+                      onChange={(e) => setPrintFormat(e.target.value)}
+                      disabled={isLoading}
+                      className="sr-only"
+                    />
+                    {formatOption.label}
+                  </label>
+                );
+              })}
+            </div>
+          </div>
+
+          <div className="mb-6 rounded-xl border border-yellow-400/20 bg-yellow-400/10 px-4 py-3 text-sm leading-relaxed text-yellow-100">
+            ℹ️ Обратите внимание: снимки печатаются в стиле ретро, поэтому на бумаге выбранного формата останутся характерные белые поля (рамка).
+          </div>
+
           <div className="flex justify-between items-center mb-6 border-b border-gray-800 pb-4">
             <h3 className="text-xl font-bold text-white">Итого к оплате:</h3>
             <div className="text-right">

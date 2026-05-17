@@ -2,7 +2,7 @@ import React, { useState, useRef, useEffect } from "react";
 import { UploadCloud, Loader2, Image as ImageIcon, Trash2, X } from "lucide-react";
 import { redirectToPayment } from "../lib/robokassa";
 import { API_BASE_URL } from "../config";
-import { reachGoal } from "../lib/analytics";
+import { reachGoal } from "../lib/metrics";
 
 const FilePreview = ({ file, onRemove }) => {
   const [previewUrl, setPreviewUrl] = useState("");
@@ -59,6 +59,7 @@ export function RestoreWidget({ onSuccess, onReset }) {
   const [clientName, setClientName] = useState("");
   const [clientPhone, setClientPhone] = useState("");
   const [clientEmail, setClientEmail] = useState("");
+  const [comment, setComment] = useState("");
   const [serviceName, setServiceName] = useState("");
   const [isSuccess, setIsSuccess] = useState(false);
   const [orderId, setOrderId] = useState(null);
@@ -115,7 +116,11 @@ export function RestoreWidget({ onSuccess, onReset }) {
     formData.append("format", "Реставрация фото");
     formData.append("paper", "Цифровая обработка");
     formData.append("crop", serviceName);
-    formData.append("comment", `РЕСТАВРАЦИЯ ФОТО | Услуга: ${serviceName} | Сумма: ${totalPrice} руб.`);
+    formData.append(
+      "comment",
+      `РЕСТАВРАЦИЯ ФОТО | Услуга: ${serviceName} | Сумма: ${totalPrice} руб.${comment.trim() ? ` | Пожелания клиента: ${comment.trim()}` : ""}`
+    );
+    formData.append("client_comment", comment.trim());
     formData.append("category", "Реставрация фото");
     formData.append("service_name", serviceName);
     formData.append("total_price", totalPrice);
@@ -146,6 +151,7 @@ export function RestoreWidget({ onSuccess, onReset }) {
       setClientName("");
       setClientPhone("");
       setClientEmail("");
+      setComment("");
       setServiceName("");
     } catch (err) {
       setError(err.message);
@@ -161,6 +167,7 @@ export function RestoreWidget({ onSuccess, onReset }) {
     setClientName("");
     setClientPhone("");
     setClientEmail("");
+    setComment("");
     setServiceName("");
     setIsSuccess(false);
     setOrderId(null);
@@ -199,11 +206,12 @@ export function RestoreWidget({ onSuccess, onReset }) {
           onDragOver={(e) => { e.preventDefault(); setIsDragging(true); }}
           onDragLeave={(e) => { e.preventDefault(); setIsDragging(false); }}
           onDrop={handleDrop}
-          className={`rounded-2xl shadow-sm border-2 border-dashed p-8 text-center cursor-pointer transition-colors max-w-2xl mx-auto ${
-            isDragging ? "bg-gray-800 border-yellow-400" : "bg-gray-900 border-gray-700 hover:border-yellow-400"
+          className={`group relative mx-auto max-w-3xl cursor-pointer overflow-hidden rounded-3xl border border-dashed bg-[radial-gradient(circle_at_50%_0%,rgba(30,58,138,0.22),transparent_45%),linear-gradient(145deg,rgba(255,255,255,0.055),rgba(2,8,23,0.72))] p-10 text-center shadow-[inset_0_1px_0_rgba(255,255,255,0.06),0_0_40px_rgba(15,23,42,0.55)] backdrop-blur-xl transition-all duration-300 hover:-translate-y-1 hover:shadow-[inset_0_1px_0_rgba(255,255,255,0.08),0_0_48px_rgba(202,138,4,0.10)] ${
+            isDragging ? "border-yellow-500/60" : "border-white/15 hover:border-yellow-500/45"
           }`}
           onClick={() => fileInputRef.current?.click()}
         >
+          <div className={`pointer-events-none absolute inset-x-10 top-0 h-px bg-gradient-to-r from-transparent via-yellow-500/35 to-transparent transition-opacity ${isDragging ? "opacity-100" : "opacity-0 group-hover:opacity-100"}`} />
           <input
             type="file"
             ref={fileInputRef}
@@ -212,10 +220,12 @@ export function RestoreWidget({ onSuccess, onReset }) {
             multiple
             className="hidden"
           />
-          <div className="flex flex-col items-center justify-center text-gray-400">
-            <UploadCloud className={`w-12 h-12 mb-4 transition-colors ${isDragging ? "text-yellow-400" : "text-neutral-400"}`} />
+          <div className="relative flex flex-col items-center justify-center text-zinc-300">
+            <div className="mb-5 flex h-16 w-16 items-center justify-center rounded-2xl border border-yellow-500/20 bg-yellow-500/10 shadow-[0_0_28px_rgba(202,138,4,0.12)] transition-transform group-hover:scale-110">
+              <UploadCloud className={`w-8 h-8 transition-colors ${isDragging ? "text-yellow-200" : "text-yellow-300"}`} />
+            </div>
             <p className="font-semibold text-white">Перетащите файлы сюда или нажмите</p>
-            <p className="text-sm mt-2">Поддерживаются JPG, PNG, WEBP</p>
+            <p className="text-sm mt-2 leading-6 text-zinc-400">Поддерживаются JPG, PNG, WEBP</p>
           </div>
         </div>
       ) : (
@@ -277,6 +287,17 @@ export function RestoreWidget({ onSuccess, onReset }) {
               <div>
                 <label className="block text-sm font-medium text-gray-400 mb-1">Email для подтверждения *</label>
                 <input type="email" value={clientEmail} onChange={(e) => setClientEmail(e.target.value)} placeholder="ivan@example.ru" disabled={isLoading} className="w-full border border-gray-700 rounded-lg px-4 py-2.5 focus:outline-none focus:ring-2 focus:ring-yellow-400 bg-gray-800 text-white disabled:opacity-50" />
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-gray-400 mb-1">Пожелания к реставрации (необязательно)</label>
+                <textarea
+                  value={comment}
+                  onChange={(e) => setComment(e.target.value)}
+                  placeholder="Например: убрать трещину на лице, заменить фон на светло-серый, оставить на фото только одного человека и т.д."
+                  disabled={isLoading}
+                  rows={4}
+                  className="w-full border border-gray-700 rounded-lg px-4 py-2.5 focus:outline-none focus:ring-2 focus:ring-yellow-400 bg-gray-800 text-white disabled:opacity-50 resize-y"
+                />
               </div>
             </div>
             

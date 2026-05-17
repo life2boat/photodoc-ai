@@ -1,7 +1,7 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { MessageCircle, X, Send, Loader2 } from 'lucide-react';
 import { API_BASE_URL } from '../config';
-import { reachGoal } from '../lib/analytics';
+import { reachGoal } from '../lib/metrics';
 
 export default function AssistantWidget() {
   const [isOpen, setIsOpen] = useState(false);

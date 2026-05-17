@@ -1,5 +1,4 @@
 import React, { useState } from 'react';
-import { supabase } from '../lib/supabase';
 
 const priceList = {
   'Фотопечать': {
@@ -54,12 +53,6 @@ export default function ServiceCalculator() {
   const [service, setService] = useState(Object.keys(priceList['Фотопечать'])[0]);
   const [quantity, setQuantity] = useState(1);
 
-  // Form states
-  const [clientName, setClientName] = useState('');
-  const [clientPhone, setClientPhone] = useState('');
-  const [isSubmitting, setIsSubmitting] = useState(false);
-  const [submitStatus, setSubmitStatus] = useState(null);
-
   const handleCategoryChange = (e) => {
     const newCat = e.target.value;
     setCategory(newCat);
@@ -68,43 +61,11 @@ export default function ServiceCalculator() {
 
   const total = priceList[category][service] * quantity;
 
-  const handleSubmit = async (e) => {
-    e.preventDefault();
-    if (!clientName || !clientPhone) {
-      setSubmitStatus('validation_error');
-      return;
-    }
-
-    setIsSubmitting(true);
-    setSubmitStatus(null);
-
-    try {
-      const { error } = await supabase
-        .from('orders')
-        .insert([
-          {
-            client_name: clientName,
-            client_phone: clientPhone,
-            category: category,
-            service_name: service,
-            quantity: quantity,
-            total_price: total,
-            status: 'new'
-          }
-        ]);
-
-      if (error) throw error;
-
-      setSubmitStatus('success');
-      setClientName('');
-      setClientPhone('');
-      setQuantity(1);
-    } catch (error) {
-      console.error("Error saving order:", error);
-      setSubmitStatus('error');
-    } finally {
-      setIsSubmitting(false);
-    }
+  const handleGoToOrder = () => {
+    document.getElementById('services-section')?.scrollIntoView({
+      behavior: 'smooth',
+      block: 'start'
+    });
   };
 
   return (
@@ -135,54 +96,24 @@ export default function ServiceCalculator() {
         <div style={{ fontSize: '32px', fontWeight: 'bold', color: '#2563eb' }}>{total} ₽</div>
       </div>
 
-      <hr style={{ border: 'none', borderTop: '1px solid #eee', marginBottom: '1.5rem' }} />
-
-      <h3 style={{ fontSize: '1.1rem', fontWeight: 'bold', color: '#1a1a1a', marginBottom: '1rem' }}>Оформление заказа</h3>
-
-      <form onSubmit={handleSubmit}>
-        <div style={{ marginBottom: '1rem' }}>
-          <label style={{ display: 'block', fontSize: '14px', color: '#666', marginBottom: '5px' }}>Ваше имя</label>
-          <input type="text" value={clientName} onChange={(e) => setClientName(e.target.value)} placeholder="Иван Иванов" style={{ width: '100%', padding: '10px', borderRadius: '8px', border: '1px solid #ddd', color: '#000' }} required />
-        </div>
-
-        <div style={{ marginBottom: '1.5rem' }}>
-          <label style={{ display: 'block', fontSize: '14px', color: '#666', marginBottom: '5px' }}>Телефон для связи</label>
-          <input type="tel" value={clientPhone} onChange={(e) => setClientPhone(e.target.value)} placeholder="+7 (999) 000-00-00" style={{ width: '100%', padding: '10px', borderRadius: '8px', border: '1px solid #ddd', color: '#000' }} required />
-        </div>
-
-        {submitStatus === 'validation_error' && (
-          <div style={{ color: '#dc2626', fontSize: '14px', marginBottom: '1rem', textAlign: 'center' }}>Пожалуйста, заполните имя и телефон.</div>
-        )}
-
-        {submitStatus === 'error' && (
-          <div style={{ color: '#dc2626', fontSize: '14px', marginBottom: '1rem', textAlign: 'center' }}>Ошибка при отправке заказа. Убедитесь, что таблица настроена верно.</div>
-        )}
-
-        {submitStatus === 'success' && (
-          <div style={{ color: '#16a34a', fontSize: '14px', marginBottom: '1rem', textAlign: 'center', padding: '10px', background: '#dcfce7', borderRadius: '8px' }}>
-            🎉 Заказ успешно оформлен! Мы свяжемся с вами.
-          </div>
-        )}
-
-        <button
-          type="submit"
-          disabled={isSubmitting}
-          style={{
-            width: '100%',
-            padding: '12px',
-            background: isSubmitting ? '#93c5fd' : '#2563eb',
-            color: '#fff',
-            border: 'none',
-            borderRadius: '8px',
-            fontWeight: 'bold',
-            fontSize: '16px',
-            cursor: isSubmitting ? 'not-allowed' : 'pointer',
-            transition: 'background 0.2s'
-          }}
-        >
-          {isSubmitting ? 'Отправка...' : 'Отправить заявку'}
-        </button>
-      </form>
+      <button
+        type="button"
+        onClick={handleGoToOrder}
+        style={{
+          width: '100%',
+          padding: '12px',
+          background: '#2563eb',
+          color: '#fff',
+          border: 'none',
+          borderRadius: '8px',
+          fontWeight: 'bold',
+          fontSize: '16px',
+          cursor: 'pointer',
+          transition: 'background 0.2s'
+        }}
+      >
+        Перейти к заказу
+      </button>
     </div>
   );
 }

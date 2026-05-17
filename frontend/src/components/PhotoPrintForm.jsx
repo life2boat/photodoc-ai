@@ -2,7 +2,7 @@ import React, { useState, useRef, useEffect } from 'react';
 import { UploadCloud, Maximize, Minimize, UserCog, CheckCircle, Loader2, X } from 'lucide-react';
 import { redirectToPayment } from '../lib/robokassa';
 import { API_BASE_URL } from '../config';
-import { reachGoal } from '../lib/analytics';
+import { reachGoal } from '../lib/metrics';
 
 const PRICES = {
   format: {
@@ -210,13 +210,16 @@ export function PhotoPrintForm({ onSuccess, onReset }) {
       <div className="space-y-4">
         <h3 className="text-lg font-semibold text-white border-b border-gray-800 pb-2">1. Загрузите фотографии</h3>
         <div
-          className="bg-gray-900 rounded-xl border-2 border-dashed border-gray-700 p-8 text-center cursor-pointer hover:border-yellow-400 transition-colors"
+          className="group relative cursor-pointer overflow-hidden rounded-3xl border border-dashed border-white/15 bg-[radial-gradient(circle_at_50%_0%,rgba(30,58,138,0.22),transparent_45%),linear-gradient(145deg,rgba(255,255,255,0.055),rgba(2,8,23,0.72))] p-10 text-center shadow-[inset_0_1px_0_rgba(255,255,255,0.06),0_0_40px_rgba(15,23,42,0.55)] backdrop-blur-xl transition-all duration-300 hover:-translate-y-1 hover:border-yellow-500/45 hover:shadow-[inset_0_1px_0_rgba(255,255,255,0.08),0_0_48px_rgba(202,138,4,0.10)]"
           onClick={() => fileInputRef.current?.click()}
         >
+          <div className="pointer-events-none absolute inset-x-10 top-0 h-px bg-gradient-to-r from-transparent via-yellow-500/35 to-transparent opacity-0 transition-opacity group-hover:opacity-100" />
           <input type="file" ref={fileInputRef} onChange={handleFileSelect} accept="image/png, image/jpeg, image/webp" multiple className="hidden" />
-          <UploadCloud className="w-10 h-10 mx-auto mb-3 text-gray-500" />
-          <p className="font-medium text-gray-300">Нажмите для выбора файлов</p>
-          <p className="text-sm text-gray-500 mt-1">
+          <div className="relative mx-auto mb-5 flex h-16 w-16 items-center justify-center rounded-2xl border border-yellow-500/20 bg-yellow-500/10 shadow-[0_0_28px_rgba(202,138,4,0.12)] transition-transform group-hover:scale-110">
+            <UploadCloud className="w-8 h-8 text-yellow-300" />
+          </div>
+          <p className="font-semibold text-white">Нажмите для выбора файлов</p>
+          <p className="text-sm text-zinc-400 mt-2 leading-6">
             {photos.length > 0 ? <span className="text-yellow-400 font-bold">Выбрано файлов: {photos.length} шт.</span> : 'Поддерживаются JPG, PNG, WEBP'}
           </p>
         </div>

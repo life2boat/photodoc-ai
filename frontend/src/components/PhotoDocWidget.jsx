@@ -2,7 +2,7 @@ import React, { useState, useRef, useEffect } from 'react';
 import { UploadCloud, Loader2, Trash2, X } from 'lucide-react';
 import { redirectToPayment } from '../lib/robokassa';
 import { API_BASE_URL } from '../config';
-import { reachGoal } from '../lib/analytics';
+import { reachGoal } from '../lib/metrics';
 
 const DOC_PRICES = {
   '3x4': 300,
@@ -172,14 +172,17 @@ export function PhotoDocWidget({ onSuccess, onReset }) {
     <div className="w-full space-y-6 max-w-4xl mx-auto">
       {files.length === 0 ? (
         <div
-          className="bg-gray-900 rounded-2xl shadow-sm border-2 border-dashed border-gray-700 p-8 text-center cursor-pointer hover:border-yellow-400 transition-colors max-w-2xl mx-auto"
+          className="group relative mx-auto max-w-3xl cursor-pointer overflow-hidden rounded-3xl border border-dashed border-white/15 bg-[radial-gradient(circle_at_50%_0%,rgba(30,58,138,0.22),transparent_45%),linear-gradient(145deg,rgba(255,255,255,0.055),rgba(2,8,23,0.72))] p-10 text-center shadow-[inset_0_1px_0_rgba(255,255,255,0.06),0_0_40px_rgba(15,23,42,0.55)] backdrop-blur-xl transition-all duration-300 hover:-translate-y-1 hover:border-yellow-500/45 hover:shadow-[inset_0_1px_0_rgba(255,255,255,0.08),0_0_48px_rgba(202,138,4,0.10)]"
           onClick={() => fileInputRef.current?.click()}
         >
+          <div className="pointer-events-none absolute inset-x-10 top-0 h-px bg-gradient-to-r from-transparent via-yellow-500/35 to-transparent opacity-0 transition-opacity group-hover:opacity-100" />
           <input type="file" ref={fileInputRef} onChange={handleFileSelect} accept="image/png, image/jpeg, image/webp" multiple className="hidden" />
-          <div className="flex flex-col items-center justify-center text-gray-400">
-            <UploadCloud className="w-12 h-12 mb-4 text-neutral-400" />
-            <p className="font-semibold text-neutral-700">Нажмите для выбора фото</p>
-            <p className="text-sm">Можно загрузить сразу несколько фотографий</p>
+          <div className="relative flex flex-col items-center justify-center text-zinc-300">
+            <div className="mb-5 flex h-16 w-16 items-center justify-center rounded-2xl border border-yellow-500/20 bg-yellow-500/10 shadow-[0_0_28px_rgba(202,138,4,0.12)] transition-transform group-hover:scale-110">
+              <UploadCloud className="w-8 h-8 text-yellow-300" />
+            </div>
+            <p className="font-semibold text-white">Нажмите для выбора фото</p>
+            <p className="mt-2 text-sm leading-6 text-zinc-400">Можно загрузить сразу несколько фотографий</p>
           </div>
         </div>
       ) : (

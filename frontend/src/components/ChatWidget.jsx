@@ -1,6 +1,6 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { API_BASE_URL } from '../config';
-import { reachGoal } from '../lib/analytics';
+import { reachGoal } from '../lib/metrics';
 
 export default function ChatWidget() {
   const [isOpen, setIsOpen] = useState(false);

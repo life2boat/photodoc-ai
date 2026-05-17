@@ -2,7 +2,7 @@ import React, { useState, useRef, useEffect } from 'react';
 import { UploadCloud, Loader2, Trash2, X } from 'lucide-react';
 import { redirectToPayment } from '../lib/robokassa';
 import { API_BASE_URL } from '../config';
-import { reachGoal } from '../lib/analytics';
+import { reachGoal } from '../lib/metrics';
 
 const PHOTO_FORMATS = [
   { id: '3x4', label: '3х4 см (Медицинская книжка, удостоверения)', price: 300 },
