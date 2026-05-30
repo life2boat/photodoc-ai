@@ -3,6 +3,7 @@ import { UploadCloud, Maximize, Minimize, UserCog, CheckCircle, Loader2, X } fro
 import { redirectToPayment } from '../lib/robokassa';
 import { API_BASE_URL } from '../config';
 import { reachGoal } from '../lib/metrics';
+import { PHONE_ERROR_MESSAGE, validateRussianPhone } from '../utils/phoneValidation';
 
 const PRICES = {
   format: {
@@ -68,6 +69,7 @@ export function PhotoPrintForm({ onSuccess, onReset }) {
   const [successMessage, setSuccessMessage] = useState(null);
   const [userName, setUserName] = useState('');
   const [userPhone, setUserPhone] = useState('');
+  const [phoneError, setPhoneError] = useState('');
   const [userEmail, setUserEmail] = useState('');
   const [orderId, setOrderId] = useState(null);
   const [paymentAmount, setPaymentAmount] = useState(0);
@@ -121,6 +123,11 @@ export function PhotoPrintForm({ onSuccess, onReset }) {
     e.stopPropagation(); // Отключаем всплытие эвента к родительским формам
     if (photos.length === 0 || !isConfirmed) return;
 
+    if (!validateRussianPhone(userPhone)) {
+      setPhoneError(PHONE_ERROR_MESSAGE);
+      return;
+    }
+
     setIsLoading(true);
     const formData = new FormData();
 
@@ -143,7 +150,7 @@ export function PhotoPrintForm({ onSuccess, onReset }) {
     });
 
     try {
-      const response = await fetch(`${API_BASE_URL}/api/order`, {
+      const response = await fetch(`${API_BASE_URL}/order`, {
         method: 'POST',
         // Заголовок Content-Type браузер подставит сам!
         body: formData,
@@ -163,6 +170,7 @@ export function PhotoPrintForm({ onSuccess, onReset }) {
         setIsConfirmed(false);
         setUserName('');
         setUserPhone('');
+        setPhoneError('');
         setUserEmail('');
       } else {
         const errorDetail = await response.json().catch(() => ({}));
@@ -210,7 +218,24 @@ export function PhotoPrintForm({ onSuccess, onReset }) {
           </div>
           <div>
             <label className="block text-sm font-medium text-gray-400 mb-2">Телефон</label>
-            <input type="tel" value={userPhone} onChange={(e) => setUserPhone(e.target.value)} placeholder="+7 (999) 000-00-00" className="w-full px-4 py-2 border border-gray-700 bg-gray-800 text-white rounded-lg focus:ring-2 focus:ring-yellow-400 focus:border-yellow-400 outline-none transition-colors" required />
+            <input
+              type="tel"
+              value={userPhone}
+              onChange={(e) => {
+                setUserPhone(e.target.value);
+                setPhoneError('');
+              }}
+              placeholder="+7 (999) 000-00-00"
+              className={`w-full rounded-lg border bg-gray-800 px-4 py-2 text-white outline-none transition-colors focus:ring-2 ${
+                phoneError
+                  ? 'border-red-500/50 focus:border-red-500 focus:ring-red-500/50'
+                  : 'border-gray-700 focus:border-yellow-400 focus:ring-yellow-400'
+              }`}
+              required
+            />
+            <p className={`mt-1 text-xs text-red-400 transition-all duration-200 ${phoneError ? 'opacity-100' : 'opacity-0'}`}>
+              {phoneError || '\u00A0'}
+            </p>
           </div>
           <div>
             <label className="block text-sm font-medium text-gray-400 mb-2">Email для подтверждения</label>

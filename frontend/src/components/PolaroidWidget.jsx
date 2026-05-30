@@ -3,6 +3,7 @@ import { CheckCircle } from 'lucide-react';
 import { redirectToPayment } from '../lib/robokassa';
 import { API_BASE_URL } from '../config';
 import { reachGoal } from '../lib/metrics';
+import { PHONE_ERROR_MESSAGE, validateRussianPhone } from '../utils/phoneValidation';
 
 export default function PolaroidWidget({ onSuccess, onReset }) {
   const [photos, setPhotos] = useState([]);
@@ -11,6 +12,7 @@ export default function PolaroidWidget({ onSuccess, onReset }) {
   const [draggingId, setDraggingId] = useState(null);
   const [userName, setUserName] = useState('');
   const [userPhone, setUserPhone] = useState('');
+  const [phoneError, setPhoneError] = useState('');
   const [userEmail, setUserEmail] = useState('');
   const [isSuccess, setIsSuccess] = useState(false);
   const [orderId, setOrderId] = useState(null);
@@ -101,6 +103,11 @@ export default function PolaroidWidget({ onSuccess, onReset }) {
       return;
     }
 
+    if (!validateRussianPhone(userPhone)) {
+      setPhoneError(PHONE_ERROR_MESSAGE);
+      return;
+    }
+
     setIsLoading(true);
     const formData = new FormData();
     formData.append('name', userName); 
@@ -123,7 +130,7 @@ export default function PolaroidWidget({ onSuccess, onReset }) {
     photos.forEach(p => formData.append('files', p.file));
 
     try {
-      const response = await fetch(`${API_BASE_URL}/api/order`, {
+      const response = await fetch(`${API_BASE_URL}/order`, {
         method: 'POST',
         body: formData,
       });
@@ -139,6 +146,7 @@ export default function PolaroidWidget({ onSuccess, onReset }) {
         setIsConfirmed(false);
         setUserName('');
         setUserPhone('');
+        setPhoneError('');
         setUserEmail('');
         setPrintFormat('10x15');
       } else {
@@ -334,7 +342,24 @@ export default function PolaroidWidget({ onSuccess, onReset }) {
             </div>
             <div>
               <label className="block text-sm font-medium text-gray-400 mb-1">Телефон *</label>
-              <input type="tel" value={userPhone} onChange={(e) => setUserPhone(e.target.value)} placeholder="+7 (999) 000-00-00" disabled={isLoading} className="w-full bg-gray-900 border border-gray-800 text-white rounded-xl px-4 py-3 focus:outline-none focus:border-yellow-400 transition-colors" />
+              <input
+                type="tel"
+                value={userPhone}
+                onChange={(e) => {
+                  setUserPhone(e.target.value);
+                  setPhoneError('');
+                }}
+                placeholder="+7 (999) 000-00-00"
+                disabled={isLoading}
+                className={`w-full rounded-xl border bg-gray-900 px-4 py-3 text-white transition-colors focus:outline-none ${
+                  phoneError
+                    ? 'border-red-500/50 focus:border-red-500 focus:ring-2 focus:ring-red-500/50'
+                    : 'border-gray-800 focus:border-yellow-400'
+                }`}
+              />
+              <p className={`mt-1 text-xs text-red-400 transition-all duration-200 ${phoneError ? 'opacity-100' : 'opacity-0'}`}>
+                {phoneError || '\u00A0'}
+              </p>
             </div>
             <div>
               <label className="block text-sm font-medium text-gray-400 mb-1">Email для подтверждения *</label>

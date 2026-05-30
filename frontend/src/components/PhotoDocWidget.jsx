@@ -3,6 +3,7 @@ import { UploadCloud, Loader2, Trash2, X } from 'lucide-react';
 import { redirectToPayment } from '../lib/robokassa';
 import { API_BASE_URL } from '../config';
 import { reachGoal } from '../lib/metrics';
+import { PHONE_ERROR_MESSAGE, validateRussianPhone } from '../utils/phoneValidation';
 
 const DOC_PRICES = {
   '3x4': 300,
@@ -68,20 +69,12 @@ export function PhotoDocWidget({ onSuccess, onReset }) {
 
   const [userName, setUserName] = useState('');
   const [userPhone, setUserPhone] = useState('');
+  const [phoneError, setPhoneError] = useState('');
   const [userEmail, setUserEmail] = useState('');
   const [userComment, setUserComment] = useState('');
   const [docType, setDocType] = useState('3.5x4.5');
 
   const fileInputRef = useRef(null);
-
-  const handleFileSelect = (e) => {
-    if (e.target.files && e.target.files.length > 0) {
-      const newFiles = Array.from(e.target.files).filter(f => f.type.startsWith("image/"));
-      setFiles(prev => [...prev, ...newFiles]);
-      setError(null);
-      setIsSuccess(false);
-    }
-  };
 
   const addFiles = (fileList) => {
     const newFiles = Array.from(fileList).filter(f => f.type.startsWith("image/"));
@@ -99,6 +92,11 @@ export function PhotoDocWidget({ onSuccess, onReset }) {
 
   const handleSubmitOrder = async () => {
     if (files.length === 0 || !userName.trim() || !userPhone.trim() || !userEmail.trim()) return;
+
+    if (!validateRussianPhone(userPhone)) {
+      setPhoneError(PHONE_ERROR_MESSAGE);
+      return;
+    }
 
     setIsLoading(true);
     setError(null);
@@ -122,7 +120,7 @@ export function PhotoDocWidget({ onSuccess, onReset }) {
     });
 
     try {
-      const apiResponse = await fetch(`${API_BASE_URL}/api/order`, {
+      const apiResponse = await fetch(`${API_BASE_URL}/order`, {
         method: 'POST',
         body: formData,
       });
@@ -151,6 +149,7 @@ export function PhotoDocWidget({ onSuccess, onReset }) {
     setIsSuccess(false);
     setUserName('');
     setUserPhone('');
+    setPhoneError('');
     setUserEmail('');
     setUserComment('');
     setError(null);
@@ -256,7 +255,24 @@ export function PhotoDocWidget({ onSuccess, onReset }) {
             </div>
             <div>
               <label className="block text-sm font-medium text-gray-400 mb-1">Телефон</label>
-              <input type="tel" value={userPhone} onChange={(e) => setUserPhone(e.target.value)} placeholder="+7 (999) 000-00-00" disabled={isLoading} className="w-full border border-gray-700 rounded-lg px-4 py-2.5 focus:outline-none focus:ring-2 focus:ring-yellow-400 bg-gray-800 text-white disabled:opacity-50" />
+              <input
+                type="tel"
+                value={userPhone}
+                onChange={(e) => {
+                  setUserPhone(e.target.value);
+                  setPhoneError('');
+                }}
+                placeholder="+7 (999) 000-00-00"
+                disabled={isLoading}
+                className={`w-full rounded-lg border bg-gray-800 px-4 py-2.5 text-white transition-colors focus:outline-none focus:ring-2 disabled:opacity-50 ${
+                  phoneError
+                    ? 'border-red-500/50 focus:border-red-500 focus:ring-red-500/50'
+                    : 'border-gray-700 focus:ring-yellow-400'
+                }`}
+              />
+              <p className={`mt-1 text-xs text-red-400 transition-all duration-200 ${phoneError ? 'opacity-100' : 'opacity-0'}`}>
+                {phoneError || '\u00A0'}
+              </p>
             </div>
             <div>
               <label className="block text-sm font-medium text-gray-400 mb-1">Email для подтверждения</label>

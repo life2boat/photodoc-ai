@@ -1,5 +1,6 @@
 import os
 import logging
+import re
 import sqlite3
 import httpx
 import smtplib
@@ -29,10 +30,27 @@ logging.basicConfig(level=logging.INFO)
 
 app = FastAPI()
 
+DEFAULT_CORS_ORIGINS = (
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost",
+    "http://127.0.0.1",
+    "https://photodoc-ai.ru",
+    "https://www.photodoc-ai.ru",
+)
+
+
+def get_cors_origins():
+    raw_origins = os.getenv("CORS_ORIGINS", "")
+    if not raw_origins.strip():
+        return list(DEFAULT_CORS_ORIGINS)
+
+    return [origin.strip() for origin in raw_origins.split(",") if origin.strip()]
+
 # Настройка CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=get_cors_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -98,6 +116,12 @@ ensure_orders_schema()
 # Создаем папку для локальных загрузок
 UPLOAD_DIR = BASE_DIR / "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+
+def sanitize_upload_filename(filename: str | None) -> str:
+    base_name = (filename or "upload").replace("\\", "/").split("/")[-1]
+    safe_name = re.sub(r"[^A-Za-zА-Яа-яЁё0-9._-]+", "_", base_name).strip("._")
+    return safe_name or "upload"
 
 
 def format_robokassa_amount(value: float | int | str) -> str:
@@ -614,7 +638,8 @@ async def create_order(
 ):
     try:
         # 1. Сохраняем данные в SQLite для получения номера заказа
-        filenames = ", ".join([f.filename for f in files])
+        safe_filenames = [sanitize_upload_filename(f.filename) for f in files]
+        filenames = ", ".join(safe_filenames)
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         cursor.execute(
@@ -633,10 +658,11 @@ async def create_order(
         safe_settings = f"{format}_{paper}_{crop}".replace(" ", "_")
         remote_folder_path = f"PhotoDoc_Orders/Заказ_{order_id}_{safe_name}/{safe_settings}"
 
-        for file in files:
-            safe_filename = file.filename.replace(" ", "_")
+        for file, safe_filename in zip(files, safe_filenames):
             local_filename = f"{order_id}_{safe_filename}"
-            local_file_path = os.path.join(UPLOAD_DIR, local_filename)
+            local_file_path = (UPLOAD_DIR / local_filename).resolve()
+            if UPLOAD_DIR.resolve() not in local_file_path.parents:
+                raise HTTPException(status_code=400, detail="Invalid filename")
             
             # 3. Сохраняем физический файл на жесткий диск
             with open(local_file_path, "wb") as f:

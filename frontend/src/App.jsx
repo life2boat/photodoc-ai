@@ -22,6 +22,9 @@ import SliderCompare from './components/SliderCompare';
 import { RestoreWidget } from './components/RestoreWidget'; 
 import PrivacyModal from './components/PrivacyModal';
 import heroMockup from './assets/hero-mockup.png';
+import passportImg from './assets/img/passport-example.png';
+import polaroidImg from './assets/img/polaroid-example.png';
+import restorationImg from './assets/img/restoration_placeholder.png';
 
 export default function App() {
   const [activeService, setActiveService] = useState('docs');
@@ -49,37 +52,24 @@ export default function App() {
 
   const exampleCards = [
     {
-      title: 'Паспорт',
-      subtitle: 'Фото 35×45 • Белый фон',
-      before: 'https://images.unsplash.com/photo-1544005313-94ddf0286df2?w=500&q=80',
-      after: 'https://images.unsplash.com/photo-1544005313-94ddf0286df2?w=500&q=80&auto=format&bg=fff',
-      mode: 'reveal',
-    },
-    {
-      title: 'Виза',
-      subtitle: 'Шенген • Ровный свет',
-      before: 'https://images.unsplash.com/photo-1544005313-94ddf0286df2?w=500&q=80',
-      after: 'https://images.unsplash.com/photo-1544005313-94ddf0286df2?w=500&q=80&auto=format&bg=fff',
-      mode: 'reveal',
-    },
-    {
-      title: 'Резюме',
-      subtitle: 'Деловой портрет • Чистый кадр',
-      image: 'https://images.unsplash.com/photo-1560250097-0b93528c311a?w=500&q=80',
-      mode: 'business',
-    },
-    {
       title: 'Polaroid',
       subtitle: 'Ретро-рамка • Атмосферная печать',
-      image: 'https://images.unsplash.com/photo-1528590547842-836798c8959f?w=500&q=80',
-      mode: 'polaroid',
+      image: polaroidImg,
+      mode: 'image',
+    },
+    {
+      title: 'Паспорт',
+      subtitle: 'Фото 35×45 • Белый фон',
+      image: passportImg,
+      mode: 'image',
+      fit: 'contain',
+      isWide: true,
     },
     {
       title: 'Реставрация',
       subtitle: 'Восстановление • Цвет и детали',
-      before: 'https://images.unsplash.com/photo-1506891536236-3e0789256d9e?w=500&q=80&grayscale=1',
-      after: 'https://images.unsplash.com/photo-1506891536236-3e0789256d9e?w=500&q=80',
-      mode: 'reveal',
+      image: restorationImg,
+      mode: 'image',
     },
   ];
 
@@ -319,13 +309,17 @@ export default function App() {
             </p>
           </div>
 
-          <div className="hide-scrollbar -mx-4 flex snap-x gap-4 overflow-x-auto px-4 pb-4 md:mx-0 md:grid md:grid-cols-5 md:overflow-visible md:px-0 md:pb-0">
+          <div className="hide-scrollbar -mx-4 flex snap-x gap-4 overflow-x-auto px-4 pb-4 md:mx-0 md:grid md:grid-cols-4 md:gap-6 md:overflow-visible md:px-0 md:pb-0">
             {exampleCards.map((card) => (
               <article
                 key={card.title}
-                className="group relative min-w-[78vw] snap-center overflow-hidden rounded-2xl border border-white/10 bg-white/5 backdrop-blur-md transition-all duration-300 ease-in-out hover:-translate-y-1 hover:border-yellow-500/30 hover:shadow-[0_0_44px_rgba(202,138,4,0.12)] sm:min-w-[360px] md:min-w-0"
+                className={`group relative min-w-[78vw] snap-center overflow-hidden rounded-2xl border border-white/10 bg-white/5 backdrop-blur-md transition-all duration-300 ease-in-out hover:-translate-y-1 hover:border-yellow-500/30 hover:shadow-[0_0_44px_rgba(202,138,4,0.12)] sm:min-w-[360px] md:min-w-0 ${
+                  card.isWide ? 'md:col-span-2' : 'md:col-span-1'
+                }`}
               >
-                <div className="relative aspect-[4/5] overflow-hidden bg-[radial-gradient(circle_at_50%_18%,rgba(255,255,255,0.10),transparent_26%),linear-gradient(145deg,#0a1020,#02040a)]">
+                <div className={`relative overflow-hidden bg-[radial-gradient(circle_at_50%_18%,rgba(255,255,255,0.10),transparent_26%),linear-gradient(145deg,#0a1020,#02040a)] ${
+                  card.isWide ? 'aspect-[8/5]' : 'aspect-[4/5]'
+                }`}>
                   {card.mode === 'reveal' && (
                     <>
                       <img
@@ -364,23 +358,20 @@ export default function App() {
                     </div>
                   )}
 
-                  {card.mode === 'polaroid' && (
-                    <div className="flex h-full items-center justify-center bg-[radial-gradient(circle_at_50%_42%,rgba(250,204,21,0.10),transparent_34%),linear-gradient(145deg,#08111f,#02040a)] p-7">
-                      <div className="rotate-3 bg-zinc-50 p-3 pb-10 shadow-lg transition-transform duration-500 ease-in-out group-hover:rotate-1 group-hover:scale-[1.03]">
-                        <img
-                          src={card.image}
-                          alt={card.title}
-                          loading="lazy"
-                          className="aspect-square w-full object-cover"
-                        />
-                        <div className="mt-4 h-2 rounded-full bg-zinc-200/80" />
-                      </div>
-                    </div>
+                  {card.mode === 'image' && (
+                    <img
+                      src={card.image}
+                      alt={card.title}
+                      loading="lazy"
+                      className={`h-full w-full transition-transform duration-500 ease-in-out group-hover:scale-[1.03] ${
+                        card.fit === 'contain' ? 'object-contain p-4' : 'object-cover'
+                      }`}
+                    />
                   )}
 
                   <div className="pointer-events-none absolute inset-0 bg-gradient-to-t from-black/45 via-transparent to-white/5 opacity-90" />
                 </div>
-                <div className="border-t border-white/10 bg-black/20 p-5">
+                <div className="border-t border-white/10 bg-black/20 p-5 text-center">
                   <h3 className="text-base font-semibold text-white">{card.title}</h3>
                   <p className="mt-1 text-sm leading-6 text-zinc-400">{card.subtitle}</p>
                 </div>
