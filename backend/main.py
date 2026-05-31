@@ -20,7 +20,7 @@ from dotenv import load_dotenv
 from pydantic import BaseModel
 
 BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = BASE_DIR / "orders.db"
+DB_PATH = Path(os.getenv("ORDERS_DB_PATH", BASE_DIR / "orders.db"))
 
 # Загрузка переменных окружения
 load_dotenv(BASE_DIR / ".env")
