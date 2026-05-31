@@ -75,6 +75,13 @@ export function PhotoDocWidget({ onSuccess, onReset }) {
   const [docType, setDocType] = useState('3.5x4.5');
 
   const fileInputRef = useRef(null);
+  const widgetRef = useRef(null);
+
+  const scrollToWidget = () => {
+    setTimeout(() => {
+      widgetRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }, 100);
+  };
 
   const addFiles = (fileList) => {
     const newFiles = Array.from(fileList).filter(f => f.type.startsWith("image/"));
@@ -134,6 +141,7 @@ export function PhotoDocWidget({ onSuccess, onReset }) {
       setOrderId(data.order_id || '...');
       setPaymentAmount(price);
       setIsSuccess(true);
+      scrollToWidget();
       reachGoal('ORDER_CREATED');
       if (onSuccess) onSuccess();
     } catch (err) {
@@ -163,7 +171,7 @@ export function PhotoDocWidget({ onSuccess, onReset }) {
 
   if (isSuccess) {
     return (
-      <div className="bg-green-50 border border-green-200 text-green-800 rounded-xl p-8 text-center space-y-4 animate-in fade-in zoom-in duration-300 max-w-2xl mx-auto">
+      <div ref={widgetRef} className="bg-green-50 border border-green-200 text-green-800 rounded-xl p-8 text-center space-y-4 animate-in fade-in zoom-in duration-300 max-w-2xl mx-auto">
         <h2 className="text-2xl font-bold animate-check-pop">✅ Фото успешно отправлено в обработку</h2>
         <p className="text-green-700">Заказ №{orderId} принят. Мы подготовим фото по стандартам и свяжемся с вами.</p>
         <div className="flex flex-col sm:flex-row gap-4 justify-center mt-6">
@@ -183,7 +191,7 @@ export function PhotoDocWidget({ onSuccess, onReset }) {
   }
 
   return (
-    <div className="w-full space-y-6 max-w-4xl mx-auto">
+    <div ref={widgetRef} className="w-full space-y-6 max-w-4xl mx-auto">
       {files.length === 0 ? (
         <div
           onDragOver={(e) => { e.preventDefault(); setIsDragging(true); }}

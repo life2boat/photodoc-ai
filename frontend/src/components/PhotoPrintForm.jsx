@@ -76,6 +76,13 @@ export function PhotoPrintForm({ onSuccess, onReset }) {
   const [isDragging, setIsDragging] = useState(false);
 
   const fileInputRef = useRef(null);
+  const widgetRef = useRef(null);
+
+  const scrollToWidget = () => {
+    setTimeout(() => {
+      widgetRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }, 100);
+  };
 
   const formatMap = {
     '9x13': '9x13 см',
@@ -161,6 +168,7 @@ export function PhotoPrintForm({ onSuccess, onReset }) {
         setOrderId(data.order_id);
         setPaymentAmount(totalPrice);
         setSuccessMessage('Заказ сформирован!');
+        scrollToWidget();
         reachGoal('ORDER_CREATED');
         if (onSuccess) onSuccess();
         setPhotos([]);
@@ -187,7 +195,7 @@ export function PhotoPrintForm({ onSuccess, onReset }) {
 
   if (successMessage) {
     return (
-      <div className="bg-green-50 border border-green-200 text-green-800 rounded-xl p-8 text-center space-y-4">
+      <div ref={widgetRef} className="bg-green-50 border border-green-200 text-green-800 rounded-xl p-8 text-center space-y-4">
         <CheckCircle className="w-16 h-16 mx-auto text-green-500" />
         <h2 className="text-2xl font-bold animate-check-pop">Фото успешно отправлено в обработку</h2>
         <p className="text-green-700">Заказ №{orderId} сформирован. Перейдите к оплате для запуска в печать.</p>
@@ -208,7 +216,7 @@ export function PhotoPrintForm({ onSuccess, onReset }) {
   }
 
   return (
-    <form onSubmit={handleSubmit} className="space-y-8 animate-in fade-in duration-300">
+    <form ref={widgetRef} onSubmit={handleSubmit} className="space-y-8 animate-in fade-in duration-300">
       <div className="space-y-4 ">
         <h3 className="text-lg font-semibold text-white border-b border-gray-800 pb-2">Контактные данные</h3>
         <div className="grid md:grid-cols-2 gap-6">

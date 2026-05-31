@@ -4,9 +4,15 @@ logs.txt
 venv/
 temp_uploads/
 backend/uploads/
+backend/orders.db
+backend/temp_restore.jpg
 backend/weights/
 backend/gfpgan/weights/
 frontend/public/models/
+frontend/dev-server.pid
+frontend/dev-server.*.log
+__pycache__/
+*.py[cod]
 node_modules/
 venv/
 *.pth

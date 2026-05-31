@@ -55,6 +55,7 @@ export function RestoreWidget({ onSuccess, onReset }) {
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState(null);
   const fileInputRef = useRef(null);
+  const widgetRef = useRef(null);
   const [isDragging, setIsDragging] = useState(false);
 
   const [clientName, setClientName] = useState("");
@@ -68,6 +69,12 @@ export function RestoreWidget({ onSuccess, onReset }) {
   const [paymentAmount, setPaymentAmount] = useState(0);
 
   const totalPrice = serviceName ? selectedFiles.length * SERVICES[serviceName] : 0;
+
+  const scrollToWidget = () => {
+    setTimeout(() => {
+      widgetRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
+    }, 100);
+  };
 
   // Глобальная блокировка drag & drop, чтобы фото не открывалось в новой вкладке при промахе
   useEffect(() => {
@@ -152,6 +159,7 @@ export function RestoreWidget({ onSuccess, onReset }) {
       setOrderId(data.order_id || '...');
       setPaymentAmount(totalPrice);
       setIsSuccess(true);
+      scrollToWidget();
       reachGoal('ORDER_CREATED');
       if (onSuccess) onSuccess();
       setSelectedFiles([]);
@@ -188,7 +196,7 @@ export function RestoreWidget({ onSuccess, onReset }) {
 
   if (isSuccess) {
     return (
-      <div className="bg-green-50 border border-green-200 text-green-800 rounded-xl p-8 text-center space-y-4 animate-in fade-in zoom-in duration-300 max-w-2xl mx-auto">
+      <div ref={widgetRef} className="bg-green-50 border border-green-200 text-green-800 rounded-xl p-8 text-center space-y-4 animate-in fade-in zoom-in duration-300 max-w-2xl mx-auto">
         <h2 className="text-2xl font-bold animate-check-pop">✅ Фото успешно отправлено в обработку</h2>
         <p className="text-green-700">Заказ №{orderId} принят. Мы получили ваши фотографии и скоро приступим к работе.</p>
         <div className="flex flex-col sm:flex-row gap-4 justify-center mt-6">
@@ -208,7 +216,7 @@ export function RestoreWidget({ onSuccess, onReset }) {
   }
 
   return (
-    <div className="w-full space-y-6">
+    <div ref={widgetRef} className="w-full space-y-6">
       {selectedFiles.length === 0 ? (
         <div
           onDragOver={(e) => { e.preventDefault(); setIsDragging(true); }}

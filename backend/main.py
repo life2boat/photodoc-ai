@@ -45,7 +45,10 @@ def get_cors_origins():
     if not raw_origins.strip():
         return list(DEFAULT_CORS_ORIGINS)
 
-    return [origin.strip() for origin in raw_origins.split(",") if origin.strip()]
+    origins = [origin.strip() for origin in raw_origins.split(",") if origin.strip()]
+    if "*" in origins:
+        raise RuntimeError("CORS_ORIGINS must not include '*' while credentials are enabled")
+    return origins
 
 # Настройка CORS
 app.add_middleware(
@@ -282,11 +285,10 @@ def log_robokassa_signature_check(endpoint_name: str, out_sum: str, inv_id: str,
     expected = get_robokassa_signature(out_sum, inv_id, password)
     is_valid = expected.lower() == (signature or "").lower()
     logging.info(
-        "%s: проверка подписи %s. expected=%s received=%s",
+        "%s: проверка подписи %s для InvId=%s",
         endpoint_name,
         "прошла" if is_valid else "НЕ прошла",
-        expected,
-        signature,
+        inv_id,
     )
     return is_valid
 
@@ -311,7 +313,7 @@ async def robokassa_result(request: Request, background_tasks: BackgroundTasks):
     out_sum = payload.get("OutSum")
     inv_id = payload.get("InvId")
     signature = payload.get("SignatureValue")
-    logging.info("Result URL: OutSum=%s InvId=%s SignatureValue=%s", out_sum, inv_id, signature)
+    logging.info("Result URL: OutSum=%s InvId=%s SignatureValue=%s", out_sum, inv_id, "present" if signature else "missing")
 
     if not out_sum or inv_id is None or not signature:
         logging.error("Result URL: не хватает параметров Robokassa payload=%s", payload)
@@ -358,7 +360,7 @@ async def robokassa_success(request: Request, background_tasks: BackgroundTasks)
     inv_id = payload.get("InvId")
     signature = payload.get("SignatureValue")
     order_id = None
-    logging.info("Success URL: OutSum=%s InvId=%s SignatureValue=%s", out_sum, inv_id, signature)
+    logging.info("Success URL: OutSum=%s InvId=%s SignatureValue=%s", out_sum, inv_id, "present" if signature else "missing")
 
     if out_sum and inv_id is not None and signature:
         try:

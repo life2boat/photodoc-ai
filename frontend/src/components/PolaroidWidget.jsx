@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { CheckCircle } from 'lucide-react';
 import { redirectToPayment } from '../lib/robokassa';
 import { API_BASE_URL } from '../config';
@@ -19,6 +19,13 @@ export default function PolaroidWidget({ onSuccess, onReset }) {
   const [paymentAmount, setPaymentAmount] = useState(0);
   const [printFormat, setPrintFormat] = useState('10x15');
   const [isFileDragging, setIsFileDragging] = useState(false);
+  const widgetRef = useRef(null);
+
+  const scrollToWidget = () => {
+    setTimeout(() => {
+      widgetRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }, 100);
+  };
   
   const PRICE_PER_PHOTO = 30;
   const PRINT_FORMATS = [
@@ -139,6 +146,7 @@ export default function PolaroidWidget({ onSuccess, onReset }) {
         setOrderId(data.order_id || '...');
         setPaymentAmount(photos.length * PRICE_PER_PHOTO);
         setIsSuccess(true);
+        scrollToWidget();
         reachGoal('ORDER_CREATED');
         if (onSuccess) onSuccess();
         photos.forEach(p => URL.revokeObjectURL(p.url));
@@ -162,7 +170,7 @@ export default function PolaroidWidget({ onSuccess, onReset }) {
 
   if (isSuccess) {
     return (
-      <div className="bg-green-50 border border-green-200 text-green-800 rounded-xl p-8 text-center space-y-4 max-w-2xl mx-auto animate-fadeIn">
+      <div ref={widgetRef} className="bg-green-50 border border-green-200 text-green-800 rounded-xl p-8 text-center space-y-4 max-w-2xl mx-auto animate-fadeIn">
         <CheckCircle className="w-16 h-16 mx-auto text-green-500" />
         <h2 className="text-2xl font-bold animate-check-pop">Фото успешно отправлено в обработку</h2>
         <p className="text-green-700">Заказ №{orderId} сформирован. Перейдите к оплате для запуска в печать.</p>
@@ -183,7 +191,7 @@ export default function PolaroidWidget({ onSuccess, onReset }) {
   }
 
   return (
-    <form onSubmit={handleSubmit} className="bg-gray-900 border border-gray-800 rounded-3xl p-8 shadow-2xl animate-fadeIn">
+    <form ref={widgetRef} onSubmit={handleSubmit} className="bg-gray-900 border border-gray-800 rounded-3xl p-8 shadow-2xl animate-fadeIn">
       <h2 className="text-2xl font-bold text-white mb-6">📸 Ретро Polaroid <span className="text-sm font-normal text-gray-500">(до 10 шт)</span></h2>
 
       {/* Кнопка загрузки */}
