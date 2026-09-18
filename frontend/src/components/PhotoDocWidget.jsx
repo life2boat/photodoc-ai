@@ -49,10 +49,10 @@ const FilePreview = ({ file, onRemove }) => {
         type="button"
         onClick={onRemove}
         aria-label="Удалить файл"
-        className="absolute -top-2 -right-2 bg-red-500 text-white rounded-full p-1 opacity-0 group-hover:opacity-100 transition-opacity shadow-md hover:bg-red-600"
+        className="absolute -top-2 -right-2 flex h-8 w-8 items-center justify-center bg-red-500 text-white rounded-full opacity-90 sm:opacity-0 group-hover:opacity-100 transition-opacity shadow-md hover:bg-red-600 focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white"
         title="Удалить фото"
       >
-        <X size={14} strokeWidth={3} />
+        <X size={16} strokeWidth={3} />
       </button>
     </div>
   );
@@ -182,7 +182,7 @@ export function PhotoDocWidget({ onSuccess, onReset }) {
           >
             Перейти к оплате
           </button>
-          <button onClick={handleReset} className="px-6 py-3 bg-green-600 text-white font-medium rounded-full hover:bg-green-700 transition-colors">
+          <button type="button" onClick={handleReset} className="px-6 py-3 bg-green-600 text-white font-medium rounded-full hover:bg-green-700 transition-colors">
             Оформить еще один заказ
           </button>
         </div>
@@ -194,10 +194,19 @@ export function PhotoDocWidget({ onSuccess, onReset }) {
     <div ref={widgetRef} className="w-full space-y-6 max-w-4xl mx-auto">
       {files.length === 0 ? (
         <div
+          role="button"
+          tabIndex={0}
+          aria-label="Загрузить фотографии на документы"
+          onKeyDown={(e) => {
+            if (e.key === 'Enter' || e.key === ' ') {
+              e.preventDefault();
+              fileInputRef.current?.click();
+            }
+          }}
           onDragOver={(e) => { e.preventDefault(); setIsDragging(true); }}
           onDragLeave={(e) => { e.preventDefault(); setIsDragging(false); }}
           onDrop={handleDrop}
-          className={`group relative mx-auto max-w-3xl cursor-pointer overflow-hidden rounded-3xl border border-dashed bg-[radial-gradient(circle_at_50%_0%,rgba(30,58,138,0.22),transparent_45%),linear-gradient(145deg,rgba(255,255,255,0.055),rgba(2,8,23,0.72))] p-10 text-center shadow-[inset_0_1px_0_rgba(255,255,255,0.06),0_0_40px_rgba(15,23,42,0.55)] backdrop-blur-xl transition-all duration-300 hover:-translate-y-1 hover:shadow-[inset_0_1px_0_rgba(255,255,255,0.08),0_0_48px_rgba(202,138,4,0.10)] ${isDragging ? 'border-yellow-500/60 bg-yellow-500/10' : 'border-white/15 hover:border-yellow-500/45'}`}
+          className={`group relative mx-auto max-w-3xl cursor-pointer overflow-hidden rounded-3xl border border-dashed bg-[radial-gradient(circle_at_50%_0%,rgba(30,58,138,0.22),transparent_45%),linear-gradient(145deg,rgba(255,255,255,0.055),rgba(2,8,23,0.72))] p-10 text-center shadow-[inset_0_1px_0_rgba(255,255,255,0.06),0_0_40px_rgba(15,23,42,0.55)] backdrop-blur-xl transition-all duration-300 hover:-translate-y-1 hover:shadow-[inset_0_1px_0_rgba(255,255,255,0.08),0_0_48px_rgba(202,138,4,0.10)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-yellow-400 ${isDragging ? 'border-yellow-500/60 bg-yellow-500/10' : 'border-white/15 hover:border-yellow-500/45'}`}
           onClick={() => fileInputRef.current?.click()}
         >
           <div className={`pointer-events-none absolute inset-x-10 top-0 h-px bg-gradient-to-r from-transparent via-yellow-500/35 to-transparent transition-opacity ${isDragging ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'}`} />
@@ -217,10 +226,10 @@ export function PhotoDocWidget({ onSuccess, onReset }) {
             <div className="flex justify-between items-center mb-3">
               <h3 className="font-semibold text-gray-300">Выбрано фото: {files.length} шт.</h3>
               <div className="flex gap-2">
-                <button onClick={() => fileInputRef.current?.click()} disabled={isLoading} className="text-yellow-400 hover:text-yellow-300 text-sm font-medium transition-colors">
+                <button type="button" onClick={() => fileInputRef.current?.click()} disabled={isLoading} className="text-yellow-400 hover:text-yellow-300 text-sm font-medium transition-colors py-1 px-2 rounded focus-visible:ring-2 focus-visible:ring-yellow-400">
                   + Добавить
                 </button>
-                <button onClick={handleReset} disabled={isLoading} className="text-gray-500 hover:text-red-500 p-1 transition-colors" title="Удалить все" aria-label="Удалить все фото">
+                <button type="button" onClick={handleReset} disabled={isLoading} className="text-gray-400 hover:text-red-400 p-2 min-h-[36px] min-w-[36px] flex items-center justify-center rounded transition-colors focus-visible:ring-2 focus-visible:ring-red-400" title="Удалить все" aria-label="Удалить все фото">
                   <Trash2 className="w-5 h-5" />
                 </button>
               </div>
@@ -249,21 +258,22 @@ export function PhotoDocWidget({ onSuccess, onReset }) {
           <div className="flex flex-col gap-5">
             <h3 className="text-lg font-bold text-white border-b border-gray-800 pb-2">Оформление заказа</h3>
             
-            {error && ( <div className="bg-red-100 border-l-4 border-red-500 text-red-700 p-3 rounded-md text-sm">{error}</div> )}
+            {error && ( <div className="bg-red-950/80 border-l-4 border-red-500 text-red-200 p-3 rounded-md text-sm">{error}</div> )}
 
             <div>
-              <label className="block text-sm font-medium text-gray-400 mb-1">Тип документа</label>
-              <select value={docType} onChange={(e) => setDocType(e.target.value)} disabled={isLoading} className="w-full border border-gray-700 rounded-lg px-4 py-2.5 focus:outline-none focus:ring-2 focus:ring-yellow-400 bg-gray-800 text-white">
+              <label htmlFor="photodoc-type" className="block text-sm font-medium text-gray-400 mb-1">Тип документа</label>
+              <select id="photodoc-type" value={docType} onChange={(e) => setDocType(e.target.value)} disabled={isLoading} className="w-full border border-gray-700 rounded-lg px-4 py-2.5 focus:outline-none focus:ring-2 focus:ring-yellow-400 bg-gray-800 text-white">
                 {DOC_FORMATS.map(format => (<option key={format.id} value={format.id}>{format.label} — {DOC_PRICES[format.id]} ₽</option>))}
               </select>
             </div>
             <div>
-              <label className="block text-sm font-medium text-gray-400 mb-1">Ваше имя</label>
-              <input type="text" value={userName} onChange={(e) => setUserName(e.target.value)} placeholder="Иван Иванов" disabled={isLoading} className="w-full border border-gray-700 rounded-lg px-4 py-2.5 focus:outline-none focus:ring-2 focus:ring-yellow-400 bg-gray-800 text-white disabled:opacity-50" />
+              <label htmlFor="photodoc-name" className="block text-sm font-medium text-gray-400 mb-1">Ваше имя</label>
+              <input id="photodoc-name" type="text" value={userName} onChange={(e) => setUserName(e.target.value)} placeholder="Иван Иванов" disabled={isLoading} className="w-full border border-gray-700 rounded-lg px-4 py-2.5 focus:outline-none focus:ring-2 focus:ring-yellow-400 bg-gray-800 text-white disabled:opacity-50" />
             </div>
             <div>
-              <label className="block text-sm font-medium text-gray-400 mb-1">Телефон</label>
+              <label htmlFor="photodoc-phone" className="block text-sm font-medium text-gray-400 mb-1">Телефон</label>
               <input
+                id="photodoc-phone"
                 type="tel"
                 value={userPhone}
                 onChange={(e) => {
@@ -283,14 +293,14 @@ export function PhotoDocWidget({ onSuccess, onReset }) {
               </p>
             </div>
             <div>
-              <label className="block text-sm font-medium text-gray-400 mb-1">Email для подтверждения</label>
-              <input type="email" value={userEmail} onChange={(e) => setUserEmail(e.target.value)} placeholder="ivan@example.ru" disabled={isLoading} className="w-full border border-gray-700 rounded-lg px-4 py-2.5 focus:outline-none focus:ring-2 focus:ring-yellow-400 bg-gray-800 text-white disabled:opacity-50" />
+              <label htmlFor="photodoc-email" className="block text-sm font-medium text-gray-400 mb-1">Email для подтверждения</label>
+              <input id="photodoc-email" type="email" value={userEmail} onChange={(e) => setUserEmail(e.target.value)} placeholder="ivan@example.ru" disabled={isLoading} className="w-full border border-gray-700 rounded-lg px-4 py-2.5 focus:outline-none focus:ring-2 focus:ring-yellow-400 bg-gray-800 text-white disabled:opacity-50" />
             </div>
             <div>
-              <label className="block text-sm font-medium text-gray-400 mb-1">Комментарий к заказу</label>
-              <textarea value={userComment} onChange={(e) => setUserComment(e.target.value)} placeholder="Например: сделать в костюме, убрать прыщик" disabled={isLoading} className="w-full border border-gray-700 rounded-lg px-4 py-2.5 focus:outline-none focus:ring-2 focus:ring-yellow-400 bg-gray-800 text-white disabled:opacity-50 resize-none h-24" />
+              <label htmlFor="photodoc-comment" className="block text-sm font-medium text-gray-400 mb-1">Комментарий к заказу</label>
+              <textarea id="photodoc-comment" value={userComment} onChange={(e) => setUserComment(e.target.value)} placeholder="Например: сделать в костюме, убрать прыщик" disabled={isLoading} className="w-full border border-gray-700 rounded-lg px-4 py-2.5 focus:outline-none focus:ring-2 focus:ring-yellow-400 bg-gray-800 text-white disabled:opacity-50 resize-none h-24" />
             </div>
-            <button onClick={handleSubmitOrder} disabled={isLoading || files.length === 0 || !userName.trim() || !userPhone.trim() || !userEmail.trim()} className="w-full mt-2 bg-yellow-400 text-black font-bold py-3.5 px-4 rounded-lg flex items-center justify-center hover:bg-yellow-300 transition-all disabled:bg-gray-500 disabled:text-gray-300 disabled:cursor-not-allowed">
+            <button type="button" onClick={handleSubmitOrder} disabled={isLoading || files.length === 0 || !userName.trim() || !userPhone.trim() || !userEmail.trim()} className="w-full mt-2 bg-yellow-400 text-black font-bold py-3.5 px-4 rounded-lg flex items-center justify-center hover:bg-yellow-300 transition-all disabled:bg-gray-500 disabled:text-gray-300 disabled:cursor-not-allowed">
               {isLoading ? ( <><Loader2 className="mr-2 h-5 w-5 animate-spin" /> Отправка...</> ) : ( 'Оформить заказ' )}
             </button>
           </div>

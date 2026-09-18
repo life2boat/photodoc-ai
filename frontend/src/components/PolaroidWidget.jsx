@@ -1,44 +1,52 @@
-import React, { useState, useEffect, useRef } from 'react';
-import { CheckCircle } from 'lucide-react';
-import { redirectToPayment } from '../lib/robokassa';
-import { API_BASE_URL } from '../config';
+import React, { useState, useRef, useEffect } from 'react';
+import { CheckCircle, RefreshCw } from 'lucide-react';
+import { validateRussianPhone, PHONE_ERROR_MESSAGE } from '../utils/phoneValidation';
 import { reachGoal } from '../lib/metrics';
-import { PHONE_ERROR_MESSAGE, validateRussianPhone } from '../utils/phoneValidation';
+import { redirectToPayment } from '../lib/robokassa';
 
 export default function PolaroidWidget({ onSuccess, onReset }) {
-  const [photos, setPhotos] = useState([]);
+  const [photos, setPhotos] = useState([]); // [{ id, file, url, zoom, rotation, x, y }]
+  const [draggingId, setDraggingId] = useState(null);
   const [isConfirmed, setIsConfirmed] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
-  const [draggingId, setDraggingId] = useState(null);
-  const [userName, setUserName] = useState('');
-  const [userPhone, setUserPhone] = useState('');
-  const [phoneError, setPhoneError] = useState('');
-  const [userEmail, setUserEmail] = useState('');
   const [isSuccess, setIsSuccess] = useState(false);
   const [orderId, setOrderId] = useState(null);
   const [paymentAmount, setPaymentAmount] = useState(0);
   const [printFormat, setPrintFormat] = useState('10x15');
   const [isFileDragging, setIsFileDragging] = useState(false);
+  const [error, setError] = useState(null);
+
+  // Контакты клиента
+  const [userName, setUserName] = useState('');
+  const [userPhone, setUserPhone] = useState('');
+  const [phoneError, setPhoneError] = useState('');
+  const [userEmail, setUserEmail] = useState('');
+
   const widgetRef = useRef(null);
+  const fileInputRef = useRef(null);
 
   const scrollToWidget = () => {
     setTimeout(() => {
       widgetRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' });
     }, 100);
   };
-  
+
+  const API_BASE_URL = '/api';
   const PRICE_PER_PHOTO = 30;
   const PRINT_FORMATS = [
     { value: '9x13', label: '9x13 см' },
     { value: '10x15', label: '10x15 см' }
   ];
 
-  // Очистка памяти при размонтировании согласно gemini.md
+  const photoUrlsRef = useRef({});
+
+  // Очистка памяти: отзываем ObjectURL при размонтировании компонента
   useEffect(() => {
+    const urls = photoUrlsRef.current;
     return () => {
-      photos.forEach(photo => URL.revokeObjectURL(photo.url));
+      Object.values(urls).forEach(url => URL.revokeObjectURL(url));
     };
-  }, [photos]);
+  }, []);
 
   const handleFileChange = (e) => {
     addPhotos(e.target.files);
@@ -47,19 +55,25 @@ export default function PolaroidWidget({ onSuccess, onReset }) {
   const addPhotos = (fileList) => {
     const selected = Array.from(fileList || []);
     if (selected.length + photos.length > 10) {
-      alert("Максимум 10 фотографий");
+      setError("Максимум 10 фотографий");
       return;
     }
+    setError(null);
     
-    const newPhotos = selected.map(file => ({
-      id: Math.random().toString(36).substr(2, 9),
-      file,
-      url: URL.createObjectURL(file),
-      zoom: 1.0, 
-      rotation: 0, // Новое поле для поворота
-      x: 0,
-      y: 0
-    }));
+    const newPhotos = selected.map(file => {
+      const id = crypto.randomUUID();
+      const url = URL.createObjectURL(file);
+      photoUrlsRef.current[id] = url;
+      return {
+        id,
+        file,
+        url,
+        zoom: 1.0,
+        rotation: 0, // Новое поле для поворота
+        x: 0,
+        y: 0
+      };
+    });
 
     setPhotos(prev => [...prev, ...newPhotos]);
   };
@@ -75,9 +89,11 @@ export default function PolaroidWidget({ onSuccess, onReset }) {
   };
 
   const removePhoto = (id) => {
-    // ВАЖНО: Освобождаем память перед удалением снимка
-    const photoToRemove = photos.find(p => p.id === id);
-    if (photoToRemove) URL.revokeObjectURL(photoToRemove.url);
+    // Освобождаем ObjectURL и убираем из ref
+    if (photoUrlsRef.current[id]) {
+      URL.revokeObjectURL(photoUrlsRef.current[id]);
+      delete photoUrlsRef.current[id];
+    }
     setPhotos(prev => prev.filter(p => p.id !== id));
   };
 
@@ -91,8 +107,6 @@ export default function PolaroidWidget({ onSuccess, onReset }) {
     if (draggingId !== id) return;
     const photo = photos.find(p => p.id === id);
     if (!photo) return;
-
-    // Смещение с учетом текущего масштаба
     updatePhoto(id, {
       x: photo.x + e.movementX / photo.zoom,
       y: photo.y + e.movementY / photo.zoom
@@ -103,10 +117,10 @@ export default function PolaroidWidget({ onSuccess, onReset }) {
 
   const handleSubmit = async (e) => {
     e.preventDefault();
-    e.stopPropagation(); // Отключаем всплытие эвента к родительским формам
+    e.stopPropagation();
     if (!isConfirmed || photos.length === 0) return;
     if (!userName.trim() || !userPhone.trim() || !userEmail.trim()) {
-      alert("Пожалуйста, укажите ваше имя, телефон и email");
+      setError("Пожалуйста, укажите ваше имя, телефон и email");
       return;
     }
 
@@ -116,6 +130,7 @@ export default function PolaroidWidget({ onSuccess, onReset }) {
     }
 
     setIsLoading(true);
+    setError(null);
     const formData = new FormData();
     formData.append('name', userName); 
     formData.append('phone', userPhone);
@@ -150,6 +165,7 @@ export default function PolaroidWidget({ onSuccess, onReset }) {
         reachGoal('ORDER_CREATED');
         if (onSuccess) onSuccess();
         photos.forEach(p => URL.revokeObjectURL(p.url));
+        photoUrlsRef.current = {};
         setPhotos([]);
         setIsConfirmed(false);
         setUserName('');
@@ -157,12 +173,13 @@ export default function PolaroidWidget({ onSuccess, onReset }) {
         setPhoneError('');
         setUserEmail('');
         setPrintFormat('10x15');
+        setError(null);
       } else {
         const errorData = await response.json();
         throw new Error(errorData.detail || "Ошибка сервера");
       }
     } catch (err) {
-      alert("Ошибка: " + err.message);
+      setError("Ошибка: " + (err?.message || "Не удалось оформить заказ"));
     } finally {
       setIsLoading(false);
     }
@@ -194,19 +211,34 @@ export default function PolaroidWidget({ onSuccess, onReset }) {
     <form ref={widgetRef} onSubmit={handleSubmit} className="bg-gray-900 border border-gray-800 rounded-3xl p-8 shadow-2xl animate-fadeIn">
       <h2 className="text-2xl font-bold text-white mb-6">📸 Ретро Polaroid <span className="text-sm font-normal text-gray-500">(до 10 шт)</span></h2>
 
+      {error && (
+        <div className="mb-6 bg-red-950/80 border-l-4 border-red-500 text-red-200 p-3 rounded-md text-sm">
+          {error}
+        </div>
+      )}
+
       {/* Кнопка загрузки */}
       <label
+        role="button"
+        tabIndex={0}
+        aria-label="Добавить фотографии для ретро-печати"
+        onKeyDown={(e) => {
+          if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault();
+            fileInputRef.current?.click();
+          }
+        }}
         onDragOver={(e) => { e.preventDefault(); setIsFileDragging(true); }}
         onDragLeave={(e) => { e.preventDefault(); setIsFileDragging(false); }}
         onDrop={handleFileDrop}
-        className={`group relative mb-8 flex min-h-40 w-full cursor-pointer flex-col items-center justify-center overflow-hidden rounded-3xl border border-dashed bg-[radial-gradient(circle_at_50%_0%,rgba(30,58,138,0.22),transparent_45%),linear-gradient(145deg,rgba(255,255,255,0.055),rgba(2,8,23,0.72))] p-8 text-center shadow-[inset_0_1px_0_rgba(255,255,255,0.06),0_0_40px_rgba(15,23,42,0.55)] backdrop-blur-xl transition-all duration-300 hover:-translate-y-1 hover:shadow-[inset_0_1px_0_rgba(255,255,255,0.08),0_0_48px_rgba(202,138,4,0.10)] ${isFileDragging ? 'border-yellow-500/60' : 'border-white/15 hover:border-yellow-500/45'}`}
+        className={`group relative mb-8 flex min-h-40 w-full cursor-pointer flex-col items-center justify-center overflow-hidden rounded-3xl border border-dashed bg-[radial-gradient(circle_at_50%_0%,rgba(30,58,138,0.22),transparent_45%),linear-gradient(145deg,rgba(255,255,255,0.055),rgba(2,8,23,0.72))] p-8 text-center shadow-[inset_0_1px_0_rgba(255,255,255,0.06),0_0_40px_rgba(15,23,42,0.55)] backdrop-blur-xl transition-all duration-300 hover:-translate-y-1 hover:shadow-[inset_0_1px_0_rgba(255,255,255,0.08),0_0_48px_rgba(202,138,4,0.10)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-yellow-400 ${isFileDragging ? 'border-yellow-500/60' : 'border-white/15 hover:border-yellow-500/45'}`}
       >
         <span className={`pointer-events-none absolute inset-x-10 top-0 h-px bg-gradient-to-r from-transparent via-yellow-500/35 to-transparent transition-opacity ${isFileDragging ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'}`} />
         <span className="mb-4 flex h-14 w-14 items-center justify-center rounded-2xl border border-yellow-500/20 bg-yellow-500/10 text-3xl shadow-[0_0_28px_rgba(202,138,4,0.12)] transition-transform group-hover:scale-110">➕</span>
         <p className="text-sm font-semibold text-white">Добавить фотографии</p>
         <p className="mt-2 text-xs leading-5 text-zinc-400">До 10 снимков для ретро-печати</p>
         <p className="text-xs text-zinc-500">Поддерживаются JPG, PNG, WEBP</p>
-        <input type="file" multiple accept="image/*" className="hidden" onChange={handleFileChange} />
+        <input ref={fileInputRef} type="file" multiple accept="image/*" className="hidden" onChange={handleFileChange} />
       </label>
 
       {/* Сетка фото с рамками */}
@@ -345,12 +377,13 @@ export default function PolaroidWidget({ onSuccess, onReset }) {
 
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-6">
             <div>
-              <label className="block text-sm font-medium text-gray-400 mb-1">Ваше имя *</label>
-              <input type="text" value={userName} onChange={(e) => setUserName(e.target.value)} placeholder="Иван" disabled={isLoading} className="w-full bg-gray-900 border border-gray-800 text-white rounded-xl px-4 py-3 focus:outline-none focus:border-yellow-400 transition-colors" />
+              <label htmlFor="polaroid-name" className="block text-sm font-medium text-gray-400 mb-1">Ваше имя *</label>
+              <input id="polaroid-name" type="text" value={userName} onChange={(e) => setUserName(e.target.value)} placeholder="Иван" disabled={isLoading} className="w-full bg-gray-900 border border-gray-800 text-white rounded-xl px-4 py-3 focus:outline-none focus:border-yellow-400 transition-colors" />
             </div>
             <div>
-              <label className="block text-sm font-medium text-gray-400 mb-1">Телефон *</label>
+              <label htmlFor="polaroid-phone" className="block text-sm font-medium text-gray-400 mb-1">Телефон *</label>
               <input
+                id="polaroid-phone"
                 type="tel"
                 value={userPhone}
                 onChange={(e) => {
@@ -370,8 +403,8 @@ export default function PolaroidWidget({ onSuccess, onReset }) {
               </p>
             </div>
             <div>
-              <label className="block text-sm font-medium text-gray-400 mb-1">Email для подтверждения *</label>
-              <input type="email" value={userEmail} onChange={(e) => setUserEmail(e.target.value)} placeholder="ivan@example.ru" disabled={isLoading} className="w-full bg-gray-900 border border-gray-800 text-white rounded-xl px-4 py-3 focus:outline-none focus:border-yellow-400 transition-colors" />
+              <label htmlFor="polaroid-email" className="block text-sm font-medium text-gray-400 mb-1">Email для подтверждения *</label>
+              <input id="polaroid-email" type="email" value={userEmail} onChange={(e) => setUserEmail(e.target.value)} placeholder="ivan@example.ru" disabled={isLoading} className="w-full bg-gray-900 border border-gray-800 text-white rounded-xl px-4 py-3 focus:outline-none focus:border-yellow-400 transition-colors" />
             </div>
           </div>
 

@@ -6,11 +6,13 @@ import {
   Download,
   Image as ImageIcon,
   Layers3,
+  Menu,
   Printer,
   ShieldCheck,
   Star,
   UploadCloud,
-  Wand2
+  Wand2,
+  X
 } from 'lucide-react';
 
 // Импортируем все рабочие виджеты
@@ -21,6 +23,14 @@ import ServiceCalculator from './components/ServiceCalculator';
 import SliderCompare from './components/SliderCompare';
 import { RestoreWidget } from './components/RestoreWidget'; 
 import PrivacyModal from './components/PrivacyModal';
+import CosmicOrb from './components/ui/CosmicOrb';
+import AppearText from './components/ui/AppearText';
+import GradientText from './components/ui/GradientText';
+import CoverflowGallery from './components/ui/CoverflowGallery';
+import InteractiveGrid from './components/ui/InteractiveGrid';
+import MagneticButton from './components/ui/MagneticButton';
+import FireworkCelebration from './components/ui/FireworkCelebration';
+import FadeInSection from './components/ui/FadeInSection';
 import heroMockup from './assets/hero-mockup.png';
 import passportImg from './assets/img/passport-example.png';
 import polaroidImg from './assets/img/polaroid-example.png';
@@ -30,6 +40,7 @@ export default function App() {
   const [activeService, setActiveService] = useState('docs');
   const [isOrderSuccess, setIsOrderSuccess] = useState(false);
   const [isPrivacyOpen, setIsPrivacyOpen] = useState(false);
+  const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
 
   const scrollToSection = (id) => {
     document.getElementById(id)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -52,23 +63,28 @@ export default function App() {
 
   const exampleCards = [
     {
+      title: 'Паспорт',
+      subtitle: 'Фото 35×45 • Белый фон',
+      image: passportImg,
+      mode: 'image',
+      fit: 'contain',
+    },
+    {
+      title: 'Реставрация',
+      subtitle: 'Восстановление • Цвет и детали',
+      image: restorationImg,
+      mode: 'image',
+    },
+    {
       title: 'Polaroid',
       subtitle: 'Ретро-рамка • Атмосферная печать',
       image: polaroidImg,
       mode: 'image',
     },
     {
-      title: 'Паспорт',
-      subtitle: 'Фото 35×45 • Белый фон',
-      image: passportImg,
-      mode: 'image',
-      fit: 'contain',
-      isWide: true,
-    },
-    {
-      title: 'Реставрация',
-      subtitle: 'Восстановление • Цвет и детали',
-      image: restorationImg,
+      title: 'Печать фото',
+      subtitle: 'Премиум бумага • Яркие цвета',
+      image: heroMockup, // Используем mockup как пример
       mode: 'image',
     },
   ];
@@ -83,54 +99,128 @@ export default function App() {
             onClick={() => window.scrollTo({ top: 0, behavior: 'smooth' })}
             className="text-xl font-bold tracking-tight text-white"
           >
-            PhotoDoc<span className="text-yellow-400">.</span>
+            <GradientText>PhotoDoc</GradientText><span className="text-yellow-400">.</span>
           </button>
           <nav className="hidden items-center gap-6 text-sm font-medium text-zinc-400 md:flex">
-            <button type="button" onClick={() => scrollToSection('examples-section')} className="transition-colors hover:text-white">
+            <button type="button" onClick={() => scrollToSection('examples-showcase')} className="transition-colors hover:text-white">
               Примеры
             </button>
             <button type="button" onClick={() => scrollToSection('services-section')} className="transition-colors hover:text-white">
               Услуги
             </button>
             <button type="button" onClick={() => scrollToSection('reviews-section')} className="transition-colors hover:text-white">
-              Отзывы
+              Преимущества
             </button>
             <button type="button" onClick={() => scrollToSection('contacts')} className="transition-colors hover:text-white">
               Контакты
             </button>
           </nav>
-          <button
-            type="button"
-            onClick={() => scrollToSection('services-section')}
-            className="rounded-full border border-white/10 bg-white/5 px-4 py-2 text-sm font-semibold text-white backdrop-blur-md transition-colors hover:bg-white/10"
-          >
-            Заказать
-          </button>
+          <div className="flex items-center gap-3">
+            <button
+              type="button"
+              onClick={() => scrollToSection('services-section')}
+              className="rounded-full border border-white/10 bg-white/5 px-4 py-2 text-sm font-semibold text-white backdrop-blur-md transition-colors hover:bg-white/10"
+            >
+              Заказать
+            </button>
+            <button
+              type="button"
+              onClick={() => setIsMobileMenuOpen(!isMobileMenuOpen)}
+              className="flex h-10 w-10 items-center justify-center rounded-full border border-white/10 bg-white/5 text-zinc-300 md:hidden hover:text-white"
+              aria-label={isMobileMenuOpen ? "Закрыть меню" : "Открыть меню"}
+              aria-expanded={isMobileMenuOpen}
+            >
+              {isMobileMenuOpen ? <X className="h-5 w-5" /> : <Menu className="h-5 w-5" />}
+            </button>
+          </div>
         </div>
+
+        {/* Мобильная навигация */}
+        {isMobileMenuOpen && (
+          <nav
+            aria-label="Мобильная навигация"
+            className="border-t border-white/10 bg-black/95 px-6 py-4 backdrop-blur-xl md:hidden animate-fade-up"
+          >
+            <div className="flex flex-col gap-3 text-base font-medium text-zinc-300">
+              <button
+                type="button"
+                onClick={() => {
+                  scrollToSection('services-section');
+                  setIsMobileMenuOpen(false);
+                }}
+                className="text-left py-2 transition-colors hover:text-white"
+              >
+                Услуги
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  scrollToSection('examples-showcase');
+                  setIsMobileMenuOpen(false);
+                }}
+                className="text-left py-2 transition-colors hover:text-white"
+              >
+                Примеры
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  scrollToSection('reviews-section');
+                  setIsMobileMenuOpen(false);
+                }}
+                className="text-left py-2 transition-colors hover:text-white"
+              >
+                Преимущества
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  scrollToSection('contacts');
+                  setIsMobileMenuOpen(false);
+                }}
+                className="text-left py-2 transition-colors hover:text-white"
+              >
+                Контакты
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  scrollToSection('services-section');
+                  setIsMobileMenuOpen(false);
+                }}
+                className="mt-2 rounded-xl bg-yellow-400 py-3 text-center font-bold text-black shadow-[0_0_15px_rgba(234,179,8,0.4)]"
+              >
+                Оформить заказ
+              </button>
+            </div>
+          </nav>
+        )}
       </header>
 
       {/* Hero Секция (Главный экран) */}
       <section className="relative overflow-hidden px-4 pb-24 pt-20 text-center md:pb-32">
-        <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_50%_8%,rgba(79,70,229,0.18),transparent_34%),radial-gradient(circle_at_20%_35%,rgba(14,165,233,0.08),transparent_28%)]" />
+        <CosmicOrb />
 
         <div className="relative mx-auto mt-20 max-w-6xl">
           <div className="animate-fade-up">
-            <h1 className="mx-auto mt-6 max-w-[800px] text-5xl font-bold leading-none tracking-tighter text-white md:text-7xl">
-              Цифровая фотостудия нового поколения
-            </h1>
+            <AppearText
+              as="h1"
+              text="Цифровая фотостудия нового поколения"
+              className="mx-auto mt-6 max-w-[800px] text-5xl font-bold leading-none tracking-tighter text-white md:text-7xl"
+              delay={0.2}
+            />
             <p className="mx-auto mt-6 max-w-2xl text-base leading-8 text-zinc-400 md:text-xl">
               Подготовьте фото на документы, печать Polaroid или реставрацию снимков с внимательной проверкой
               специалиста и быстрым онлайн-заказом.
             </p>
             <div className="mt-8 flex flex-col items-center justify-center gap-3 sm:flex-row">
-              <button
-                type="button"
+              <MagneticButton
                 onClick={() => scrollToSection('services-section')}
                 className="inline-flex w-full items-center justify-center gap-2 rounded-full bg-yellow-400 px-8 py-4 font-bold text-black shadow-[0_0_15px_rgba(234,179,8,0.5)] transition-all hover:scale-105 hover:brightness-110 sm:w-auto"
               >
                 Начать заказ
                 <ArrowRight className="h-4 w-4" aria-hidden="true" />
-              </button>
+              </MagneticButton>
               <button
                 type="button"
                 onClick={() => scrollToSection('calculator-section')}
@@ -141,7 +231,7 @@ export default function App() {
             </div>
           </div>
 
-          <div id="examples-section" className="animate-float-slow relative mx-auto mt-12 w-full max-w-5xl scroll-mt-24 overflow-hidden rounded-2xl border border-white/5 shadow-[0_0_50px_rgba(99,102,241,0.15)]">
+          <div className="animate-float-slow relative mx-auto mt-12 w-full max-w-5xl overflow-hidden rounded-2xl border border-white/5 shadow-[0_0_50px_rgba(99,102,241,0.15)]">
             <img
               src={heroMockup}
               alt="Интерфейс цифровой фотостудии: загрузка фото, обработка и готовый результат"
@@ -156,8 +246,8 @@ export default function App() {
 
           <div className="mt-8 flex flex-col items-center justify-center gap-3 text-sm text-zinc-400 sm:flex-row sm:flex-wrap sm:gap-4">
             <span>✓ Более 5000 обработанных фото</span>
-            <span>✓ Готовность за 5 минут</span>
-            <span>✓ Поддержка всех типов документов</span>
+            <span>✓ Быстрая подготовка и проверка</span>
+            <span>✓ Поддержка популярных форматов документов</span>
           </div>
 
           <div className="mx-auto mt-10 grid max-w-5xl grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
@@ -171,36 +261,40 @@ export default function App() {
       </section>
 
       {/* Блок преимуществ */}
-      <section id="reviews-section" className="scroll-mt-24 py-24 px-4 border-y border-white/10 bg-[#050815]">
+      <FadeInSection>
+        <section id="reviews-section" className="relative scroll-mt-24 py-24 px-4 border-y border-white/10 bg-[#050815] overflow-hidden">
+          <InteractiveGrid />
         <h2 className="sr-only">Преимущества PhotoDoc AI</h2>
-        <div className="max-w-6xl mx-auto grid grid-cols-1 md:grid-cols-3 gap-5">
-          <div className="group flex flex-col items-center text-center space-y-5 rounded-2xl border border-white/10 bg-white/[0.04] p-8 backdrop-blur-xl transition-all duration-300 hover:-translate-y-1 hover:border-yellow-500/25 hover:shadow-[0_0_40px_rgba(202,138,4,0.10)]">
+        <div className="relative z-10 max-w-6xl mx-auto grid grid-cols-1 md:grid-cols-3 gap-5 pointer-events-none">
+          <div className="pointer-events-auto group flex flex-col items-center text-center space-y-5 rounded-2xl border border-white/10 bg-white/[0.04] p-8 backdrop-blur-xl transition-all duration-300 hover:-translate-y-1 hover:border-yellow-500/25 hover:shadow-[0_0_40px_rgba(202,138,4,0.10)]">
             <div className="w-16 h-16 bg-yellow-400/10 rounded-2xl flex items-center justify-center border border-yellow-400/20 transition-transform duration-300 group-hover:scale-110">
               <Star className="w-7 h-7 text-yellow-400" />
             </div>
             <h3 className="text-lg font-bold text-white">Ручная проверка каждого макета</h3>
             <p className="text-zinc-300 text-sm leading-7">Наши специалисты внимательно оценивают качество перед отправкой в печать.</p>
           </div>
-          <div className="group flex flex-col items-center text-center space-y-5 rounded-2xl border border-white/10 bg-white/[0.04] p-8 backdrop-blur-xl transition-all duration-300 hover:-translate-y-1 hover:border-yellow-500/25 hover:shadow-[0_0_40px_rgba(202,138,4,0.10)]">
+          <div className="pointer-events-auto group flex flex-col items-center text-center space-y-5 rounded-2xl border border-white/10 bg-white/[0.04] p-8 backdrop-blur-xl transition-all duration-300 hover:-translate-y-1 hover:border-yellow-500/25 hover:shadow-[0_0_40px_rgba(202,138,4,0.10)]">
             <div className="w-16 h-16 bg-yellow-400/10 rounded-2xl flex items-center justify-center border border-yellow-400/20 transition-transform duration-300 group-hover:scale-110">
               <ShieldCheck className="w-7 h-7 text-yellow-400" />
             </div>
-            <h3 className="text-lg font-bold text-white">100% соответствие стандартам</h3>
+            <h3 className="text-lg font-bold text-white">Подготовка с учётом требований к документам</h3>
             <p className="text-zinc-300 text-sm leading-7">Идеальные размеры и пропорции для любых видов документов и виз.</p>
           </div>
-          <div className="group flex flex-col items-center text-center space-y-5 rounded-2xl border border-white/10 bg-white/[0.04] p-8 backdrop-blur-xl transition-all duration-300 hover:-translate-y-1 hover:border-yellow-500/25 hover:shadow-[0_0_40px_rgba(202,138,4,0.10)]">
+          <div className="pointer-events-auto group flex flex-col items-center text-center space-y-5 rounded-2xl border border-white/10 bg-white/[0.04] p-8 backdrop-blur-xl transition-all duration-300 hover:-translate-y-1 hover:border-yellow-500/25 hover:shadow-[0_0_40px_rgba(202,138,4,0.10)]">
             <div className="w-16 h-16 bg-yellow-400/10 rounded-2xl flex items-center justify-center border border-yellow-400/20 transition-transform duration-300 group-hover:scale-110">
               <Clock className="w-7 h-7 text-yellow-400" />
             </div>
             <h3 className="text-lg font-bold text-white">Бережное отношение к деталям</h3>
             <p className="text-zinc-300 text-sm leading-7">Премиальная бумага, идеальная цветопередача и аккуратная доставка.</p>
           </div>
-        </div>
-      </section>
+          </div>
+        </section>
+      </FadeInSection>
 
       {/* Навигация по услугам (Витрина) */}
-      <section id="services-section" className="relative scroll-mt-24 overflow-hidden py-32 px-4">
-        <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_50%_0%,rgba(30,58,138,0.20),transparent_42%),radial-gradient(circle_at_80%_35%,rgba(109,40,217,0.10),transparent_30%),linear-gradient(180deg,#02040a_0%,#07101f_48%,#02040a_100%)]" />
+      <FadeInSection>
+        <section id="services-section" className="relative scroll-mt-24 overflow-hidden py-32 px-4">
+          <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_50%_0%,rgba(30,58,138,0.20),transparent_42%),radial-gradient(circle_at_80%_35%,rgba(109,40,217,0.10),transparent_30%),linear-gradient(180deg,#02040a_0%,#07101f_48%,#02040a_100%)]" />
         <div className="pointer-events-none absolute left-1/2 top-24 h-96 w-96 -translate-x-1/2 rounded-full bg-blue-500/10 blur-[130px]" />
         <div className="relative max-w-6xl mx-auto">
           <div className="text-center mb-14">
@@ -297,10 +391,12 @@ export default function App() {
             </aside>
           </div>
         </div>
-      </section>
+        </section>
+      </FadeInSection>
 
-      <section id="examples-showcase" className="relative overflow-hidden px-4 py-24">
-        <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_50%_18%,rgba(30,58,138,0.18),transparent_36%),radial-gradient(circle_at_15%_72%,rgba(202,138,4,0.08),transparent_28%)]" />
+      <FadeInSection>
+        <section id="examples-showcase" className="relative overflow-hidden px-4 py-24">
+          <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_50%_18%,rgba(30,58,138,0.18),transparent_36%),radial-gradient(circle_at_15%_72%,rgba(202,138,4,0.08),transparent_28%)]" />
         <div className="relative mx-auto max-w-6xl">
           <div className="mb-12 text-center">
             <h2 className="text-3xl font-bold tracking-tighter text-white md:text-4xl">Примеры работ</h2>
@@ -309,85 +405,21 @@ export default function App() {
             </p>
           </div>
 
-          <div className="hide-scrollbar -mx-4 flex snap-x gap-4 overflow-x-auto px-4 pb-4 md:mx-0 md:grid md:grid-cols-4 md:gap-6 md:overflow-visible md:px-0 md:pb-0">
-            {exampleCards.map((card) => (
-              <article
-                key={card.title}
-                className={`group relative min-w-[78vw] snap-center overflow-hidden rounded-2xl border border-white/10 bg-white/5 backdrop-blur-md transition-all duration-300 ease-in-out hover:-translate-y-1 hover:border-yellow-500/30 hover:shadow-[0_0_44px_rgba(202,138,4,0.12)] sm:min-w-[360px] md:min-w-0 ${
-                  card.isWide ? 'md:col-span-2' : 'md:col-span-1'
-                }`}
-              >
-                <div className={`relative overflow-hidden bg-[radial-gradient(circle_at_50%_18%,rgba(255,255,255,0.10),transparent_26%),linear-gradient(145deg,#0a1020,#02040a)] ${
-                  card.isWide ? 'aspect-[8/5]' : 'aspect-[4/5]'
-                }`}>
-                  {card.mode === 'reveal' && (
-                    <>
-                      <img
-                        src={card.before}
-                        alt={`${card.title}: до обработки`}
-                        loading="lazy"
-                        className="h-full w-full object-cover transition-transform duration-500 ease-in-out group-hover:scale-[1.03]"
-                      />
-                      <img
-                        src={card.after}
-                        alt={`${card.title}: после обработки`}
-                        loading="lazy"
-                        className="absolute inset-0 h-full w-full object-cover opacity-0 transition-all duration-500 ease-in-out group-hover:opacity-100 group-hover:scale-[1.03]"
-                      />
-                      <div className="absolute left-3 top-3 rounded-full bg-zinc-950/70 px-3 py-1 text-xs font-semibold text-zinc-200 backdrop-blur-md transition-opacity duration-300 group-hover:opacity-0">
-                        До
-                      </div>
-                      <div className="absolute right-3 top-3 rounded-full bg-zinc-950/70 px-3 py-1 text-xs font-semibold text-white opacity-0 backdrop-blur-md transition-opacity duration-300 group-hover:opacity-100">
-                        После
-                      </div>
-                    </>
-                  )}
-
-                  {card.mode === 'business' && (
-                    <div className="relative h-full p-4">
-                      <img
-                        src={card.image}
-                        alt={card.title}
-                        loading="lazy"
-                        className="h-full w-full rounded-xl object-cover shadow-[0_18px_50px_rgba(0,0,0,0.35)] transition-transform duration-500 ease-in-out group-hover:scale-[1.025]"
-                      />
-                      <div className="absolute inset-x-6 bottom-6 rounded-xl border border-white/10 bg-black/45 px-4 py-3 backdrop-blur-md">
-                        <p className="text-xs font-semibold uppercase tracking-[0.18em] text-yellow-200/80">Business</p>
-                        <p className="mt-1 text-sm font-semibold text-white">Профессиональный портрет</p>
-                      </div>
-                    </div>
-                  )}
-
-                  {card.mode === 'image' && (
-                    <img
-                      src={card.image}
-                      alt={card.title}
-                      loading="lazy"
-                      className={`h-full w-full transition-transform duration-500 ease-in-out group-hover:scale-[1.03] ${
-                        card.fit === 'contain' ? 'object-contain p-4' : 'object-cover'
-                      }`}
-                    />
-                  )}
-
-                  <div className="pointer-events-none absolute inset-0 bg-gradient-to-t from-black/45 via-transparent to-white/5 opacity-90" />
-                </div>
-                <div className="border-t border-white/10 bg-black/20 p-5 text-center">
-                  <h3 className="text-base font-semibold text-white">{card.title}</h3>
-                  <p className="mt-1 text-sm leading-6 text-zinc-400">{card.subtitle}</p>
-                </div>
-              </article>
-            ))}
-          </div>
+          <CoverflowGallery cards={exampleCards} />
         </div>
       </section>
+      </FadeInSection>
 
       {/* Секция Калькулятора */}
+      {isOrderSuccess && <FireworkCelebration />}
       {!isOrderSuccess && (
-        <section id="calculator-section" className="scroll-mt-24 py-16 px-4 bg-gray-900/30 border-t border-gray-800">
-          <div className="max-w-6xl mx-auto">
-            <ServiceCalculator />
-          </div>
-        </section>
+        <FadeInSection>
+          <section id="calculator-section" className="scroll-mt-24 py-16 px-4 bg-gray-900/30 border-t border-gray-800">
+            <div className="max-w-6xl mx-auto">
+              <ServiceCalculator />
+            </div>
+          </section>
+        </FadeInSection>
       )}
 
       {/* Подвал (Footer) */}

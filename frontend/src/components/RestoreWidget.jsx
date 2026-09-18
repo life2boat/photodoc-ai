@@ -35,10 +35,10 @@ const FilePreview = ({ file, onRemove }) => {
         type="button"
         onClick={onRemove}
         aria-label="Удалить файл"
-        className="absolute -top-2 -right-2 bg-red-500 text-white rounded-full p-1 opacity-0 group-hover:opacity-100 transition-opacity shadow-md hover:bg-red-600"
+        className="absolute -top-2 -right-2 flex h-8 w-8 items-center justify-center bg-red-500 text-white rounded-full opacity-90 sm:opacity-0 group-hover:opacity-100 transition-opacity shadow-md hover:bg-red-600 focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white"
         title="Удалить фото"
       >
-        <X size={14} strokeWidth={3} />
+        <X size={16} strokeWidth={3} />
       </button>
     </div>
   );
@@ -46,7 +46,7 @@ const FilePreview = ({ file, onRemove }) => {
 
 const SERVICES = {
   "Легкая реставрация": 200,
-  "Глубокая реставрация с ИИ": 350,
+  "Глубокая реставрация": 350,
   "Окрашивание / Колоризация": 150
 };
 
@@ -219,10 +219,19 @@ export function RestoreWidget({ onSuccess, onReset }) {
     <div ref={widgetRef} className="w-full space-y-6">
       {selectedFiles.length === 0 ? (
         <div
+          role="button"
+          tabIndex={0}
+          aria-label="Загрузить фотографии для реставрации"
+          onKeyDown={(e) => {
+            if (e.key === 'Enter' || e.key === ' ') {
+              e.preventDefault();
+              fileInputRef.current?.click();
+            }
+          }}
           onDragOver={(e) => { e.preventDefault(); setIsDragging(true); }}
           onDragLeave={(e) => { e.preventDefault(); setIsDragging(false); }}
           onDrop={handleDrop}
-          className={`group relative mx-auto max-w-3xl cursor-pointer overflow-hidden rounded-3xl border border-dashed bg-[radial-gradient(circle_at_50%_0%,rgba(30,58,138,0.22),transparent_45%),linear-gradient(145deg,rgba(255,255,255,0.055),rgba(2,8,23,0.72))] p-10 text-center shadow-[inset_0_1px_0_rgba(255,255,255,0.06),0_0_40px_rgba(15,23,42,0.55)] backdrop-blur-xl transition-all duration-300 hover:-translate-y-1 hover:shadow-[inset_0_1px_0_rgba(255,255,255,0.08),0_0_48px_rgba(202,138,4,0.10)] ${
+          className={`group relative mx-auto max-w-3xl cursor-pointer overflow-hidden rounded-3xl border border-dashed bg-[radial-gradient(circle_at_50%_0%,rgba(30,58,138,0.22),transparent_45%),linear-gradient(145deg,rgba(255,255,255,0.055),rgba(2,8,23,0.72))] p-10 text-center shadow-[inset_0_1px_0_rgba(255,255,255,0.06),0_0_40px_rgba(15,23,42,0.55)] backdrop-blur-xl transition-all duration-300 hover:-translate-y-1 hover:shadow-[inset_0_1px_0_rgba(255,255,255,0.08),0_0_48px_rgba(202,138,4,0.10)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-yellow-400 ${
             isDragging ? "border-yellow-500/60" : "border-white/15 hover:border-yellow-500/45"
           }`}
           onClick={() => fileInputRef.current?.click()}
@@ -250,10 +259,10 @@ export function RestoreWidget({ onSuccess, onReset }) {
             <div className="flex justify-between items-center mb-3">
               <h3 className="font-semibold text-gray-300">Выбрано фото: {selectedFiles.length} шт.</h3>
               <div className="flex gap-2">
-                <button onClick={() => fileInputRef.current?.click()} disabled={isLoading} className="text-yellow-400 hover:text-yellow-300 text-sm font-medium transition-colors">
+                <button type="button" onClick={() => fileInputRef.current?.click()} disabled={isLoading} className="text-yellow-400 hover:text-yellow-300 text-sm font-medium transition-colors py-1 px-2 rounded focus-visible:ring-2 focus-visible:ring-yellow-400">
                   + Добавить
                 </button>
-                <button onClick={() => setSelectedFiles([])} disabled={isLoading} className="text-gray-500 hover:text-red-500 p-1 transition-colors" title="Удалить все" aria-label="Удалить все фото">
+                <button type="button" onClick={() => setSelectedFiles([])} disabled={isLoading} className="text-gray-400 hover:text-red-400 p-2 min-h-[36px] min-w-[36px] flex items-center justify-center rounded transition-colors focus-visible:ring-2 focus-visible:ring-red-400" title="Удалить все" aria-label="Удалить все фото">
                   <Trash2 className="w-5 h-5" />
                 </button>
               </div>
@@ -282,12 +291,26 @@ export function RestoreWidget({ onSuccess, onReset }) {
           <div className="flex flex-col gap-5 bg-gray-900 p-6 rounded-xl border border-gray-800">
             <h3 className="text-lg font-bold text-white border-b border-gray-800 pb-2">Оформление заказа</h3>
             
-            {error && ( <div className="bg-red-900/50 border-l-4 border-red-500 text-red-200 p-3 rounded-md text-sm">{error}</div> )}
+            {error && ( <div className="bg-red-950/80 border-l-4 border-red-500 text-red-200 p-3 rounded-md text-sm">{error}</div> )}
 
             <div className="space-y-3">
               <label className="block text-sm font-medium text-gray-400 mb-1">Выберите услугу</label>
               {Object.entries(SERVICES).map(([name, price]) => (
-                <div key={name} onClick={() => { setServiceName(name); setError(null); }} className={`flex items-center justify-between p-3 rounded-lg border cursor-pointer transition-colors ${serviceName === name ? 'border-yellow-400 bg-yellow-400/10' : 'border-gray-700 bg-gray-800 hover:border-gray-600'}`}>
+                <div
+                  key={name}
+                  role="button"
+                  tabIndex={0}
+                  aria-pressed={serviceName === name}
+                  onClick={() => { setServiceName(name); setError(null); }}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' || e.key === ' ') {
+                      e.preventDefault();
+                      setServiceName(name);
+                      setError(null);
+                    }
+                  }}
+                  className={`flex items-center justify-between p-3 rounded-lg border cursor-pointer transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-yellow-400 ${serviceName === name ? 'border-yellow-400 bg-yellow-400/10' : 'border-gray-700 bg-gray-800 hover:border-gray-600'}`}
+                >
                   <div className="flex items-center gap-3">
                     <input type="radio" name="service" value={name} checked={serviceName === name} readOnly className="w-4 h-4 text-yellow-400 bg-gray-900 border-gray-700 focus:ring-yellow-400 focus:ring-2 pointer-events-none" />
                     <span className="text-white text-sm font-medium">{name}</span>
@@ -299,12 +322,13 @@ export function RestoreWidget({ onSuccess, onReset }) {
 
             <div className="space-y-4 pt-2">
               <div>
-                <label className="block text-sm font-medium text-gray-400 mb-1">Ваше имя *</label>
-                <input type="text" value={clientName} onChange={(e) => setClientName(e.target.value)} placeholder="Иван Иванов" disabled={isLoading} className="w-full border border-gray-700 rounded-lg px-4 py-2.5 focus:outline-none focus:ring-2 focus:ring-yellow-400 bg-gray-800 text-white disabled:opacity-50" />
+                <label htmlFor="restore-name" className="block text-sm font-medium text-gray-400 mb-1">Ваше имя *</label>
+                <input id="restore-name" type="text" value={clientName} onChange={(e) => setClientName(e.target.value)} placeholder="Иван Иванов" disabled={isLoading} className="w-full border border-gray-700 rounded-lg px-4 py-2.5 focus:outline-none focus:ring-2 focus:ring-yellow-400 bg-gray-800 text-white disabled:opacity-50" />
               </div>
               <div>
-                <label className="block text-sm font-medium text-gray-400 mb-1">Телефон *</label>
+                <label htmlFor="restore-phone" className="block text-sm font-medium text-gray-400 mb-1">Телефон *</label>
                 <input
+                  id="restore-phone"
                   type="tel"
                   value={clientPhone}
                   onChange={(e) => {
@@ -324,12 +348,13 @@ export function RestoreWidget({ onSuccess, onReset }) {
                 </p>
               </div>
               <div>
-                <label className="block text-sm font-medium text-gray-400 mb-1">Email для подтверждения *</label>
-                <input type="email" value={clientEmail} onChange={(e) => setClientEmail(e.target.value)} placeholder="ivan@example.ru" disabled={isLoading} className="w-full border border-gray-700 rounded-lg px-4 py-2.5 focus:outline-none focus:ring-2 focus:ring-yellow-400 bg-gray-800 text-white disabled:opacity-50" />
+                <label htmlFor="restore-email" className="block text-sm font-medium text-gray-400 mb-1">Email для подтверждения *</label>
+                <input id="restore-email" type="email" value={clientEmail} onChange={(e) => setClientEmail(e.target.value)} placeholder="ivan@example.ru" disabled={isLoading} className="w-full border border-gray-700 rounded-lg px-4 py-2.5 focus:outline-none focus:ring-2 focus:ring-yellow-400 bg-gray-800 text-white disabled:opacity-50" />
               </div>
               <div>
-                <label className="block text-sm font-medium text-gray-400 mb-1">Пожелания к реставрации (необязательно)</label>
+                <label htmlFor="restore-comment" className="block text-sm font-medium text-gray-400 mb-1">Пожелания к реставрации (необязательно)</label>
                 <textarea
+                  id="restore-comment"
                   value={comment}
                   onChange={(e) => setComment(e.target.value)}
                   placeholder="Например: убрать трещину на лице, заменить фон на светло-серый, оставить на фото только одного человека и т.д."
@@ -345,7 +370,7 @@ export function RestoreWidget({ onSuccess, onReset }) {
               <span className="text-2xl font-bold text-yellow-400">{totalPrice} ₽</span>
             </div>
 
-            <button onClick={handleSubmitOrder} disabled={isLoading || selectedFiles.length === 0 || !clientName.trim() || !clientPhone.trim() || !clientEmail.trim()} className="w-full mt-2 bg-yellow-400 text-black font-bold py-3.5 px-4 rounded-lg flex items-center justify-center hover:bg-yellow-300 transition-all disabled:bg-gray-500 disabled:text-gray-300 disabled:cursor-not-allowed">
+            <button type="button" onClick={handleSubmitOrder} disabled={isLoading || selectedFiles.length === 0 || !clientName.trim() || !clientPhone.trim() || !clientEmail.trim()} className="w-full mt-2 bg-yellow-400 text-black font-bold py-3.5 px-4 rounded-lg flex items-center justify-center hover:bg-yellow-300 transition-all disabled:bg-gray-500 disabled:text-gray-300 disabled:cursor-not-allowed">
               {isLoading ? ( <><Loader2 className="mr-2 h-5 w-5 animate-spin" /> Отправка...</> ) : ( 'Оформить заказ' )}
             </button>
           </div>

@@ -49,11 +49,11 @@ const PhotoPreview = ({ photo, onRemove }) => {
       <button
         type="button"
         onClick={onRemove}
-        aria-label="Удалить фото"
-        className="absolute -top-2 -right-2 bg-red-500 text-white rounded-full p-1 opacity-0 group-hover:opacity-100 transition-opacity shadow-md hover:bg-red-600"
+        aria-label="Удалить файл"
+        className="absolute -top-2 -right-2 flex h-8 w-8 items-center justify-center bg-red-500 text-white rounded-full opacity-90 sm:opacity-0 group-hover:opacity-100 transition-opacity shadow-md hover:bg-red-600 focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white"
         title="Удалить фото"
       >
-        <X size={14} strokeWidth={3} />
+        <X size={16} strokeWidth={3} />
       </button>
     </div>
   );
@@ -74,6 +74,7 @@ export function PhotoPrintForm({ onSuccess, onReset }) {
   const [orderId, setOrderId] = useState(null);
   const [paymentAmount, setPaymentAmount] = useState(0);
   const [isDragging, setIsDragging] = useState(false);
+  const [error, setError] = useState(null);
 
   const fileInputRef = useRef(null);
   const widgetRef = useRef(null);
@@ -99,36 +100,36 @@ export function PhotoPrintForm({ onSuccess, onReset }) {
   };
 
   const cropMap = {
-    'fill': 'Без полей',
-    'fit': 'С полями',
-    'auto': 'Автоматически'
+    'fill': 'Без полей (заполнение)',
+    'fit': 'С полями (целиком)',
+    'auto': 'На усмотрение оператора'
   };
 
-  const pricePerPiece = (PRICES.format[format] || 0) + (PRICES.paper[paperType] || 0);
-  const totalPrice = pricePerPiece * photos.length;
-
-  const addPhotos = (fileList) => {
-    const newFiles = Array.from(fileList || []).filter(file => file.type.startsWith('image/'));
-    if (newFiles.length === 0) return;
-    setPhotos(prev => [...prev, ...newFiles]);
-  };
+  const totalPrice = photos.length * (PRICES.format[format] || 0);
 
   const handleFileSelect = (e) => {
-    if (e.target.files && e.target.files.length > 0) {
-      addPhotos(e.target.files);
+    const files = Array.from(e.target.files);
+    if (files.length > 0) {
+      setPhotos((prev) => [...prev, ...files]);
+      setError(null);
     }
   };
 
   const handleDrop = (e) => {
     e.preventDefault();
     setIsDragging(false);
-    addPhotos(e.dataTransfer.files);
+    const files = Array.from(e.dataTransfer.files);
+    if (files.length > 0) {
+      setPhotos((prev) => [...prev, ...files]);
+      setError(null);
+    }
   };
 
   const handleSubmit = async (e) => {
     e.preventDefault();
-    e.stopPropagation(); // Отключаем всплытие эвента к родительским формам
-    if (photos.length === 0 || !isConfirmed) return;
+    if (photos.length === 0 || !isConfirmed || !userName.trim() || !userPhone.trim() || !userEmail.trim()) {
+      return;
+    }
 
     if (!validateRussianPhone(userPhone)) {
       setPhoneError(PHONE_ERROR_MESSAGE);
@@ -136,30 +137,24 @@ export function PhotoPrintForm({ onSuccess, onReset }) {
     }
 
     setIsLoading(true);
-    const formData = new FormData();
+    setError(null);
 
-    // ВАЖНО: Названия ключей теперь строго совпадают с тем, что ждет FastAPI
+    const formData = new FormData();
     formData.append('name', userName);
     formData.append('phone', userPhone);
     formData.append('email', userEmail);
-    
-    // Упаковываем остальные настройки в поле comment для админки
-    const orderDetails = `Формат: ${formatMap[format]} | Бумага: ${paperMap[paperType]} | Кадрирование: ${cropMap[cropMode]} | Сумма: ${totalPrice} руб.`;
-    formData.append('comment', orderDetails);
-
     formData.append('format', formatMap[format]);
     formData.append('paper', paperMap[paperType]);
     formData.append('crop', cropMap[cropMode]);
+    formData.append('comment', `Печать фото: ${photos.length} шт., Формат: ${formatMap[format]}, Бумага: ${paperMap[paperType]}, Кадрирование: ${cropMap[cropMode]}`);
 
-    // Добавляем файлы
-    photos.forEach(file => {
-      formData.append('files', file);
+    photos.forEach((photo) => {
+      formData.append('files', photo);
     });
 
     try {
       const response = await fetch(`${API_BASE_URL}/order`, {
         method: 'POST',
-        // Заголовок Content-Type браузер подставит сам!
         body: formData,
       });
 
@@ -168,6 +163,7 @@ export function PhotoPrintForm({ onSuccess, onReset }) {
         setOrderId(data.order_id);
         setPaymentAmount(totalPrice);
         setSuccessMessage('Заказ сформирован!');
+        setError(null);
         scrollToWidget();
         reachGoal('ORDER_CREATED');
         if (onSuccess) onSuccess();
@@ -183,11 +179,11 @@ export function PhotoPrintForm({ onSuccess, onReset }) {
       } else {
         const errorDetail = await response.json().catch(() => ({}));
         console.error('Ошибка сервера:', errorDetail);
-        alert('Ошибка при проверке данных. Загляни в консоль (F12).');
+        setError(errorDetail?.detail || 'Ошибка при проверке данных. Пожалуйста, проверьте введённые данные.');
       }
-    } catch (error) {
-      console.error(error);
-      alert('Ошибка соединения с сервером');
+    } catch (err) {
+      console.error(err);
+      setError('Ошибка соединения с сервером. Пожалуйста, проверьте подключение к интернету.');
     } finally {
       setIsLoading(false);
     }
@@ -217,16 +213,23 @@ export function PhotoPrintForm({ onSuccess, onReset }) {
 
   return (
     <form ref={widgetRef} onSubmit={handleSubmit} className="space-y-8 animate-in fade-in duration-300">
+      {error && (
+        <div className="bg-red-950/80 border-l-4 border-red-500 text-red-200 p-3 rounded-md text-sm">
+          {error}
+        </div>
+      )}
+
       <div className="space-y-4 ">
         <h3 className="text-lg font-semibold text-white border-b border-gray-800 pb-2">Контактные данные</h3>
         <div className="grid md:grid-cols-2 gap-6">
           <div>
-            <label className="block text-sm font-medium text-gray-400 mb-2">Ваше имя</label>
-            <input type="text" value={userName} onChange={(e) => setUserName(e.target.value)} placeholder="Иван" className="w-full px-4 py-2 border border-gray-700 bg-gray-800 text-white rounded-lg focus:ring-2 focus:ring-yellow-400 focus:border-yellow-400 outline-none transition-colors" required />
+            <label htmlFor="print-name" className="block text-sm font-medium text-gray-400 mb-2">Ваше имя</label>
+            <input id="print-name" type="text" value={userName} onChange={(e) => setUserName(e.target.value)} placeholder="Иван" className="w-full px-4 py-2 border border-gray-700 bg-gray-800 text-white rounded-lg focus:ring-2 focus:ring-yellow-400 focus:border-yellow-400 outline-none transition-colors" required />
           </div>
           <div>
-            <label className="block text-sm font-medium text-gray-400 mb-2">Телефон</label>
+            <label htmlFor="print-phone" className="block text-sm font-medium text-gray-400 mb-2">Телефон</label>
             <input
+              id="print-phone"
               type="tel"
               value={userPhone}
               onChange={(e) => {
@@ -246,8 +249,8 @@ export function PhotoPrintForm({ onSuccess, onReset }) {
             </p>
           </div>
           <div>
-            <label className="block text-sm font-medium text-gray-400 mb-2">Email для подтверждения</label>
-            <input type="email" value={userEmail} onChange={(e) => setUserEmail(e.target.value)} placeholder="ivan@example.ru" className="w-full px-4 py-2 border border-gray-700 bg-gray-800 text-white rounded-lg focus:ring-2 focus:ring-yellow-400 focus:border-yellow-400 outline-none transition-colors" required />
+            <label htmlFor="print-email" className="block text-sm font-medium text-gray-400 mb-2">Email для подтверждения</label>
+            <input id="print-email" type="email" value={userEmail} onChange={(e) => setUserEmail(e.target.value)} placeholder="ivan@example.ru" className="w-full px-4 py-2 border border-gray-700 bg-gray-800 text-white rounded-lg focus:ring-2 focus:ring-yellow-400 focus:border-yellow-400 outline-none transition-colors" required />
           </div>
         </div>
       </div>
@@ -255,10 +258,19 @@ export function PhotoPrintForm({ onSuccess, onReset }) {
       <div className="space-y-4">
         <h3 className="text-lg font-semibold text-white border-b border-gray-800 pb-2">1. Загрузите фотографии</h3>
         <div
+          role="button"
+          tabIndex={0}
+          aria-label="Загрузить фотографии для печати"
+          onKeyDown={(e) => {
+            if (e.key === 'Enter' || e.key === ' ') {
+              e.preventDefault();
+              fileInputRef.current?.click();
+            }
+          }}
           onDragOver={(e) => { e.preventDefault(); setIsDragging(true); }}
           onDragLeave={(e) => { e.preventDefault(); setIsDragging(false); }}
           onDrop={handleDrop}
-          className={`group relative cursor-pointer overflow-hidden rounded-3xl border border-dashed bg-[radial-gradient(circle_at_50%_0%,rgba(30,58,138,0.22),transparent_45%),linear-gradient(145deg,rgba(255,255,255,0.055),rgba(2,8,23,0.72))] p-10 text-center shadow-[inset_0_1px_0_rgba(255,255,255,0.06),0_0_40px_rgba(15,23,42,0.55)] backdrop-blur-xl transition-all duration-300 hover:-translate-y-1 hover:shadow-[inset_0_1px_0_rgba(255,255,255,0.08),0_0_48px_rgba(202,138,4,0.10)] ${isDragging ? 'border-yellow-500/60 bg-yellow-500/10' : 'border-white/15 hover:border-yellow-500/45'}`}
+          className={`group relative cursor-pointer overflow-hidden rounded-3xl border border-dashed bg-[radial-gradient(circle_at_50%_0%,rgba(30,58,138,0.22),transparent_45%),linear-gradient(145deg,rgba(255,255,255,0.055),rgba(2,8,23,0.72))] p-10 text-center shadow-[inset_0_1px_0_rgba(255,255,255,0.06),0_0_40px_rgba(15,23,42,0.55)] backdrop-blur-xl transition-all duration-300 hover:-translate-y-1 hover:shadow-[inset_0_1px_0_rgba(255,255,255,0.08),0_0_48px_rgba(202,138,4,0.10)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-yellow-400 ${isDragging ? 'border-yellow-500/60 bg-yellow-500/10' : 'border-white/15 hover:border-yellow-500/45'}`}
           onClick={() => fileInputRef.current?.click()}
         >
           <div className={`pointer-events-none absolute inset-x-10 top-0 h-px bg-gradient-to-r from-transparent via-yellow-500/35 to-transparent transition-opacity ${isDragging ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'}`} />
@@ -325,12 +337,24 @@ export function PhotoPrintForm({ onSuccess, onReset }) {
             </div>
           </div>
         </div>
-
         <div>
           <label className="block text-sm font-medium text-gray-400 mb-2">Режим кадрирования</label>
           <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
             {[{ id: 'fill', icon: Maximize, desc: 'Фото заполнит бумагу, края обрежутся' }, { id: 'fit', icon: Minimize, desc: 'Фото поместится целиком, останутся белые поля' }, { id: 'auto', icon: UserCog, desc: 'Мы сами выберем лучший вариант' }].map(({ id, icon, desc }) => (
-              <div key={id} onClick={() => setCropMode(id)} className={`relative flex flex-col p-4 cursor-pointer rounded-xl border-2 transition-all ${cropMode === id ? 'border-yellow-400 bg-yellow-400/10' : 'border-gray-700 bg-gray-800 hover:border-gray-600'}`}>
+              <div
+                key={id}
+                role="button"
+                tabIndex={0}
+                aria-pressed={cropMode === id}
+                onClick={() => setCropMode(id)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault();
+                    setCropMode(id);
+                  }
+                }}
+                className={`relative flex flex-col p-4 cursor-pointer rounded-xl border-2 transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-yellow-400 ${cropMode === id ? 'border-yellow-400 bg-yellow-400/10' : 'border-gray-700 bg-gray-800 hover:border-gray-600'}`}
+              >
                 <div className="flex items-center mb-2">
                   {React.createElement(icon, { className: `w-5 h-5 mr-2 ${cropMode === id ? 'text-yellow-400' : 'text-gray-400'}` })}
                   <span className={`font-semibold ${cropMode === id ? 'text-yellow-300' : 'text-gray-300'}`}>{cropMap[id]}</span>

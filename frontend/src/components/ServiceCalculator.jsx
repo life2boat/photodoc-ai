@@ -88,8 +88,8 @@ export default function ServiceCalculator() {
 
           <div className="space-y-5">
             <div>
-              <label className="mb-2 block text-sm font-medium text-zinc-300">Категория услуг</label>
-              <select value={category} onChange={handleCategoryChange} className={fieldClass}>
+              <label htmlFor="calc-category" className="mb-2 block text-sm font-medium text-zinc-300">Категория услуг</label>
+              <select id="calc-category" value={category} onChange={handleCategoryChange} className={fieldClass}>
                 {Object.keys(priceList).map((item) => (
                   <option key={item} value={item}>{item}</option>
                 ))}
@@ -97,8 +97,8 @@ export default function ServiceCalculator() {
             </div>
 
             <div>
-              <label className="mb-2 block text-sm font-medium text-zinc-300">Тип услуги / размер</label>
-              <select value={service} onChange={(event) => setService(event.target.value)} className={fieldClass}>
+              <label htmlFor="calc-service" className="mb-2 block text-sm font-medium text-zinc-300">Тип услуги / размер</label>
+              <select id="calc-service" value={service} onChange={(event) => setService(event.target.value)} className={fieldClass}>
                 {Object.keys(priceList[category]).map((item) => (
                   <option key={item} value={item}>{item} — {priceList[category][item]} ₽</option>
                 ))}
@@ -106,10 +106,11 @@ export default function ServiceCalculator() {
             </div>
 
             <div>
-              <label className="mb-2 block text-sm font-medium text-zinc-300">Количество</label>
+              <label htmlFor="calc-quantity" className="mb-2 block text-sm font-medium text-zinc-300">Количество</label>
               <div className="relative">
                 <Hash className="pointer-events-none absolute left-4 top-1/2 h-4 w-4 -translate-y-1/2 text-zinc-500" aria-hidden="true" />
                 <input
+                  id="calc-quantity"
                   type="number"
                   min="1"
                   value={quantity}
