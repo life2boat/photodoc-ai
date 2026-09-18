@@ -73,60 +73,101 @@ def init_db():
 init_db()
 
 
+# --- Known server SKUs (explicit allowlist — no unknown combinations accepted) ---
+# Format: SERVICE_CODE -> (price_per_unit, is_per_file)
+_DOC_SKUS: dict[str, float] = {
+    "DOC_3X4": 300.0,
+    "DOC_35X45": 300.0,
+    "DOC_4X6": 300.0,
+    "DOC_9X12": 300.0,
+}
+_PRINT_SKUS: dict[str, float] = {
+    "PRINT_9X13": 20.0,
+    "PRINT_10X15": 20.0,
+    "PRINT_13X18": 40.0,
+    "PRINT_15X20": 40.0,
+    "PRINT_A4": 70.0,
+    "PRINT_30X40": 150.0,
+}
+_RESTORE_SKUS: dict[str, float] = {
+    "RESTORE_LIGHT": 200.0,
+    "RESTORE_DEEP": 350.0,
+    "RESTORE_COLORIZE": 150.0,
+}
+_POLAROID_SKU = "POLAROID"
+
+# Legacy display-name → normalized SKU mapping (for orders created via UI)
+_LEGACY_FORMAT_TO_SKU: dict[str, str] = {
+    "3x4": "DOC_3X4",
+    "3.5x4.5": "DOC_35X45",
+    "4x6": "DOC_4X6",
+    "9x12": "DOC_9X12",
+    "9x13": "PRINT_9X13",
+    "10x15": "PRINT_10X15",
+    "13x18": "PRINT_13X18",
+    "15x20": "PRINT_15X20",
+    "A4": "PRINT_A4",
+    "30x40": "PRINT_30X40",
+    "polaroid": "POLAROID",
+    "Polaroid": "POLAROID",
+    "POLAROID": "POLAROID",
+    "Легкая реставрация": "RESTORE_LIGHT",
+    "Глубокая реставрация с ИИ": "RESTORE_DEEP",
+    "Окрашивание / Колоризация": "RESTORE_COLORIZE",
+}
+
+
+def _resolve_sku(format_str: str, crop_str: str) -> Optional[str]:
+    """Resolves UI input into a canonical server SKU, or returns None if unrecognised."""
+    format_val = (format_str or "").strip()
+    crop_val = (crop_str or "").strip()
+
+    # Direct SKU match
+    all_skus = set(_DOC_SKUS) | set(_PRINT_SKUS) | set(_RESTORE_SKUS) | {_POLAROID_SKU}
+    if format_val in all_skus:
+        return format_val
+    if crop_val in all_skus:
+        return crop_val
+
+    # Legacy display-name lookup
+    if format_val in _LEGACY_FORMAT_TO_SKU:
+        return _LEGACY_FORMAT_TO_SKU[format_val]
+    if crop_val in _LEGACY_FORMAT_TO_SKU:
+        return _LEGACY_FORMAT_TO_SKU[crop_val]
+
+    return None
+
+
 # --- Серверная система расчета стоимости (Authoritative Price Engine) ---
 def calculate_authoritative_price(format_str: str, paper_str: str, crop_str: str, file_count: int) -> float:
     """
     Вычисляет строго серверную стоимость заказа на основе типа услуги и параметров.
-    Клиентский ввод не является доверенным источником цены.
+    Принимает ТОЛЬКО явно известные серверные SKU или их legacy-псевдонимы.
+    Неизвестные комбинации вызывают HTTPException 400 — НЕ дефолт 300 руб.
     """
-    format_val = (format_str or "").strip()
-    paper_val = (paper_str or "").strip()
-    crop_val = (crop_str or "").strip()
     count = max(1, file_count)
+    sku = _resolve_sku(format_str, crop_str)
 
-    # 1. Фото на документы (DOC_PRICES)
-    doc_formats = {
-        "3x4": 300.0,
-        "3.5x4.5": 300.0,
-        "4x6": 300.0,
-        "9x12": 300.0,
-    }
-    if format_val in doc_formats:
-        return doc_formats[format_val]
-    for fmt, pr in doc_formats.items():
-        if fmt in format_val:
-            return pr
+    if sku is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown service/SKU: format='{format_str}', crop='{crop_str}'. "
+                   "Accepted SKUs: DOC_3X4, DOC_35X45, DOC_4X6, DOC_9X12, POLAROID, "
+                   "PRINT_9X13, PRINT_10X15, PRINT_13X18, PRINT_15X20, PRINT_A4, PRINT_30X40, "
+                   "RESTORE_LIGHT, RESTORE_DEEP, RESTORE_COLORIZE.",
+        )
 
-    # 2. Ретро Polaroid (30 руб/фото)
-    if format_val.lower() == "polaroid" or "polaroid" in format_val.lower() or "polaroid" in crop_val.lower():
+    if sku in _DOC_SKUS:
+        return _DOC_SKUS[sku]  # flat per-order price, not per-file
+    if sku == _POLAROID_SKU:
         return 30.0 * count
+    if sku in _RESTORE_SKUS:
+        return _RESTORE_SKUS[sku] * count
+    if sku in _PRINT_SKUS:
+        return _PRINT_SKUS[sku] * count
 
-    # 3. Реставрация фото
-    restore_services = {
-        "Легкая реставрация": 200.0,
-        "Глубокая реставрация с ИИ": 350.0,
-        "Окрашивание / Колоризация": 150.0,
-    }
-    for svc_name, svc_price in restore_services.items():
-        if svc_name in format_val or svc_name in crop_val:
-            return svc_price * count
-    if "реставрация" in format_val.lower() or "реставрация" in crop_val.lower():
-        return restore_services.get(crop_val, 200.0) * count
-
-    # 4. Фотопечать (форматы)
-    print_formats = {
-        "9x13": 20.0,
-        "10x15": 20.0,
-        "13x18": 40.0,
-        "15x20": 40.0,
-        "A4": 70.0,
-        "30x40": 150.0,
-    }
-    if format_val in print_formats:
-        return print_formats[format_val] * count
-
-    # Стандартная стоимость по умолчанию
-    return 300.0
+    # Should be unreachable after _resolve_sku, but be explicit
+    raise HTTPException(status_code=400, detail=f"Unhandled SKU: {sku}")
 
 
 def format_robokassa_amount(amount: float | str | int) -> str:
@@ -162,12 +203,8 @@ def get_authoritative_order_amount(order: dict) -> str:
         except ValueError:
             pass
 
-    if order.get("payment_amount"):
-        try:
-            return format_robokassa_amount(order["payment_amount"])
-        except ValueError:
-            pass
-
+    # payment_amount is transactional payment state ONLY — never a price authority.
+    # If order_amount is missing/invalid, recalculate server-side from order spec.
     filenames = (order.get("filename") or "").split(",")
     file_count = len([f for f in filenames if f.strip()])
     price = calculate_authoritative_price(
@@ -194,7 +231,12 @@ def update_order_payment_pending(order_id: int, amount: str):
     conn.close()
 
 
-def mark_order_paid(order_id: int, amount: str):
+def mark_order_paid(order_id: int, amount: str) -> bool:
+    """
+    Atomically transitions order to 'paid' status using a conditional UPDATE.
+    Returns True if THIS call performed the transition (rowcount == 1).
+    Returns False if order was already paid by a concurrent request (idempotent, no side-effects).
+    """
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     paid_timestamp = datetime.utcnow().isoformat()
@@ -202,12 +244,14 @@ def mark_order_paid(order_id: int, amount: str):
         """
         UPDATE orders
         SET payment_status = 'paid', status = 'paid', payment_amount = ?, paid_at = ?
-        WHERE id = ?
+        WHERE id = ? AND payment_status != 'paid'
         """,
         (amount, paid_timestamp, order_id),
     )
     conn.commit()
+    was_transition_owner = cursor.rowcount == 1
     conn.close()
+    return was_transition_owner
 
 
 def sanitize_upload_filename(filename: str | None) -> str:
@@ -255,12 +299,16 @@ def send_order_email(order_id: int, name: str, phone: str, comment: str, format:
 
 
 def send_paid_order_email(order_id: int):
-    """Отправляет подтверждение оплаты (строго один раз на заказ)."""
+    """
+    Sends payment confirmation email exactly once per order.
+    payment_email_sent_at is recorded ONLY after a successful SMTP send,
+    so failed sends leave the timestamp NULL and remain retryable.
+    """
     order = get_order_by_id(order_id)
     if not order:
         return
 
-    # Защита от дубликатов email
+    # Idempotency guard: skip if email was already successfully sent
     if order.get("payment_email_sent_at"):
         logging.info("Email об оплате заказа #%s уже был отправлен ранее, пропуск.", order_id)
         return
@@ -271,16 +319,13 @@ def send_paid_order_email(order_id: int):
     smtp_password = os.getenv("SMTP_PASSWORD")
     email_to = os.getenv("EMAIL_TO")
 
-    # Фиксируем время отправки в БД перед попыткой или сразу после
-    now_iso = datetime.utcnow().isoformat()
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("UPDATE orders SET payment_email_sent_at = ? WHERE id = ?", (now_iso, order_id))
-    conn.commit()
-    conn.close()
-
     if not all([smtp_server, smtp_user, smtp_password, email_to]):
-        logging.info("SMTP не настроен — уведомление об оплате заказа #%s зафиксировано локально.", order_id)
+        # SMTP not configured — do NOT record payment_email_sent_at so retry stays possible
+        logging.warning(
+            "SMTP не настроен — уведомление об оплате заказа #%s НЕ отправлено. "
+            "payment_email_sent_at остаётся NULL для возможности повтора.",
+            order_id,
+        )
         return
 
     msg = MIMEMultipart()
@@ -300,8 +345,17 @@ def send_paid_order_email(order_id: int):
         with smtplib.SMTP_SSL(smtp_server, smtp_port) as server:
             server.login(smtp_user, smtp_password)
             server.send_message(msg)
+        # Record timestamp ONLY after successful send
+        now_iso = datetime.utcnow().isoformat()
+        conn = sqlite3.connect(DB_PATH)
+        conn.cursor().execute(
+            "UPDATE orders SET payment_email_sent_at = ? WHERE id = ?", (now_iso, order_id)
+        )
+        conn.commit()
+        conn.close()
         logging.info("Email об оплате заказа #%s успешно отправлен.", order_id)
     except Exception as e:
+        # SMTP failure: payment_email_sent_at stays NULL → retry remains possible
         logging.error("Ошибка при отправке email об оплате заказа #%s: %s", order_id, e)
 
 
@@ -588,17 +642,21 @@ async def robokassa_result(request: Request, background_tasks: BackgroundTasks):
         )
         raise HTTPException(status_code=400, detail="Amount mismatch")
 
-    # 4. Идемпотентность: если заказ уже оплачен, не повторяем сайд-эффекты (отправку email)
-    if order.get("payment_status") == "paid":
-        logging.info("Result URL: Заказ #%s уже отмечен как оплачен. Идемпотентный ответ OK%s.", order_id, order_id)
-        return PlainTextResponse(f"OK{order_id}")
+    # 4. Atomic transition to 'paid' (conditional UPDATE WHERE payment_status != 'paid')
+    #    Returns True if THIS request performed the transition; False if already paid (concurrent duplicate).
+    was_transition_owner = mark_order_paid(order_id, expected_amount)
 
-    # 5. Перевод заказа в статус 'paid'
-    mark_order_paid(order_id, expected_amount)
-    logging.info("Result URL: Заказ #%s успешно отмечен как оплачен.", order_id)
-
-    # 6. Отправка подтверждения оплаты
-    background_tasks.add_task(send_paid_order_email, order_id)
+    if was_transition_owner:
+        logging.info("Result URL: Заказ #%s успешно отмечен как оплачен.", order_id)
+        # Schedule email only for the one call that owned the transition
+        background_tasks.add_task(send_paid_order_email, order_id)
+    else:
+        logging.info(
+            "Result URL: Заказ #%s уже отмечен как оплачен (конкурентный дубликат). "
+            "Идемпотентный ответ OK%s.",
+            order_id,
+            order_id,
+        )
 
     return PlainTextResponse(f"OK{order_id}")
 
