@@ -65,9 +65,44 @@ jobs:
   docker-build:
     name: Docker Build
     runs-on: ubuntu-latest
+    env:
+      VITE_SUPABASE_URL: https://example.supabase.co
+      VITE_SUPABASE_ANON_KEY: example-anon-key
+      VITE_YANDEX_METRIKA_ID: ""
+      VITE_API_URL: /api
+      PORT: 80
+      ROBOKASSA_IS_TEST: "1"
+      DATABASE_PATH: /data/orders.db
     steps:
     - uses: actions/checkout@v4
     - name: Validate Docker Compose config
       run: docker compose config
     - name: Build Docker images
       run: docker compose build
+    - name: Start containers
+      run: |
+        docker compose up -d --wait --wait-timeout 180
+        docker compose ps
+    - name: Run container smoke tests
+      run: |
+        echo "Testing Root SPA..."
+        curl --fail -s -o /dev/null -w "Root status: %{http_code}\n" http://127.0.0.1:${PORT}/
+        curl --fail -sS -I http://127.0.0.1:${PORT}/
+
+        echo "Testing OG Image..."
+        curl --fail -s -o /dev/null -w "OG image status: %{http_code}\n" http://127.0.0.1:${PORT}/og/photodoc-og.jpg
+        curl --fail -sS -I http://127.0.0.1:${PORT}/og/photodoc-og.jpg
+
+        echo "Testing API Proxy /api/health..."
+        curl --fail -sS -I http://127.0.0.1:${PORT}/api/health
+        HEALTH_RESP=$(curl --fail -sS http://127.0.0.1:${PORT}/api/health)
+        echo "API Health Response: ${HEALTH_RESP}"
+        echo "${HEALTH_RESP}" | grep -q '"status"[[:space:]]*:[[:space:]]*"ok"'
+    - name: Dump logs on failure
+      if: failure()
+      run: |
+        docker compose ps
+        docker compose logs --no-color
+    - name: Teardown containers
+      if: always()
+      run: docker compose down -v
