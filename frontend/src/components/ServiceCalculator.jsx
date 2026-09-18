@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { supabase } from '../lib/supabase';
+import { ArrowRight, Calculator, Hash, Layers3 } from 'lucide-react';
 
 const priceList = {
   'Фотопечать': {
@@ -24,10 +24,10 @@ const priceList = {
   },
   'Реставрация фото': {
     'Легкая реставрация': 200,
-    'Глубокая реставрация с ИИ': 350,
+    'Глубокая реставрация': 350,
     'Окрашивание (Колоризация)': 150,
   },
-  'Печать и Копии': {
+  'Печать и копии': {
     'Печать A4 ч/б (1 лист)': 10,
     'Печать A4 цвет (1 лист)': 25,
     'Печать A3 ч/б (1 лист)': 30,
@@ -46,7 +46,7 @@ const priceList = {
   'Оцифровка': {
     'Оцифровка видео (1 час)': 480,
     'Перевод видео в DVD (1 час)': 480,
-  }
+  },
 };
 
 export default function ServiceCalculator() {
@@ -54,135 +54,103 @@ export default function ServiceCalculator() {
   const [service, setService] = useState(Object.keys(priceList['Фотопечать'])[0]);
   const [quantity, setQuantity] = useState(1);
 
-  // Form states
-  const [clientName, setClientName] = useState('');
-  const [clientPhone, setClientPhone] = useState('');
-  const [isSubmitting, setIsSubmitting] = useState(false);
-  const [submitStatus, setSubmitStatus] = useState(null);
-
-  const handleCategoryChange = (e) => {
-    const newCat = e.target.value;
-    setCategory(newCat);
-    setService(Object.keys(priceList[newCat])[0]);
+  const handleCategoryChange = (event) => {
+    const nextCategory = event.target.value;
+    setCategory(nextCategory);
+    setService(Object.keys(priceList[nextCategory])[0]);
   };
 
   const total = priceList[category][service] * quantity;
 
-  const handleSubmit = async (e) => {
-    e.preventDefault();
-    if (!clientName || !clientPhone) {
-      setSubmitStatus('validation_error');
-      return;
-    }
-
-    setIsSubmitting(true);
-    setSubmitStatus(null);
-
-    try {
-      const { error } = await supabase
-        .from('orders')
-        .insert([
-          {
-            client_name: clientName,
-            client_phone: clientPhone,
-            category: category,
-            service_name: service,
-            quantity: quantity,
-            total_price: total,
-            status: 'new'
-          }
-        ]);
-
-      if (error) throw error;
-
-      setSubmitStatus('success');
-      setClientName('');
-      setClientPhone('');
-      setQuantity(1);
-    } catch (error) {
-      console.error("Error saving order:", error);
-      setSubmitStatus('error');
-    } finally {
-      setIsSubmitting(false);
-    }
+  const handleGoToOrder = () => {
+    document.getElementById('services-section')?.scrollIntoView({
+      behavior: 'smooth',
+      block: 'start',
+    });
   };
 
+  const fieldClass = 'w-full rounded-2xl border border-white/10 bg-black/30 px-4 py-3 text-sm text-zinc-100 outline-none transition focus:border-yellow-500/50 focus:ring-2 focus:ring-yellow-500/30';
+
   return (
-    <div style={{ maxWidth: '500px', margin: '3rem auto', padding: '2rem', background: '#fff', borderRadius: '16px', boxShadow: '0 10px 25px rgba(0,0,0,0.1)', fontFamily: 'sans-serif' }}>
-      <h2 style={{ textAlign: 'center', color: '#1a1a1a', marginBottom: '1.5rem', fontSize: '1.5rem', fontWeight: 'bold' }}>Умный калькулятор</h2>
-      
-      <div style={{ marginBottom: '1rem' }}>
-        <label style={{ display: 'block', fontSize: '14px', color: '#666', marginBottom: '5px' }}>Категория услуг</label>
-        <select value={category} onChange={handleCategoryChange} style={{ width: '100%', padding: '10px', borderRadius: '8px', border: '1px solid #ddd', color: '#000' }}>
-          {Object.keys(priceList).map(cat => <option key={cat} value={cat}>{cat}</option>)}
-        </select>
-      </div>
-
-      <div style={{ marginBottom: '1rem' }}>
-        <label style={{ display: 'block', fontSize: '14px', color: '#666', marginBottom: '5px' }}>Тип услуги / Размер</label>
-        <select value={service} onChange={(e) => setService(e.target.value)} style={{ width: '100%', padding: '10px', borderRadius: '8px', border: '1px solid #ddd', color: '#000' }}>
-          {Object.keys(priceList[category]).map(ser => <option key={ser} value={ser}>{ser} — {priceList[category][ser]}₽</option>)}
-        </select>
-      </div>
-
-      <div style={{ marginBottom: '1.5rem' }}>
-        <label style={{ display: 'block', fontSize: '14px', color: '#666', marginBottom: '5px' }}>Количество</label>
-        <input type="number" min="1" value={quantity} onChange={(e) => setQuantity(Math.max(1, parseInt(e.target.value) || 1))} style={{ width: '100%', padding: '10px', borderRadius: '8px', border: '1px solid #ddd', color: '#000' }} />
-      </div>
-
-      <div style={{ padding: '1.5rem', background: '#f8f9fa', borderRadius: '12px', textAlign: 'center', marginBottom: '1.5rem' }}>
-        <div style={{ fontSize: '14px', color: '#888', marginBottom: '5px' }}>Итоговая стоимость</div>
-        <div style={{ fontSize: '32px', fontWeight: 'bold', color: '#2563eb' }}>{total} ₽</div>
-      </div>
-
-      <hr style={{ border: 'none', borderTop: '1px solid #eee', marginBottom: '1.5rem' }} />
-
-      <h3 style={{ fontSize: '1.1rem', fontWeight: 'bold', color: '#1a1a1a', marginBottom: '1rem' }}>Оформление заказа</h3>
-
-      <form onSubmit={handleSubmit}>
-        <div style={{ marginBottom: '1rem' }}>
-          <label style={{ display: 'block', fontSize: '14px', color: '#666', marginBottom: '5px' }}>Ваше имя</label>
-          <input type="text" value={clientName} onChange={(e) => setClientName(e.target.value)} placeholder="Иван Иванов" style={{ width: '100%', padding: '10px', borderRadius: '8px', border: '1px solid #ddd', color: '#000' }} required />
-        </div>
-
-        <div style={{ marginBottom: '1.5rem' }}>
-          <label style={{ display: 'block', fontSize: '14px', color: '#666', marginBottom: '5px' }}>Телефон для связи</label>
-          <input type="tel" value={clientPhone} onChange={(e) => setClientPhone(e.target.value)} placeholder="+7 (999) 000-00-00" style={{ width: '100%', padding: '10px', borderRadius: '8px', border: '1px solid #ddd', color: '#000' }} required />
-        </div>
-
-        {submitStatus === 'validation_error' && (
-          <div style={{ color: '#dc2626', fontSize: '14px', marginBottom: '1rem', textAlign: 'center' }}>Пожалуйста, заполните имя и телефон.</div>
-        )}
-
-        {submitStatus === 'error' && (
-          <div style={{ color: '#dc2626', fontSize: '14px', marginBottom: '1rem', textAlign: 'center' }}>Ошибка при отправке заказа. Убедитесь, что таблица настроена верно.</div>
-        )}
-
-        {submitStatus === 'success' && (
-          <div style={{ color: '#16a34a', fontSize: '14px', marginBottom: '1rem', textAlign: 'center', padding: '10px', background: '#dcfce7', borderRadius: '8px' }}>
-            🎉 Заказ успешно оформлен! Мы свяжемся с вами.
+    <div className="relative mx-auto max-w-4xl overflow-hidden rounded-3xl border border-white/10 bg-zinc-900/50 p-5 shadow-2xl shadow-black/40 backdrop-blur-xl md:p-8">
+      <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_20%_0%,rgba(202,138,4,0.10),transparent_32%),radial-gradient(circle_at_80%_20%,rgba(79,70,229,0.12),transparent_34%)]" />
+      <div className="relative grid gap-8 lg:grid-cols-[1.1fr_0.9fr]">
+        <div>
+          <div className="mb-6 flex items-center gap-3">
+            <div className="flex h-12 w-12 items-center justify-center rounded-2xl border border-yellow-500/20 bg-yellow-500/10 text-yellow-300">
+              <Calculator className="h-5 w-5" aria-hidden="true" />
+            </div>
+            <div>
+              <h2 className="text-2xl font-bold tracking-tight text-white">Умный калькулятор</h2>
+              <p className="mt-1 text-sm leading-6 text-zinc-300">Быстро оцените стоимость перед оформлением заказа.</p>
+            </div>
           </div>
-        )}
 
-        <button
-          type="submit"
-          disabled={isSubmitting}
-          style={{
-            width: '100%',
-            padding: '12px',
-            background: isSubmitting ? '#93c5fd' : '#2563eb',
-            color: '#fff',
-            border: 'none',
-            borderRadius: '8px',
-            fontWeight: 'bold',
-            fontSize: '16px',
-            cursor: isSubmitting ? 'not-allowed' : 'pointer',
-            transition: 'background 0.2s'
-          }}
-        >
-          {isSubmitting ? 'Отправка...' : 'Отправить заявку'}
-        </button>
-      </form>
+          <div className="space-y-5">
+            <div>
+              <label htmlFor="calc-category" className="mb-2 block text-sm font-medium text-zinc-300">Категория услуг</label>
+              <select id="calc-category" value={category} onChange={handleCategoryChange} className={fieldClass}>
+                {Object.keys(priceList).map((item) => (
+                  <option key={item} value={item}>{item}</option>
+                ))}
+              </select>
+            </div>
+
+            <div>
+              <label htmlFor="calc-service" className="mb-2 block text-sm font-medium text-zinc-300">Тип услуги / размер</label>
+              <select id="calc-service" value={service} onChange={(event) => setService(event.target.value)} className={fieldClass}>
+                {Object.keys(priceList[category]).map((item) => (
+                  <option key={item} value={item}>{item} — {priceList[category][item]} ₽</option>
+                ))}
+              </select>
+            </div>
+
+            <div>
+              <label htmlFor="calc-quantity" className="mb-2 block text-sm font-medium text-zinc-300">Количество</label>
+              <div className="relative">
+                <Hash className="pointer-events-none absolute left-4 top-1/2 h-4 w-4 -translate-y-1/2 text-zinc-500" aria-hidden="true" />
+                <input
+                  id="calc-quantity"
+                  type="number"
+                  min="1"
+                  value={quantity}
+                  onChange={(event) => setQuantity(Math.max(1, parseInt(event.target.value, 10) || 1))}
+                  className={`${fieldClass} pl-11`}
+                />
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div className="flex flex-col justify-between rounded-3xl border border-white/10 bg-black/25 p-5">
+          <div>
+            <div className="mb-5 flex items-center gap-3">
+              <div className="flex h-10 w-10 items-center justify-center rounded-xl border border-violet-300/20 bg-violet-400/10 text-violet-200">
+                <Layers3 className="h-5 w-5" aria-hidden="true" />
+              </div>
+              <div>
+                <p className="text-sm font-semibold text-white">Предварительная оценка</p>
+                <p className="text-xs text-zinc-400">Итог уточняется после проверки файлов</p>
+              </div>
+            </div>
+
+            <div className="rounded-2xl border border-yellow-500/15 bg-yellow-500/10 p-5 text-center">
+              <p className="text-sm text-zinc-300">Итоговая стоимость</p>
+              <p className="mt-2 text-4xl font-bold tracking-tight text-yellow-300">{total} ₽</p>
+              <p className="mt-2 text-xs text-zinc-400">{quantity} шт. × {priceList[category][service]} ₽</p>
+            </div>
+          </div>
+
+          <button
+            type="button"
+            onClick={handleGoToOrder}
+            className="mt-6 inline-flex w-full items-center justify-center gap-2 rounded-2xl bg-yellow-400 px-5 py-3 font-bold text-black shadow-[0_0_32px_rgba(202,138,4,0.20)] transition-all hover:scale-[1.01] hover:bg-yellow-300"
+          >
+            Перейти к заказу
+            <ArrowRight className="h-4 w-4" aria-hidden="true" />
+          </button>
+        </div>
+      </div>
     </div>
   );
 }

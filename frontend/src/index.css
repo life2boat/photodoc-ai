@@ -56,6 +56,16 @@
   body {
     @apply bg-background text-foreground;
   }
+
+  a:focus-visible,
+  button:focus-visible,
+  input:focus-visible,
+  textarea:focus-visible,
+  select:focus-visible,
+  [tabindex]:focus-visible {
+    outline: 2px solid #facc15;
+    outline-offset: 3px;
+  }
 }
 
 /* Направляющие для фото на документы (ГОСТ) */
@@ -64,4 +74,90 @@
     linear-gradient(to bottom, transparent 11%, rgba(255, 50, 50, 0.8) 11%, rgba(255, 50, 50, 0.8) calc(11% + 2px), transparent calc(11% + 2px)),
     linear-gradient(to bottom, transparent 38%, rgba(50, 150, 255, 0.8) 38%, rgba(50, 150, 255, 0.8) calc(38% + 2px), transparent calc(38% + 2px)),
     linear-gradient(to bottom, transparent 86%, rgba(255, 50, 50, 0.8) 86%, rgba(255, 50, 50, 0.8) calc(86% + 2px), transparent calc(86% + 2px)) !important;
+}
+
+@keyframes fade-up {
+  from {
+    opacity: 0;
+    transform: translateY(18px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes float-slow {
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-10px);
+  }
+}
+
+@keyframes shimmer {
+  100% {
+    transform: translateX(100%);
+  }
+}
+
+@keyframes check-pop {
+  0% {
+    opacity: 0;
+    transform: scale(0.75);
+  }
+  70% {
+    transform: scale(1.08);
+  }
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+@keyframes gradient {
+  to {
+    background-position: var(--bg-size, 200%) center;
+  }
+}
+
+.animate-gradient {
+  animation: gradient 8s linear infinite;
+}
+
+.animate-fade-up {
+  animation: fade-up 700ms ease-out both;
+}
+
+.animate-float-slow {
+  animation: float-slow 7s ease-in-out infinite;
+}
+
+.shimmer {
+  position: relative;
+  overflow: hidden;
+}
+
+.shimmer::after {
+  animation: shimmer 1.6s infinite;
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.08), transparent);
+  content: "";
+  inset: 0;
+  position: absolute;
+  transform: translateX(-100%);
+}
+
+.animate-check-pop {
+  animation: check-pop 420ms ease-out both;
+}
+
+.hide-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+.hide-scrollbar::-webkit-scrollbar {
+  display: none;
 }

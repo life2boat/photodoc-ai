@@ -1,5 +1,7 @@
 photos/
 .env
+.env.*
+!.env.example
 logs.txt
 venv/
 temp_uploads/
