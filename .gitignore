@@ -16,11 +16,26 @@ backend/gfpgan/
 backend/weights/
 
 # Playwright
-/test-results/
-/playwright-report/
-/blob-report/
-/playwright/.cache/
-/playwright/.auth/
+test-results/
+playwright-report/
+blob-report/
+.cache/
+dist/
 
 # Настройки редактора и локальные секреты
 .vscode/
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+
+# Databases & Runtime artifacts
+*.db
+*.sqlite
+*.sqlite3
+backend/orders.db
+*.pid
+frontend/dev-server.pid
