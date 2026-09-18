@@ -73,6 +73,11 @@ def init_db():
 init_db()
 
 
+@app.get("/api/health")
+def health_check():
+    return {"status": "ok"}
+
+
 # --- Known server SKUs (explicit allowlist — no unknown combinations accepted) ---
 # Format: SERVICE_CODE -> (price_per_unit, is_per_file)
 _DOC_SKUS: dict[str, float] = {

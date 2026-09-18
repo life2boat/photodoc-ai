@@ -60,4 +60,14 @@ jobs:
     - name: Install pytest
       run: pip install pytest
     - name: Run payment security tests
-      run: pytest tests/test_payment_security.py -v
+      run: pytest tests/test_payment_security.py -v
+
+  docker-build:
+    name: Docker Build
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Validate Docker Compose config
+      run: docker compose config
+    - name: Build Docker images
+      run: docker compose build

@@ -21,6 +21,8 @@ backend/weights/
 test-results/
 playwright-report/
 blob-report/
+frontend/test-results/
+frontend/playwright-report/
 .cache/
 dist/
 
@@ -29,6 +31,8 @@ dist/
 
 # Python artifacts
 __pycache__/
+**/__pycache__/
+*.pyc
 *.py[cod]
 *$py.class
 *.so
