@@ -70,7 +70,7 @@ jobs:
       VITE_SUPABASE_ANON_KEY: example-anon-key
       VITE_YANDEX_METRIKA_ID: ""
       VITE_API_URL: /api
-      PORT: 80
+      PORT: 8080
       ROBOKASSA_IS_TEST: "1"
       DATABASE_PATH: /data/orders.db
     steps:
@@ -83,6 +83,19 @@ jobs:
       run: |
         docker compose up -d --wait --wait-timeout 180
         docker compose ps
+    - name: Verify named volume writability and DB creation
+      run: |
+        echo "Verifying backend permissions on /data and /app/uploads..."
+        docker compose exec -T backend sh -c '
+          test -w /data &&
+          test -w /app/uploads &&
+          touch /data/.write-test &&
+          touch /app/uploads/.write-test &&
+          rm /data/.write-test /app/uploads/.write-test
+        '
+        echo "Verifying application database file exists in volume..."
+        docker compose exec -T backend test -f /data/orders.db
+        echo "Volumes are writable and orders.db exists."
     - name: Run container smoke tests
       run: |
         echo "Testing Root SPA..."
