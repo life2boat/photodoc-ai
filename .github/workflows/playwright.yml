@@ -86,16 +86,15 @@ jobs:
     - name: Run container smoke tests
       run: |
         echo "Testing Root SPA..."
-        curl --fail -s -o /dev/null -w "Root status: %{http_code}\n" http://127.0.0.1:${PORT}/
-        curl --fail -sS -I http://127.0.0.1:${PORT}/
+        curl --fail -s -o /dev/null -w "Root status: %{http_code}\n" "http://127.0.0.1:${PORT}/"
+        curl --fail "http://127.0.0.1:${PORT}/" > /dev/null
 
         echo "Testing OG Image..."
-        curl --fail -s -o /dev/null -w "OG image status: %{http_code}\n" http://127.0.0.1:${PORT}/og/photodoc-og.jpg
-        curl --fail -sS -I http://127.0.0.1:${PORT}/og/photodoc-og.jpg
+        curl --fail -s -o /dev/null -w "OG image status: %{http_code}\n" "http://127.0.0.1:${PORT}/og/photodoc-og.jpg"
+        curl --fail "http://127.0.0.1:${PORT}/og/photodoc-og.jpg" > /dev/null
 
         echo "Testing API Proxy /api/health..."
-        curl --fail -sS -I http://127.0.0.1:${PORT}/api/health
-        HEALTH_RESP=$(curl --fail -sS http://127.0.0.1:${PORT}/api/health)
+        HEALTH_RESP=$(curl --fail -sS "http://127.0.0.1:${PORT}/api/health")
         echo "API Health Response: ${HEALTH_RESP}"
         echo "${HEALTH_RESP}" | grep -q '"status"[[:space:]]*:[[:space:]]*"ok"'
     - name: Dump logs on failure
