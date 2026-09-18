@@ -1,5 +1,9 @@
-import React, { useState, useRef, useEffect, useMemo } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import { UploadCloud, Maximize, Minimize, UserCog, CheckCircle, Loader2, X } from 'lucide-react';
+import { redirectToPayment } from '../lib/robokassa';
+import { API_BASE_URL } from '../config';
+import { reachGoal } from '../lib/metrics';
+import { PHONE_ERROR_MESSAGE, validateRussianPhone } from '../utils/phoneValidation';
 
 const PRICES = {
   format: {
@@ -17,11 +21,17 @@ const PRICES = {
 };
 
 const PhotoPreview = ({ photo, onRemove }) => {
-  const previewUrl = useMemo(() => URL.createObjectURL(photo), [photo]);
+  const [previewUrl, setPreviewUrl] = useState('');
 
   useEffect(() => {
-    return () => URL.revokeObjectURL(previewUrl);
-  }, [previewUrl]);
+    const objectUrl = URL.createObjectURL(photo);
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setPreviewUrl(objectUrl);
+
+    return () => {
+      URL.revokeObjectURL(objectUrl);
+    };
+  }, [photo]);
 
   return (
     <div className="relative group aspect-square">
@@ -29,16 +39,21 @@ const PhotoPreview = ({ photo, onRemove }) => {
         <img
           src={previewUrl}
           alt="preview"
+          width="320"
+          height="320"
+          loading="lazy"
+          decoding="async"
           className="w-full h-full object-cover rounded-xl border border-gray-200 shadow-sm"
         />
       )}
       <button
         type="button"
         onClick={onRemove}
-        className="absolute -top-2 -right-2 bg-red-500 text-white rounded-full p-1 opacity-0 group-hover:opacity-100 transition-opacity shadow-md hover:bg-red-600"
+        aria-label="Удалить файл"
+        className="absolute -top-2 -right-2 flex h-8 w-8 items-center justify-center bg-red-500 text-white rounded-full opacity-90 sm:opacity-0 group-hover:opacity-100 transition-opacity shadow-md hover:bg-red-600 focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white"
         title="Удалить фото"
       >
-        <X size={14} strokeWidth={3} />
+        <X size={16} strokeWidth={3} />
       </button>
     </div>
   );
@@ -54,9 +69,21 @@ export function PhotoPrintForm({ onSuccess, onReset }) {
   const [successMessage, setSuccessMessage] = useState(null);
   const [userName, setUserName] = useState('');
   const [userPhone, setUserPhone] = useState('');
+  const [phoneError, setPhoneError] = useState('');
+  const [userEmail, setUserEmail] = useState('');
   const [orderId, setOrderId] = useState(null);
+  const [paymentAmount, setPaymentAmount] = useState(0);
+  const [isDragging, setIsDragging] = useState(false);
+  const [error, setError] = useState(null);
 
   const fileInputRef = useRef(null);
+  const widgetRef = useRef(null);
+
+  const scrollToWidget = () => {
+    setTimeout(() => {
+      widgetRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }, 100);
+  };
 
   const formatMap = {
     '9x13': '9x13 см',
@@ -73,57 +100,72 @@ export function PhotoPrintForm({ onSuccess, onReset }) {
   };
 
   const cropMap = {
-    'fill': 'Без полей',
-    'fit': 'С полями',
-    'auto': 'Автоматически'
+    'fill': 'Без полей (заполнение)',
+    'fit': 'С полями (целиком)',
+    'auto': 'На усмотрение оператора'
   };
 
-  const pricePerPiece = (PRICES.format[format] || 0) + (PRICES.paper[paperType] || 0);
-  const totalPrice = pricePerPiece * photos.length;
+  const totalPrice = photos.length * (PRICES.format[format] || 0);
 
   const handleFileSelect = (e) => {
-    if (e.target.files && e.target.files.length > 0) {
-      const newFiles = Array.from(e.target.files).filter(file => file.type.startsWith('image/'));
-      setPhotos(prev => [...prev, ...newFiles]);
+    const files = Array.from(e.target.files);
+    if (files.length > 0) {
+      setPhotos((prev) => [...prev, ...files]);
+      setError(null);
+    }
+  };
+
+  const handleDrop = (e) => {
+    e.preventDefault();
+    setIsDragging(false);
+    const files = Array.from(e.dataTransfer.files);
+    if (files.length > 0) {
+      setPhotos((prev) => [...prev, ...files]);
+      setError(null);
     }
   };
 
   const handleSubmit = async (e) => {
     e.preventDefault();
-    e.stopPropagation(); // Отключаем всплытие эвента к родительским формам
-    if (photos.length === 0 || !isConfirmed) return;
+    if (photos.length === 0 || !isConfirmed || !userName.trim() || !userPhone.trim() || !userEmail.trim()) {
+      return;
+    }
+
+    if (!validateRussianPhone(userPhone)) {
+      setPhoneError(PHONE_ERROR_MESSAGE);
+      return;
+    }
 
     setIsLoading(true);
-    const formData = new FormData();
+    setError(null);
 
-    // ВАЖНО: Названия ключей теперь строго совпадают с тем, что ждет FastAPI
+    const formData = new FormData();
     formData.append('name', userName);
     formData.append('phone', userPhone);
-    
-    // Упаковываем остальные настройки в поле comment для админки
-    const orderDetails = `Формат: ${formatMap[format]} | Бумага: ${paperMap[paperType]} | Кадрирование: ${cropMap[cropMode]} | Сумма: ${totalPrice} руб.`;
-    formData.append('comment', orderDetails);
-
-    formData.append('format', formatMap[format]);
+    formData.append('email', userEmail);
+    formData.append('format', format);
     formData.append('paper', paperMap[paperType]);
     formData.append('crop', cropMap[cropMode]);
+    formData.append('comment', `Печать фото: ${photos.length} шт., Формат: ${formatMap[format]}, Бумага: ${paperMap[paperType]}, Кадрирование: ${cropMap[cropMode]}`);
 
-    // Добавляем файлы
-    photos.forEach(file => {
-      formData.append('files', file);
+    photos.forEach((photo) => {
+      formData.append('files', photo);
     });
 
     try {
-      const response = await fetch('http://localhost:8000/api/order', {
+      const response = await fetch(`${API_BASE_URL}/order`, {
         method: 'POST',
-        // Заголовок Content-Type браузер подставит сам!
         body: formData,
       });
 
       if (response.ok) {
         const data = await response.json();
         setOrderId(data.order_id);
+        setPaymentAmount(data.amount ? parseFloat(data.amount) : totalPrice);
         setSuccessMessage('Заказ сформирован!');
+        setError(null);
+        scrollToWidget();
+        reachGoal('ORDER_CREATED');
         if (onSuccess) onSuccess();
         setPhotos([]);
         setFormat('10x15');
@@ -132,14 +174,16 @@ export function PhotoPrintForm({ onSuccess, onReset }) {
         setIsConfirmed(false);
         setUserName('');
         setUserPhone('');
+        setPhoneError('');
+        setUserEmail('');
       } else {
         const errorDetail = await response.json().catch(() => ({}));
         console.error('Ошибка сервера:', errorDetail);
-        alert('Ошибка при проверке данных. Загляни в консоль (F12).');
+        setError(errorDetail?.detail || 'Ошибка при проверке данных. Пожалуйста, проверьте введённые данные.');
       }
-    } catch (error) {
-      console.error(error);
-      alert('Ошибка соединения с сервером');
+    } catch (err) {
+      console.error(err);
+      setError('Ошибка соединения с сервером. Пожалуйста, проверьте подключение к интернету.');
     } finally {
       setIsLoading(false);
     }
@@ -147,15 +191,19 @@ export function PhotoPrintForm({ onSuccess, onReset }) {
 
   if (successMessage) {
     return (
-      <div className="bg-green-50 border border-green-200 text-green-800 rounded-xl p-8 text-center space-y-4">
+      <div ref={widgetRef} className="bg-green-50 border border-green-200 text-green-800 rounded-xl p-8 text-center space-y-4">
         <CheckCircle className="w-16 h-16 mx-auto text-green-500" />
-        <h2 className="text-2xl font-bold">Ваш заказ №{orderId} сформирован!</h2>
-        <p className="text-green-700">Перейдите к оплате для запуска в печать.</p>
+        <h2 className="text-2xl font-bold animate-check-pop">Фото успешно отправлено в обработку</h2>
+        <p className="text-green-700">Заказ №{orderId} сформирован. Перейдите к оплате для запуска в печать.</p>
         <div className="flex flex-col sm:flex-row gap-4 justify-center mt-6">
-          <button type="button" onClick={() => alert('Здесь будет редирект на ЮKassa/Robokassa')} className="px-8 py-3 bg-yellow-400 text-black font-bold rounded-full hover:bg-yellow-500 transition-colors shadow-sm">
+          <button
+            type="button"
+            onClick={() => redirectToPayment(orderId, paymentAmount)}
+            className="px-8 py-3 bg-yellow-400 text-black font-bold rounded-full hover:bg-yellow-500 transition-colors shadow-sm"
+          >
             Перейти к оплате
           </button>
-          <button type="button" onClick={() => { setSuccessMessage(null); setOrderId(null); if (onReset) onReset(); }} className="px-6 py-3 bg-gray-200 text-gray-800 font-medium rounded-full hover:bg-gray-300 transition-colors">
+          <button type="button" onClick={() => { setSuccessMessage(null); setOrderId(null); setPaymentAmount(0); if (onReset) onReset(); }} className="px-6 py-3 bg-gray-200 text-gray-800 font-medium rounded-full hover:bg-gray-300 transition-colors">
             Оформить новый заказ
           </button>
         </div>
@@ -164,17 +212,45 @@ export function PhotoPrintForm({ onSuccess, onReset }) {
   }
 
   return (
-    <form onSubmit={handleSubmit} className="space-y-8 animate-in fade-in duration-300">
+    <form ref={widgetRef} onSubmit={handleSubmit} className="space-y-8 animate-in fade-in duration-300">
+      {error && (
+        <div className="bg-red-950/80 border-l-4 border-red-500 text-red-200 p-3 rounded-md text-sm">
+          {error}
+        </div>
+      )}
+
       <div className="space-y-4 ">
         <h3 className="text-lg font-semibold text-white border-b border-gray-800 pb-2">Контактные данные</h3>
         <div className="grid md:grid-cols-2 gap-6">
           <div>
-            <label className="block text-sm font-medium text-gray-400 mb-2">Ваше имя</label>
-            <input type="text" value={userName} onChange={(e) => setUserName(e.target.value)} placeholder="Иван" className="w-full px-4 py-2 border border-gray-700 bg-gray-800 text-white rounded-lg focus:ring-2 focus:ring-yellow-400 focus:border-yellow-400 outline-none transition-colors" required />
+            <label htmlFor="print-name" className="block text-sm font-medium text-gray-400 mb-2">Ваше имя</label>
+            <input id="print-name" type="text" value={userName} onChange={(e) => setUserName(e.target.value)} placeholder="Иван" className="w-full px-4 py-2 border border-gray-700 bg-gray-800 text-white rounded-lg focus:ring-2 focus:ring-yellow-400 focus:border-yellow-400 outline-none transition-colors" required />
           </div>
           <div>
-            <label className="block text-sm font-medium text-gray-400 mb-2">Телефон</label>
-            <input type="tel" value={userPhone} onChange={(e) => setUserPhone(e.target.value)} placeholder="+7 (999) 000-00-00" className="w-full px-4 py-2 border border-gray-700 bg-gray-800 text-white rounded-lg focus:ring-2 focus:ring-yellow-400 focus:border-yellow-400 outline-none transition-colors" required />
+            <label htmlFor="print-phone" className="block text-sm font-medium text-gray-400 mb-2">Телефон</label>
+            <input
+              id="print-phone"
+              type="tel"
+              value={userPhone}
+              onChange={(e) => {
+                setUserPhone(e.target.value);
+                setPhoneError('');
+              }}
+              placeholder="+7 (999) 000-00-00"
+              className={`w-full rounded-lg border bg-gray-800 px-4 py-2 text-white outline-none transition-colors focus:ring-2 ${
+                phoneError
+                  ? 'border-red-500/50 focus:border-red-500 focus:ring-red-500/50'
+                  : 'border-gray-700 focus:border-yellow-400 focus:ring-yellow-400'
+              }`}
+              required
+            />
+            <p className={`mt-1 text-xs text-red-400 transition-all duration-200 ${phoneError ? 'opacity-100' : 'opacity-0'}`}>
+              {phoneError || '\u00A0'}
+            </p>
+          </div>
+          <div>
+            <label htmlFor="print-email" className="block text-sm font-medium text-gray-400 mb-2">Email для подтверждения</label>
+            <input id="print-email" type="email" value={userEmail} onChange={(e) => setUserEmail(e.target.value)} placeholder="ivan@example.ru" className="w-full px-4 py-2 border border-gray-700 bg-gray-800 text-white rounded-lg focus:ring-2 focus:ring-yellow-400 focus:border-yellow-400 outline-none transition-colors" required />
           </div>
         </div>
       </div>
@@ -182,19 +258,41 @@ export function PhotoPrintForm({ onSuccess, onReset }) {
       <div className="space-y-4">
         <h3 className="text-lg font-semibold text-white border-b border-gray-800 pb-2">1. Загрузите фотографии</h3>
         <div
-          className="bg-gray-900 rounded-xl border-2 border-dashed border-gray-700 p-8 text-center cursor-pointer hover:border-yellow-400 transition-colors"
+          role="button"
+          tabIndex={0}
+          aria-label="Загрузить фотографии для печати"
+          onKeyDown={(e) => {
+            if (e.key === 'Enter' || e.key === ' ') {
+              e.preventDefault();
+              fileInputRef.current?.click();
+            }
+          }}
+          onDragOver={(e) => { e.preventDefault(); setIsDragging(true); }}
+          onDragLeave={(e) => { e.preventDefault(); setIsDragging(false); }}
+          onDrop={handleDrop}
+          className={`group relative cursor-pointer overflow-hidden rounded-3xl border border-dashed bg-[radial-gradient(circle_at_50%_0%,rgba(30,58,138,0.22),transparent_45%),linear-gradient(145deg,rgba(255,255,255,0.055),rgba(2,8,23,0.72))] p-10 text-center shadow-[inset_0_1px_0_rgba(255,255,255,0.06),0_0_40px_rgba(15,23,42,0.55)] backdrop-blur-xl transition-all duration-300 hover:-translate-y-1 hover:shadow-[inset_0_1px_0_rgba(255,255,255,0.08),0_0_48px_rgba(202,138,4,0.10)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-yellow-400 ${isDragging ? 'border-yellow-500/60 bg-yellow-500/10' : 'border-white/15 hover:border-yellow-500/45'}`}
           onClick={() => fileInputRef.current?.click()}
         >
+          <div className={`pointer-events-none absolute inset-x-10 top-0 h-px bg-gradient-to-r from-transparent via-yellow-500/35 to-transparent transition-opacity ${isDragging ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'}`} />
           <input type="file" ref={fileInputRef} onChange={handleFileSelect} accept="image/png, image/jpeg, image/webp" multiple className="hidden" />
-          <UploadCloud className="w-10 h-10 mx-auto mb-3 text-gray-500" />
-          <p className="font-medium text-gray-300">Нажмите для выбора файлов</p>
-          <p className="text-sm text-gray-500 mt-1">
+          <div className="relative mx-auto mb-5 flex h-16 w-16 items-center justify-center rounded-2xl border border-yellow-500/20 bg-yellow-500/10 shadow-[0_0_28px_rgba(202,138,4,0.12)] transition-transform group-hover:scale-110">
+            <UploadCloud className="w-8 h-8 text-yellow-300" />
+          </div>
+          <p className="font-semibold text-white">Нажмите для выбора файлов</p>
+          <p className="text-sm text-zinc-400 mt-2 leading-6">
             {photos.length > 0 ? <span className="text-yellow-400 font-bold">Выбрано файлов: {photos.length} шт.</span> : 'Поддерживаются JPG, PNG, WEBP'}
           </p>
+          <p className="text-xs text-zinc-500">Можно загрузить сразу несколько фотографий</p>
         </div>
 
         {photos.length > 0 && (
           <div className="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-5 gap-4 mt-6">
+            {isLoading && (
+              <div className="col-span-full space-y-3 rounded-xl border border-white/10 bg-white/5 p-4">
+                <div className="shimmer h-3 rounded-full bg-white/10" />
+                <div className="shimmer h-3 w-2/3 rounded-full bg-white/10" />
+              </div>
+            )}
             {photos.map((photo, index) => (
               <PhotoPreview
                 key={index}
@@ -239,12 +337,24 @@ export function PhotoPrintForm({ onSuccess, onReset }) {
             </div>
           </div>
         </div>
-
         <div>
           <label className="block text-sm font-medium text-gray-400 mb-2">Режим кадрирования</label>
           <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
             {[{ id: 'fill', icon: Maximize, desc: 'Фото заполнит бумагу, края обрежутся' }, { id: 'fit', icon: Minimize, desc: 'Фото поместится целиком, останутся белые поля' }, { id: 'auto', icon: UserCog, desc: 'Мы сами выберем лучший вариант' }].map(({ id, icon, desc }) => (
-              <div key={id} onClick={() => setCropMode(id)} className={`relative flex flex-col p-4 cursor-pointer rounded-xl border-2 transition-all ${cropMode === id ? 'border-yellow-400 bg-yellow-400/10' : 'border-gray-700 bg-gray-800 hover:border-gray-600'}`}>
+              <div
+                key={id}
+                role="button"
+                tabIndex={0}
+                aria-pressed={cropMode === id}
+                onClick={() => setCropMode(id)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault();
+                    setCropMode(id);
+                  }
+                }}
+                className={`relative flex flex-col p-4 cursor-pointer rounded-xl border-2 transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-yellow-400 ${cropMode === id ? 'border-yellow-400 bg-yellow-400/10' : 'border-gray-700 bg-gray-800 hover:border-gray-600'}`}
+              >
                 <div className="flex items-center mb-2">
                   {React.createElement(icon, { className: `w-5 h-5 mr-2 ${cropMode === id ? 'text-yellow-400' : 'text-gray-400'}` })}
                   <span className={`font-semibold ${cropMode === id ? 'text-yellow-300' : 'text-gray-300'}`}>{cropMap[id]}</span>
@@ -275,7 +385,7 @@ export function PhotoPrintForm({ onSuccess, onReset }) {
           <span className="text-sm text-gray-300 select-none">Я проверил(а) параметры заказа и подтверждаю их правильность</span>
         </label>
 
-        <button type="submit" disabled={photos.length === 0 || !isConfirmed || isLoading || !userName.trim() || !userPhone.trim()} className="w-full mt-4 flex items-center justify-center py-3 px-4 border border-transparent rounded-lg shadow-sm text-sm font-bold text-black bg-yellow-400 hover:bg-yellow-300 disabled:bg-gray-500 disabled:text-gray-300 disabled:cursor-not-allowed transition-colors">
+        <button type="submit" disabled={photos.length === 0 || !isConfirmed || isLoading || !userName.trim() || !userPhone.trim() || !userEmail.trim()} className="w-full mt-4 flex items-center justify-center py-3 px-4 border border-transparent rounded-lg shadow-sm text-sm font-bold text-black bg-yellow-400 hover:bg-yellow-300 disabled:bg-gray-500 disabled:text-gray-300 disabled:cursor-not-allowed transition-colors">
           {isLoading && <Loader2 className="w-5 h-5 mr-2 animate-spin" />}
           {isLoading ? 'Отправка...' : 'Оформить заказ'}
         </button>

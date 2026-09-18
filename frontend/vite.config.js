@@ -4,7 +4,7 @@ import path from 'path'
 
 export default defineConfig({
   plugins: [react()],
-  base: '/photodoc-ai/',
+  base: '/',
   resolve: {
     alias: {
       "@": path.resolve(process.cwd(), "./src"),
