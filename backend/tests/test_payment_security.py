@@ -17,11 +17,10 @@ import sys
 import sqlite3
 import hashlib
 import tempfile
-import shutil
 import threading
 import pytest
 from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 # ---------------------------------------------------------------------------
 # Bootstrap: set env vars BEFORE importing main
@@ -45,8 +44,9 @@ _temp_db_path = _temp_db.name
 _temp_db.close()
 os.environ["DATABASE_PATH"] = _temp_db_path
 
-from fastapi.testclient import TestClient
-from main import (
+from fastapi.testclient import TestClient  # noqa: E402
+import main as main_module  # noqa: E402
+from main import (  # noqa: E402
     app,
     init_db,
     DB_PATH,
@@ -126,6 +126,109 @@ def post_result(client, out_sum: str, inv_id: int, password: str):
         "/api/payment/robokassa/result",
         params={"OutSum": out_sum, "InvId": str(inv_id), "SignatureValue": sig},
     )
+
+
+def test_paid_order_payment_create_is_terminal(client):
+    """payment/create must not modify any field of an already-paid order."""
+    order_id = create_db_order(status="paid", payment_status="paid")
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        """
+        UPDATE orders
+        SET payment_amount='300.00', paid_at='2026-09-19T01:02:03',
+            payment_email_sent_at='2026-09-19T01:03:04'
+        WHERE id=?
+        """,
+        (order_id,),
+    )
+    conn.commit()
+    before = conn.execute(
+        """
+        SELECT payment_status, status, payment_amount, paid_at, payment_email_sent_at
+        FROM orders WHERE id=?
+        """,
+        (order_id,),
+    ).fetchone()
+    conn.close()
+
+    response = client.post("/api/payment/create", json={"order_id": order_id})
+    assert response.status_code == 409
+    assert response.json()["detail"] == "Order is already paid"
+
+    conn = sqlite3.connect(DB_PATH)
+    after = conn.execute(
+        """
+        SELECT payment_status, status, payment_amount, paid_at, payment_email_sent_at
+        FROM orders WHERE id=?
+        """,
+        (order_id,),
+    ).fetchone()
+    conn.close()
+    assert after == before
+
+
+def test_unpaid_to_pending_and_repeated_create_is_idempotent(client):
+    order_id = create_db_order(status="new", payment_status="unpaid")
+    first = client.post("/api/payment/create", json={"order_id": order_id})
+    assert first.status_code == 200
+    first_state = get_order_by_id(order_id)
+    assert first_state["payment_status"] == "pending"
+    assert first_state["status"] == "awaiting_payment"
+    assert first_state["payment_amount"] == "300.00"
+
+    second = client.post("/api/payment/create", json={"order_id": order_id})
+    assert second.status_code == 200
+    assert second.json()["payment_url"] == first.json()["payment_url"]
+    second_state = get_order_by_id(order_id)
+    assert second_state == first_state
+
+
+def test_unknown_payment_state_fails_closed(client):
+    order_id = create_db_order()
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("UPDATE orders SET payment_status='corrupt' WHERE id=?", (order_id,))
+    conn.commit()
+    conn.close()
+
+    response = client.post("/api/payment/create", json={"order_id": order_id})
+    assert response.status_code == 409
+    assert get_order_by_id(order_id)["payment_status"] == "corrupt"
+
+
+def test_payment_create_racing_result_url_cannot_revert_paid(client, monkeypatch):
+    """Force ResultURL to commit after create reads but before its conditional UPDATE."""
+    order_id = create_db_order()
+    create_reached_transition = threading.Event()
+    callback_finished = threading.Event()
+    original_transition = main_module.update_order_payment_pending
+
+    def delayed_transition(target_order_id, amount):
+        create_reached_transition.set()
+        assert callback_finished.wait(timeout=5)
+        return original_transition(target_order_id, amount)
+
+    monkeypatch.setattr(main_module, "update_order_payment_pending", delayed_transition)
+    create_response = []
+
+    def call_create():
+        create_response.append(
+            client.post("/api/payment/create", json={"order_id": order_id})
+        )
+
+    create_thread = threading.Thread(target=call_create)
+    create_thread.start()
+    assert create_reached_transition.wait(timeout=5)
+    result_response = post_result(client, "300.00", order_id, TEST_PASSWORD2)
+    callback_finished.set()
+    create_thread.join(timeout=5)
+
+    assert result_response.status_code == 200
+    assert len(create_response) == 1
+    assert create_response[0].status_code == 409
+    final_order = get_order_by_id(order_id)
+    assert final_order["payment_status"] == "paid"
+    assert final_order["status"] == "paid"
+    assert final_order["paid_at"] is not None
 
 
 # ===========================================================================
