@@ -167,7 +167,10 @@ jobs:
 
         docker volume create "${WRONG}" >/dev/null
         docker volume create "${CORRECT}" >/dev/null
-        BACKEND_IMAGE="$(docker compose images -q backend)"
+        # The failed `create` still builds the project-scoped backend image before
+        # Compose checks the missing external volume. No container exists yet, so
+        # `docker compose images -q` would be empty; use the deterministic tag.
+        BACKEND_IMAGE="${PROJECT}-backend"
 
         docker run --rm --user root -e DATABASE_PATH=/data/orders.db \
           -v "${WRONG}:/data" "${BACKEND_IMAGE}" \
