@@ -1,287 +1,291 @@
 # PhotoDoc AI — Production Release & Deployment Guide
 
-This document defines the production deployment, database migration, and rollback procedures for PhotoDoc AI.
+This document defines the production deployment, database migration, permission cutover, and rollback procedures for PhotoDoc AI on the target production server.
 
 ---
 
-## 1. Prerequisites & Architecture
+## 1. Audited Production Architecture
 
-- **Host OS**: Ubuntu 22.04+ / Debian 12+ (or compatible Linux distribution)
-- **Runtime**: Docker Engine 24.0+ with Docker Compose v2 (`docker compose`)
-- **Utilities**: `sqlite3`, `curl`, `git`
-- **Reverse Proxy / TLS**: Host-level Nginx, Caddy, Cloudflare Tunnel, or cloud load balancer terminating TLS for `https://photodoc-ai.ru/` and forwarding traffic to `127.0.0.1:8080`.
+The production environment on `79.137.196.14` was audited and is **already containerized**:
 
-### 1.1 Network & TLS Architecture (Fail-Closed Default)
-
-The production canonical URL is:
 ```text
-https://photodoc-ai.ru/
+CURRENT_PRODUCTION_ALREADY_CONTAINERIZED=true
+CURRENT_RUNTIME=docker compose
+CURRENT_PATH=/opt/photodoc
+CURRENT_ENV_FILE=/opt/photodoc/backend/.env
+ROLLBACK_ARTIFACT=/opt/photodoc/release.zip
+
+CURRENT_FRONTEND=photodoc-frontend (bound to 127.0.0.1:8080)
+CURRENT_BACKEND=photodoc-backend (internal port 8000)
+
+EXISTING_DB_VOLUME=photodoc_backend-data
+EXISTING_DB_FILE=orders.db
+HOST_DB_PATH=/var/lib/docker/volumes/photodoc_backend-data/_data/orders.db
+EXISTING_DB_OWNER=root:root (mode 0644)
+
+EXISTING_UPLOAD_PATH=/opt/photodoc/backend/uploads
 ```
 
-The Docker Compose baseline binds the frontend container strictly to `localhost` to prevent plaintext public HTTP exposure:
-```yaml
-ports:
-  - "127.0.0.1:${PORT:-8080}:80"
-```
+### 1.1 Network & Infrastructure Status (Blockers)
 
-Deployment metadata:
 ```text
-APPLICATION_LISTEN=127.0.0.1:8080
-TLS_TERMINATION=EXTERNAL_REQUIRED
-PUBLIC_HTTPS_ENTRYPOINT=UNRESOLVED_UNTIL_SERVER_AUDIT
-PUBLIC_PLAINTEXT_HTTP_EXPOSURE=false
-TLS_PRODUCTION_ARCHITECTURE_RESOLVED=false
+PORT_443_OWNER=XRAY (Marzban VPN - DO NOT TOUCH)
+PORT_80=unused
+DOMAIN=photodoc-ai.ru (NXDOMAIN)
+PUBLIC_HTTPS_ROUTING=UNRESOLVED
+MANUAL_SUPABASE_ROTATION_REQUIRED=YES
+ROTATION_CONFIRMED=false
 READY_FOR_PRODUCTION_DEPLOY=false
 ```
 
-Plaintext HTTP is never exposed publicly to ensure user uploads, payment callbacks, and session data remain secure.
+- **FAIL-CLOSED RULE**: Plaintext HTTP is never exposed publicly.
+- **MARZBAN ISOLATION**: Do NOT modify `/opt/marzban`, `/var/lib/marzban`, Xray processes, certificates, or port 443 configurations during PhotoDoc AI operations.
 
 ---
 
-## 2. Required Environment Variables
+## 2. Storage Strategy & Production Overlay
 
-All production environment variables must be placed in a host `.env` file located in the project root.
-
-> **CRITICAL**: Never commit `.env` to version control. Set restrictive permissions: `chmod 600 .env`.
-
-| Variable | Description | Default / Production Requirement |
-| :--- | :--- | :--- |
-| `DATABASE_PATH` | Path to persistent SQLite DB inside container | `/data/orders.db` |
-| `ROBOKASSA_MERCHANT_LOGIN` | Merchant identifier in Robokassa | *Production Login* |
-| `ROBOKASSA_PASSWORD1` | Payment initialization password (Pass1) | *Secret Pass1* |
-| `ROBOKASSA_PASSWORD2` | Notification signature password (Pass2) | *Secret Pass2* |
-| `ROBOKASSA_IS_TEST` | Test mode toggle (`0` for production, `1` for test) | **Must be set to `0` for real production payments** (Default: `1`) |
-| `SMTP_SERVER` | SMTP host for notification emails | `smtp.yandex.ru` |
-| `SMTP_PORT` | SMTP port (SSL/TLS) | `465` |
-| `SMTP_USER` | SMTP username / sender address | `notifications@photodoc-ai.ru` |
-| `SMTP_PASSWORD` | SMTP app password | *Secret App Password* |
-| `EMAIL_TO` | Recipient address for new orders | `owner@photodoc-ai.ru` |
-| `YANDEX_DISK_TOKEN` | OAuth token for Yandex.Disk upload API | *OAuth Token* |
-| `PORT` | Localhost bind port for frontend Nginx | `8080` (bound to `127.0.0.1`) |
-| `VITE_API_URL` | Frontend API base route | `/api` |
-| `VITE_YANDEX_METRIKA_ID` | Production Yandex Metrika counter ID | *Numeric Counter ID* |
-| `VITE_SUPABASE_URL` | Supabase project URL | `https://*.supabase.co` |
-| `VITE_SUPABASE_ANON_KEY` | Supabase public anonymous key | *Public Anon Key* |
-
----
-
-## 3. Credential Security & Supabase Gate
-
-> **MANUAL ACTION REQUIRED**:
-> The historical Supabase service secret (`sb_secret`) was previously committed in historical revisions.
-> While `sb_secret` is completely absent from canonical `main` and production source code (`SB_SECRET_SEARCH=NO_MATCHES`),
-> **manual rotation/revocation of the Supabase service key must still be performed in the Supabase Cloud Console**.
->
-> Gate status:
-> ```text
-> MANUAL_SUPABASE_ROTATION_REQUIRED=YES
-> ROTATION_CONFIRMED=false
-> READY_FOR_PRODUCTION_DEPLOY=false
-> ```
-> Production deployment remains blocked until the operator confirms key rotation.
-
----
-
-## 4. Database Pre-Deployment Backup & Migration Gate
-
-The database file resides in the Docker persistent named volume `photodoc_db` mounted to `/data/orders.db`.
-
-### 4.1 Volume-Aware Database Backup
-
-Do NOT rely on host-internal Docker volume storage paths (e.g. `/var/lib/docker/volumes/...`), which are implementation-specific. Use a clean, volume-aware backup container:
+To safely reuse the existing production database, uploads, and runtime credentials without data loss or path divergence, deployment uses the production overlay:
 
 ```bash
-# 1. Ensure backup directory exists on host
-mkdir -p "$PWD/backups"
+docker compose -f docker-compose.yml -f docker-compose.production.yml config
+```
 
-# 2. Stop write traffic
-docker compose stop backend
+### 2.1 Storage & Runtime Mapping Contract
+- **Database Volume**: `photodoc_db` maps to physical volume `photodoc_backend-data` (`${PHOTODOC_DB_VOLUME:-photodoc_backend-data}`).
+- **Uploads Directory**: maps to existing host bind mount `/opt/photodoc/backend/uploads` (`${PHOTODOC_UPLOADS_SOURCE:-/opt/photodoc/backend/uploads}`).
+- **Backend Secrets**: loaded directly from existing `/opt/photodoc/backend/.env` via `env_file`.
+- **Frontend Port**: bound strictly to `127.0.0.1:${PORT:-8080}:80`.
 
-# 3. Perform volume-aware pre-deployment backup
-BACKUP_NAME="orders.db.predeploy.$(date +%Y%m%d%H%M%S)"
+---
+
+## 3. Required Environment Variables
+
+All backend production secrets reside in `/opt/photodoc/backend/.env`. Restrict permissions: `chmod 600 /opt/photodoc/backend/.env`.
+
+| Variable | Description | Target Requirement |
+| :--- | :--- | :--- |
+| `DATABASE_PATH` | Path inside container | `/data/orders.db` (deployment managed) |
+| `ROBOKASSA_MERCHANT_LOGIN` | Robokassa Merchant Login | *Production Login* |
+| `ROBOKASSA_PASSWORD1` | Payment Pass1 | *Production Pass1* |
+| `ROBOKASSA_PASSWORD2` | Notification Pass2 | *Production Pass2* |
+| `ROBOKASSA_IS_TEST` | Mode toggle | **`0` for real production** |
+| `SMTP_SERVER` | SMTP host | `smtp.yandex.ru` |
+| `SMTP_PORT` | SMTP SSL/TLS port | `465` |
+| `SMTP_USER` | SMTP sender | `notifications@photodoc-ai.ru` |
+| `SMTP_PASSWORD` | App Password | *Production App Password* |
+| `EMAIL_TO` | Recipient | `owner@photodoc-ai.ru` |
+| `YANDEX_DISK_TOKEN` | OAuth token | *OAuth Token* |
+| `PORT` | Localhost bind | `8080` (bound to `127.0.0.1`) |
+| `VITE_API_URL` | Frontend API route | `/api` |
+| `VITE_YANDEX_METRIKA_ID` | Metrika ID | *Production ID* |
+| `VITE_SUPABASE_URL` | Supabase URL | *Optional / Unused in Production Bundle* |
+| `VITE_SUPABASE_ANON_KEY` | Public Anon Key | *Optional / Unused in Production Bundle* |
+
+> **Note on Frontend Supabase Variables**:
+> Source audit confirms `SUPABASE_CLIENT_IMPORTED_IN_PRODUCTION_BUNDLE=false`. The client `frontend/src/lib/supabase.js` is not imported anywhere in the production SPA. Therefore, missing Supabase credentials do not block the frontend build.
+
+---
+
+## 4. Production Upgrade Sequence (Step-by-Step)
+
+For all production operations, consistently use the production Compose pair:
+`docker compose -f docker-compose.yml -f docker-compose.production.yml ...`
+
+### Step 1: Preflight Verification (Fail-Closed)
+Before touching any services, verify that:
+1. All required environment variable names are present in `/opt/photodoc/backend/.env` (without printing secret values).
+2. The existing database volume is present, readable, and non-empty.
+
+```bash
+# 1. Environment preflight
+python scripts/production_preflight.py --check-env /opt/photodoc/backend/.env
+
+# 2. Database preflight (via read-only mount)
 docker run --rm \
-  -v photodoc_db:/data \
+  -v photodoc_backend-data:/data:ro \
+  -v "$PWD/scripts:/scripts:ro" \
+  python:3.11-alpine \
+  python /scripts/production_preflight.py --db /data/orders.db --check-only
+```
+Expected output:
+```text
+ROBOKASSA_MERCHANT_LOGIN=PRESENT
+ROBOKASSA_PASSWORD1=PRESENT
+ROBOKASSA_PASSWORD2=PRESENT
+ROBOKASSA_IS_TEST=PRESENT
+SMTP_SERVER=PRESENT
+SMTP_PORT=PRESENT
+SMTP_USER=PRESENT
+SMTP_PASSWORD=PRESENT
+EMAIL_TO=PRESENT
+YANDEX_DISK_TOKEN=PRESENT
+ENV_SECRET_VALUES_PRINTED=false
+READY_FOR_CUTOVER=true
+
+DB_EXISTS=true
+DB_NONZERO=true
+ORDERS_TABLE_PRESENT=true
+SCHEMA_READABLE=true
+READY_FOR_MIGRATION=true
+```
+If either check fails, **STOP IMMEDIATELY**. Do not proceed with cutover.
+
+### Step 2: Stop Old Backend Writer
+Stop the existing backend to halt writes:
+```bash
+docker compose -f docker-compose.yml -f docker-compose.production.yml stop backend
+```
+*(Do NOT run `docker compose down -v`! Managed volumes must be preserved).*
+
+### Step 3: Create Volume-Aware Database Backup
+```bash
+mkdir -p "$PWD/backups"
+BACKUP_NAME="orders.db.preupgrade.$(date +%Y%m%d%H%M%S)"
+docker run --rm \
+  -v photodoc_backend-data:/data \
   -v "$PWD/backups:/backup" \
   alpine \
-  sh -c "cp /data/orders.db /backup/${BACKUP_NAME}"
+  cp /data/orders.db "/backup/${BACKUP_NAME}"
 
-# 4. Verify backup file exists and is non-empty
 test -s "$PWD/backups/${BACKUP_NAME}"
 echo "BACKUP_CREATED=true"
-echo "BACKUP_NONZERO=true"
-
-# 5. Check pre-migration database integrity
-sqlite3 "$PWD/backups/${BACKUP_NAME}" "PRAGMA integrity_check;"
-# Output MUST be: ok
-echo "PRE_MIGRATION_INTEGRITY=ok"
 ```
 
-### 4.2 Migration Execution (Audit: RUN_ONCE_ONLY)
+### Step 4: Pre-migration Integrity Check
+```bash
+docker run --rm \
+  -v "$PWD/backups:/backup" \
+  alpine sh -c "apk add --no-cache sqlite >/dev/null && sqlite3 /backup/${BACKUP_NAME} 'PRAGMA integrity_check;'"
+# Output MUST be: ok
+```
 
-Migration `001_add_payment_fields.sql` uses `ALTER TABLE orders ADD COLUMN ...`, which is **not idempotent** in SQLite (`MIGRATION_IDEMPOTENT=false`, `RUN_ONCE_ONLY=true`). Attempting to re-run it on an already-migrated database will error with `duplicate column name`.
-
-Execute the migration inside a temporary container or against the verified volume:
+### Step 5: Idempotent Schema Reconciliation
+The production DB is partially migrated (missing `order_amount` and `created_at`). Run `reconcile_payment_schema.py` using the production compose overlay:
 
 ```bash
-# Check if columns are already present
-HAS_COL=$(docker run --rm -v photodoc_db:/data alpine sh -c '
-  apk add --no-cache sqlite >/dev/null 2>&1
-  sqlite3 /data/orders.db "PRAGMA table_info(orders);" | grep -c "payment_status" || true
-')
+# 1. Dry run check
+docker compose -f docker-compose.yml -f docker-compose.production.yml run --rm --no-deps \
+  backend \
+  python migrations/reconcile_payment_schema.py --db /data/orders.db --check
 
-if [ "$HAS_COL" -eq 0 ]; then
-  echo "Applying migration 001_add_payment_fields.sql..."
-  docker run --rm \
-    -v photodoc_db:/data \
-    -v "$PWD/backend/migrations:/migrations:ro" \
-    alpine \
-    sh -c '
-      apk add --no-cache sqlite >/dev/null 2>&1
-      sqlite3 /data/orders.db < /migrations/001_add_payment_fields.sql
-    '
-else
-  echo "Payment columns already present. Skipping migration."
-fi
+# 2. Apply reconciliation
+docker compose -f docker-compose.yml -f docker-compose.production.yml run --rm --no-deps \
+  backend \
+  python migrations/reconcile_payment_schema.py --db /data/orders.db --apply
+```
+Expected output:
+```text
+COLUMNS_ADDED=order_amount,created_at
+SCHEMA_STATUS=COMPLETE
+MIGRATION_REQUIRED=false
+```
 
-# Check post-migration integrity
-docker run --rm -v photodoc_db:/data alpine sh -c '
-  apk add --no-cache sqlite >/dev/null 2>&1
-  sqlite3 /data/orders.db "PRAGMA integrity_check;"
+### Step 6: Permission Preparation for UID 1000 (`appuser`)
+The existing database file was owned by `root:root (0644)`. The new backend runs as non-root `UID 1000`. Prepare permissions:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.production.yml run --rm --no-deps \
+  --user root \
+  backend \
+  sh -c '
+    chown -R 1000:1000 /data &&
+    test -w /data/orders.db
+  '
+```
+
+### Step 7: Launch New Application Stack
+```bash
+# Validate effective compose configuration
+docker compose -f docker-compose.yml -f docker-compose.production.yml config
+
+# Build and start services
+docker compose -f docker-compose.yml -f docker-compose.production.yml build
+docker compose -f docker-compose.yml -f docker-compose.production.yml up -d --wait --wait-timeout 180
+```
+
+### Step 8: Post-Deployment Smoke Verification
+```bash
+# 1. Backend health via local proxy
+curl -f http://127.0.0.1:8080/api/health
+# Expected: {"status":"ok"}
+
+# 2. Frontend SPA root
+curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8080/
+# Expected: 200
+
+# 3. Open Graph asset
+curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8080/og/photodoc-og.jpg
+# Expected: 200
+
+# 4. Backend database write verification
+docker compose -f docker-compose.yml -f docker-compose.production.yml exec -T backend sh -c '
+  test -w /data &&
+  test -w /data/orders.db &&
+  test -w /app/uploads
 '
-# Output MUST be: ok
-echo "POST_MIGRATION_INTEGRITY=ok"
 ```
 
 ---
 
-## 5. Container Deployment & Launch
+## 5. Rollback Procedures
 
-```bash
-# 1. Validate Compose configuration
-docker compose config
+> [!CAUTION]
+> **CRITICAL PRODUCTION RULE**:
+> NEVER run `docker compose down -v` against the production environment.
+> The `-v` flag deletes named volumes (`photodoc_backend-data`), destroying order history and payment records.
+> `PRODUCTION_RUNBOOK_DOWN_V=false`
+> `ROLLBACK_DELETES_PRODUCTION_VOLUME=false`
 
-# 2. Build containers cleanly
-docker compose build --no-cache
+### 5.1 Mode 1: Rollback to Previous Container Release (`/opt/photodoc/release.zip`)
 
-# 3. Start containers in detached mode and wait for health
-docker compose up -d --wait --wait-timeout 180
+If the new stack fails cutover:
 
-# 4. Verify container status and health
-docker compose ps
-```
-
----
-
-## 6. Health & Smoke Verification
-
-Execute smoke tests against the local binding `http://127.0.0.1:8080`:
-
-1. **Backend Health Check via Nginx Proxy**:
+1. **Stop new containers**:
+   ```bash
+   docker compose -f docker-compose.yml -f docker-compose.production.yml down
+   ```
+2. **Restore previous application files**:
+   ```bash
+   unzip -o /opt/photodoc/release.zip -d /opt/photodoc/
+   ```
+3. **Restore database backup (if schema rollback is required)**:
+   ```bash
+   docker run --rm \
+     -v photodoc_backend-data:/data \
+     -v "$PWD/backups:/backup" \
+     alpine \
+     cp "/backup/${BACKUP_NAME}" /data/orders.db
+   ```
+4. **Permissions compatibility on rollback**:
+   The previous production backend runs as `root`. Root retains full read/write access to files owned by `UID 1000` (`OLD_ROOT_BACKEND_CAN_ACCESS_UID1000_DB=true`). No reverse chown is required.
+5. **Start previous stack**:
+   ```bash
+   docker compose up -d
+   ```
+6. **Verify rollback**:
    ```bash
    curl -f http://127.0.0.1:8080/api/health
-   # Expected: {"status":"ok"}
    ```
 
-2. **Frontend Root SPA**:
+### 5.2 Mode 2: Future Git-Based Container Releases Rollback
+
+For future releases managed via Git commits:
+
+1. Stop current containers:
    ```bash
-   curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8080/
-   # Expected: 200
+   docker compose -f docker-compose.yml -f docker-compose.production.yml down
    ```
-
-3. **Open Graph Asset**:
+2. Check out previous known-good commit:
    ```bash
-   curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8080/og/photodoc-og.jpg
-   # Expected: 200
+   git checkout <PREVIOUS_COMMIT>
    ```
-
-4. **Named Volume Writability & Persistence**:
+3. If database restore is needed, copy pre-deployment backup into `photodoc_backend-data`.
+4. Rebuild and launch:
    ```bash
-   docker compose exec -T backend sh -c '
-     test -w /data &&
-     test -w /app/uploads &&
-     touch /data/.write-test &&
-     touch /app/uploads/.write-test &&
-     rm /data/.write-test /app/uploads/.write-test
-   '
-   docker compose exec -T backend test -f /data/orders.db
-   # Expected: exit code 0
+   docker compose -f docker-compose.yml -f docker-compose.production.yml up -d --build
    ```
-
-5. **Nginx Client Max Body Size**:
-   Verify client upload limit is `50M` in `frontend/nginx.conf`.
-
----
-
-## 7. Rollback Procedures
-
-### 7.1 Mode 1: First Containerized Release Rollback
-
-Because the previous canonical production release did NOT use this container deployment layer, a container rollback cannot simply check out the previous commit.
-
-Before production cutover, a production server audit must discover and record:
-```text
-CURRENT_PRODUCTION_RUNTIME
-CURRENT_PRODUCTION_PATH
-CURRENT_PRODUCTION_START_COMMAND
-CURRENT_PRODUCTION_STOP_COMMAND
-CURRENT_PRODUCTION_SERVICE
-```
-
-Current qualification state:
-```text
-FIRST_CONTAINER_RELEASE_ROLLBACK_RESOLVED=false
-READY_FOR_PRODUCTION_DEPLOY=false
-```
-
-If the first container deployment fails cutover:
-1. Stop Docker containers: `docker compose down -v`
-2. If database was migrated, restore pre-deployment backup (see 7.3)
-3. Resume previous native service using documented `CURRENT_PRODUCTION_START_COMMAND`
-
-### 7.2 Mode 2: Future Container Releases Rollback
-
-For subsequent container releases:
-
-```bash
-# 1. Stop current containers
-docker compose down
-
-# 2. Check out previous known-good release tag / commit
-git checkout <PREVIOUS_KNOWN_GOOD_TAG_OR_COMMIT>
-
-# 3. Rebuild and launch previous release
-docker compose build --no-cache
-docker compose up -d --wait --wait-timeout 180
-
-# 4. Verify health
-curl -f http://127.0.0.1:8080/api/health
-```
-
-### 7.3 Database Rollback (Restoring Volume-Aware Backup)
-
-If a schema migration failed or corrupted data:
-
-```bash
-# 1. Stop backend container
-docker compose stop backend
-
-# 2. Restore database from pre-deployment backup using volume container
-docker run --rm \
-  -v photodoc_db:/data \
-  -v "$PWD/backups:/backup" \
-  alpine \
-  sh -c "cp /backup/${BACKUP_NAME} /data/orders.db"
-
-# 3. Verify integrity of restored database
-docker run --rm -v photodoc_db:/data alpine sh -c '
-  apk add --no-cache sqlite >/dev/null 2>&1
-  sqlite3 /data/orders.db "PRAGMA integrity_check;"
-'
-# Output MUST be: ok
-
-# 4. Restart backend
-docker compose start backend
-
-# 5. Verify backend health
-curl -f http://127.0.0.1:8080/api/health
-```
+5. Verify health:
+   ```bash
+   curl -f http://127.0.0.1:8080/api/health
+   ```

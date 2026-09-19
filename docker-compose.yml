@@ -6,19 +6,9 @@ services:
     restart: unless-stopped
     environment:
       - DATABASE_PATH=${DATABASE_PATH:-/data/orders.db}
-      - ROBOKASSA_MERCHANT_LOGIN=${ROBOKASSA_MERCHANT_LOGIN:-}
-      - ROBOKASSA_PASSWORD1=${ROBOKASSA_PASSWORD1:-}
-      - ROBOKASSA_PASSWORD2=${ROBOKASSA_PASSWORD2:-}
-      - ROBOKASSA_IS_TEST=${ROBOKASSA_IS_TEST:-1}
-      - SMTP_SERVER=${SMTP_SERVER:-}
-      - SMTP_PORT=${SMTP_PORT:-465}
-      - SMTP_USER=${SMTP_USER:-}
-      - SMTP_PASSWORD=${SMTP_PASSWORD:-}
-      - EMAIL_TO=${EMAIL_TO:-}
-      - YANDEX_DISK_TOKEN=${YANDEX_DISK_TOKEN:-}
     volumes:
       - photodoc_db:/data
-      - photodoc_uploads:/app/uploads
+      - ${PHOTODOC_UPLOADS_SOURCE:-photodoc_uploads}:/app/uploads
     networks:
       - photodoc_network
 
@@ -42,7 +32,7 @@ services:
 
 volumes:
   photodoc_db:
-    name: photodoc_db
+    name: ${PHOTODOC_DB_VOLUME:-photodoc_db}
   photodoc_uploads:
     name: photodoc_uploads
 

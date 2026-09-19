@@ -61,6 +61,11 @@ jobs:
       run: pip install pytest
     - name: Run payment security tests
       run: pytest tests/test_payment_security.py -v
+    - name: Run migration reconciliation tests
+      run: pytest tests/test_migration_reconciliation.py -v
+    - name: Verify preflight script
+      run: |
+        python ../scripts/production_preflight.py --db nonexistent.db || true
 
   docker-build:
     name: Docker Build
@@ -75,10 +80,93 @@ jobs:
       DATABASE_PATH: /data/orders.db
     steps:
     - uses: actions/checkout@v4
-    - name: Validate Docker Compose config
+    - name: Validate generic Docker Compose config
       run: docker compose config
+    - name: Verify synthetic production env file loading and non-override
+      run: |
+        cat << 'EOF' > backend/.env
+        ROBOKASSA_MERCHANT_LOGIN=ci
+        ROBOKASSA_PASSWORD1=ci1
+        ROBOKASSA_PASSWORD2=ci2
+        ROBOKASSA_IS_TEST=1
+        SMTP_SERVER=example.invalid
+        SMTP_PORT=465
+        SMTP_USER=ci
+        SMTP_PASSWORD=ci
+        EMAIL_TO=ci@example.invalid
+        YANDEX_DISK_TOKEN=ci
+        EOF
+
+        # Run preflight env verification check
+        python scripts/production_preflight.py --check-env backend/.env
+
+        # Run compose config on base + production overlay
+        PROD_CONFIG=$(docker compose -f docker-compose.yml -f docker-compose.production.yml config)
+        echo "${PROD_CONFIG}" | grep -q "photodoc_backend-data"
+        echo "${PROD_CONFIG}" | grep -q "/opt/photodoc/backend/uploads"
+
+        # Check that synthetic values are loaded from env_file
+        echo "${PROD_CONFIG}" | grep -q "ROBOKASSA_MERCHANT_LOGIN: ci"
+        echo "${PROD_CONFIG}" | grep -q "ROBOKASSA_PASSWORD1: ci1"
+        echo "${PROD_CONFIG}" | grep -q "ROBOKASSA_PASSWORD2: ci2"
+        echo "${PROD_CONFIG}" | grep -q "SMTP_SERVER: example.invalid"
+        echo "PRODUCTION_ENV_FILE_LOADED=true"
+
+        # Verify that generic base environment does NOT override values with empty strings
+        if echo "${PROD_CONFIG}" | grep -q 'ROBOKASSA_MERCHANT_LOGIN: ""'; then
+          echo "FAIL: generic base environment overrode ROBOKASSA_MERCHANT_LOGIN with empty string!"
+          exit 1
+        fi
+        echo "EMPTY_SECRET_OVERRIDE=false"
+
+        # Clean up synthetic env file
+        rm -f backend/.env
     - name: Build Docker images
       run: docker compose build
+    - name: Verify synthetic root-owned DB permission prep and rollback compatibility
+      run: |
+        echo "Creating synthetic root-owned database volume..."
+        docker volume create test_synthetic_db
+        docker run --rm -v test_synthetic_db:/data --user root alpine sh -c '
+          touch /data/orders.db &&
+          chown 0:0 /data/orders.db &&
+          chmod 0644 /data/orders.db &&
+          ls -ld /data/orders.db
+        '
+        echo "ROOT_OWNED_DB_BEFORE=true"
+
+        echo "Verifying backend appuser (UID 1000) cannot write to root-owned orders.db before prep..."
+        if docker run --rm -v test_synthetic_db:/data --user 1000:1000 alpine sh -c 'test -w /data/orders.db'; then
+          echo "FAIL: appuser was able to write to root-owned DB before prep"
+          exit 1
+        else
+          echo "APPUSER_CAN_WRITE_BEFORE=false"
+        fi
+
+        echo "Executing permission preparation command..."
+        docker compose run --rm --no-deps -v test_synthetic_db:/data --user root backend sh -c '
+          chown -R 1000:1000 /data &&
+          test -w /data/orders.db
+        '
+        echo "PERMISSION_PREP=PASS"
+
+        DB_OWNER=$(docker run --rm -v test_synthetic_db:/data alpine stat -c "%u" /data/orders.db)
+        echo "DB_UID_AFTER=${DB_OWNER}"
+        test "${DB_OWNER}" = "1000"
+
+        docker run --rm -v test_synthetic_db:/data --user 1000:1000 alpine test -w /data/orders.db
+        echo "APPUSER_CAN_WRITE_AFTER=true"
+
+        echo "Verifying old root backend container rollback compatibility..."
+        docker run --rm -v test_synthetic_db:/data --user root alpine sh -c '
+          test -r /data/orders.db &&
+          test -w /data/orders.db &&
+          touch /data/.root_write_test &&
+          rm /data/.root_write_test
+        '
+        echo "OLD_ROOT_BACKEND_CAN_ACCESS_UID1000_DB=true"
+
+        docker volume rm test_synthetic_db
     - name: Start containers
       run: |
         docker compose up -d --wait --wait-timeout 180
