@@ -63,6 +63,8 @@ jobs:
       run: pytest tests/test_payment_security.py -v
     - name: Run migration reconciliation tests
       run: pytest tests/test_migration_reconciliation.py -v
+    - name: Run rollback bundle tests
+      run: pytest tests/test_rollback_bundle.py -v
     - name: Verify preflight script
       run: |
         python ../scripts/production_preflight.py --db nonexistent.db || true
@@ -123,6 +125,67 @@ jobs:
         rm -f backend/.env
     - name: Build Docker images
       run: docker compose build
+    - name: Prove production external-volume and DB identity fail-closed contracts
+      run: |
+        set -eu
+        PROJECT="p0-volume-ci-${GITHUB_RUN_ID}"
+        MISSING="photodoc-missing-${GITHUB_RUN_ID}"
+        WRONG="photodoc-wrong-${GITHUB_RUN_ID}"
+        CORRECT="photodoc-correct-${GITHUB_RUN_ID}"
+        UPLOADS="$PWD/.ci-uploads"
+        mkdir -p "${UPLOADS}"
+        cat << 'EOF' > backend/.env
+        ROBOKASSA_MERCHANT_LOGIN=ci
+        ROBOKASSA_PASSWORD1=ci1
+        ROBOKASSA_PASSWORD2=ci2
+        ROBOKASSA_IS_TEST=1
+        SMTP_SERVER=example.invalid
+        SMTP_PORT=465
+        SMTP_USER=ci
+        SMTP_PASSWORD=ci
+        EMAIL_TO=ci@example.invalid
+        YANDEX_DISK_TOKEN=ci
+        EOF
+        cleanup() {
+          docker compose -p "${PROJECT}" -f docker-compose.yml -f docker-compose.production.yml down --remove-orphans >/dev/null 2>&1 || true
+          docker volume rm "${WRONG}" "${CORRECT}" >/dev/null 2>&1 || true
+          rm -f backend/.env
+          rm -rf "${UPLOADS}"
+        }
+        trap cleanup EXIT
+
+        if PHOTODOC_DB_VOLUME="${MISSING}" PHOTODOC_UPLOADS_SOURCE="${UPLOADS}" \
+          docker compose -p "${PROJECT}" -f docker-compose.yml -f docker-compose.production.yml create backend; then
+          echo "FAIL: missing external production volume was silently created"
+          exit 1
+        fi
+        if docker volume inspect "${MISSING}" >/dev/null 2>&1; then
+          echo "FAIL: Docker created the missing external production volume"
+          exit 1
+        fi
+        echo "MISSING_EXTERNAL_VOLUME_FAILS=true"
+
+        docker volume create "${WRONG}" >/dev/null
+        docker volume create "${CORRECT}" >/dev/null
+        BACKEND_IMAGE="$(docker compose images -q backend)"
+
+        docker run --rm --user root -e DATABASE_PATH=/data/orders.db \
+          -v "${WRONG}:/data" "${BACKEND_IMAGE}" \
+          python -c "import main, sqlite3; c=sqlite3.connect('/data/orders.db'); c.execute('PRAGMA application_id=123456'); c.commit(); c.close()"
+        if PHOTODOC_DB_VOLUME="${WRONG}" PHOTODOC_UPLOADS_SOURCE="${UPLOADS}" \
+          docker compose -p "${PROJECT}" -f docker-compose.yml -f docker-compose.production.yml \
+          run --rm --no-deps backend python -c "import main"; then
+          echo "FAIL: backend accepted the wrong database identity"
+          exit 1
+        fi
+        echo "WRONG_DB_IDENTITY_FAILS=true"
+
+        docker run --rm --user root -e DATABASE_PATH=/data/orders.db \
+          -v "${CORRECT}:/data" "${BACKEND_IMAGE}" python -c "import main"
+        PHOTODOC_DB_VOLUME="${CORRECT}" PHOTODOC_UPLOADS_SOURCE="${UPLOADS}" \
+          docker compose -p "${PROJECT}" -f docker-compose.yml -f docker-compose.production.yml \
+          run --rm --no-deps backend python -c "import main; assert main.database_readiness_ok()"
+        echo "CORRECT_DB_IDENTITY_PASSES=true"
     - name: Verify synthetic root-owned DB permission prep and rollback compatibility
       run: |
         echo "Creating synthetic root-owned database volume..."

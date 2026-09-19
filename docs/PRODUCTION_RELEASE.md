@@ -13,7 +13,8 @@ CURRENT_PRODUCTION_ALREADY_CONTAINERIZED=true
 CURRENT_RUNTIME=docker compose
 CURRENT_PATH=/opt/photodoc
 CURRENT_ENV_FILE=/opt/photodoc/backend/.env
-ROLLBACK_ARTIFACT=/opt/photodoc/release.zip
+LEGACY_ROLLBACK_ARTIFACT=/opt/photodoc/release.zip (DO NOT USE)
+ROLLBACK_FORMAT=tar.gz with POSIX paths and manifest.sha256
 
 CURRENT_FRONTEND=photodoc-frontend (bound to 127.0.0.1:8080)
 CURRENT_BACKEND=photodoc-backend (internal port 8000)
@@ -52,10 +53,11 @@ docker compose -f docker-compose.yml -f docker-compose.production.yml config
 ```
 
 ### 2.1 Storage & Runtime Mapping Contract
-- **Database Volume**: `photodoc_db` maps to physical volume `photodoc_backend-data` (`${PHOTODOC_DB_VOLUME:-photodoc_backend-data}`).
+- **Database Volume**: `photodoc_db` is an **external** volume mapping to physical volume `photodoc_backend-data` (`${PHOTODOC_DB_VOLUME:-photodoc_backend-data}`). Compose must fail if it does not already exist; it must never create an empty replacement production volume.
 - **Uploads Directory**: maps to existing host bind mount `/opt/photodoc/backend/uploads` (`${PHOTODOC_UPLOADS_SOURCE:-/opt/photodoc/backend/uploads}`).
 - **Backend Secrets**: loaded directly from existing `/opt/photodoc/backend/.env` via `env_file`.
 - **Frontend Port**: bound strictly to `127.0.0.1:${PORT:-8080}:80`.
+- **Database Identity**: production sets `PHOTODOC_REQUIRE_DB_IDENTITY=1`. SQLite `PRAGMA application_id` must equal decimal `1346650441` (big-endian ASCII `PDAI`) and the complete `orders` schema must be readable before the API starts.
 
 ---
 
@@ -95,18 +97,23 @@ For all production operations, consistently use the production Compose pair:
 ### Step 1: Preflight Verification (Fail-Closed)
 Before touching any services, verify that:
 1. All required environment variable names are present in `/opt/photodoc/backend/.env` (without printing secret values).
-2. The existing database volume is present, readable, and non-empty.
+2. The external database volume exists. Do this before any Compose create/start command.
+3. The existing legacy database is readable, non-empty, and has an `orders` table. The one-time unmarked exception is explicit and is valid only before reconciliation.
 
 ```bash
 # 1. Environment preflight
 python scripts/production_preflight.py --check-env /opt/photodoc/backend/.env
 
-# 2. Database preflight (via read-only mount)
+# 2. External volume existence (read-only inspection; MUST succeed)
+docker volume inspect "${PHOTODOC_DB_VOLUME:-photodoc_backend-data}" >/dev/null
+
+# 3. One-time legacy database preflight (via read-only mount)
 docker run --rm \
   -v photodoc_backend-data:/data:ro \
   -v "$PWD/scripts:/scripts:ro" \
+  -v "$PWD/backend:/backend:ro" \
   python:3.11-alpine \
-  python /scripts/production_preflight.py --db /data/orders.db --check-only
+  python /scripts/production_preflight.py --db /data/orders.db --check-only --allow-legacy-unmarked
 ```
 Expected output:
 ```text
@@ -128,6 +135,7 @@ DB_NONZERO=true
 ORDERS_TABLE_PRESENT=true
 SCHEMA_READABLE=true
 READY_FOR_MIGRATION=true
+LEGACY_UNMARKED=true
 ```
 If either check fails, **STOP IMMEDIATELY**. Do not proceed with cutover.
 
@@ -167,19 +175,36 @@ The production DB is partially migrated (missing `order_amount` and `created_at`
 # 1. Dry run check
 docker compose -f docker-compose.yml -f docker-compose.production.yml run --rm --no-deps \
   backend \
-  python migrations/reconcile_payment_schema.py --db /data/orders.db --check
+  python migrations/reconcile_payment_schema.py --db /data/orders.db --check --allow-legacy-unmarked
 
 # 2. Apply reconciliation
 docker compose -f docker-compose.yml -f docker-compose.production.yml run --rm --no-deps \
   backend \
-  python migrations/reconcile_payment_schema.py --db /data/orders.db --apply
+  python migrations/reconcile_payment_schema.py --db /data/orders.db --apply --allow-legacy-unmarked
 ```
 Expected output:
 ```text
 COLUMNS_ADDED=order_amount,created_at
 SCHEMA_STATUS=COMPLETE
 MIGRATION_REQUIRED=false
+DB_APPLICATION_ID=1346650441
 ```
+
+The migration uses `BEGIN IMMEDIATE`; missing `ALTER TABLE` operations, the identity update, schema verification, and integrity verification are one transaction. Any failure rolls the entire transaction back.
+
+### Step 5b: Strict Identity-Aware Preflight
+The legacy flag is forbidden after reconciliation:
+
+```bash
+docker run --rm \
+  -v photodoc_backend-data:/data:ro \
+  -v "$PWD/scripts:/scripts:ro" \
+  -v "$PWD/backend:/backend:ro" \
+  python:3.11-alpine \
+  python /scripts/production_preflight.py --db /data/orders.db --check-only
+```
+
+Required: `DB_IDENTITY_VALID=true`, `READY_FOR_STARTUP=true`, and `DB_APPLICATION_ID=1346650441`. Stop if any differs.
 
 ### Step 6: Permission Preparation for UID 1000 (`appuser`)
 The existing database file was owned by `root:root (0644)`. The new backend runs as non-root `UID 1000`. Prepare permissions:
@@ -237,7 +262,39 @@ docker compose -f docker-compose.yml -f docker-compose.production.yml exec -T ba
 > `PRODUCTION_RUNBOOK_DOWN_V=false`
 > `ROLLBACK_DELETES_PRODUCTION_VOLUME=false`
 
-### 5.1 Mode 1: Rollback to Previous Container Release (`/opt/photodoc/release.zip`)
+### 5.1 Required Rollback Artifact Gate
+
+The legacy `/opt/photodoc/release.zip` is not an acceptable rollback artifact. Build the known-good source bundle before cutover:
+
+```bash
+python scripts/build_rollback_bundle.py \
+  --source /path/to/known-good-release-tree \
+  --output /secure/rollback/photodoc-known-good-pre-upgrade.tar.gz \
+  --manifest-output /secure/rollback/manifest.sha256
+
+sha256sum /secure/rollback/photodoc-known-good-pre-upgrade.tar.gz \
+  > /secure/rollback/photodoc-known-good-pre-upgrade.tar.gz.sha256
+
+RESTORE_REHEARSAL="$(mktemp -d)"
+python scripts/verify_rollback_bundle.py \
+  --bundle /secure/rollback/photodoc-known-good-pre-upgrade.tar.gz \
+  --extract-to "${RESTORE_REHEARSAL}" \
+  --require docker-compose.yml \
+  --require backend/main.py \
+  --require frontend/nginx.conf
+```
+
+Before stopping the old production application, all of these must be true:
+
+```text
+ROLLBACK_BUNDLE_PRESENT=true
+ROLLBACK_BUNDLE_HASH_VALID=true
+ROLLBACK_LINUX_RESTORE_REHEARSED=true
+```
+
+The bundle and its manifest must contain no `.env`, uploads, database, backups, logs, tokens, private keys, credentials, or runtime state.
+
+### 5.2 Mode 1: Rollback to the Verified Previous Container Release
 
 If the new stack fails cutover:
 
@@ -245,11 +302,20 @@ If the new stack fails cutover:
    ```bash
    docker compose -f docker-compose.yml -f docker-compose.production.yml down
    ```
-2. **Restore previous application files**:
+2. **Verify the immutable bundle hash, then restore into an empty staging directory**:
    ```bash
-   unzip -o /opt/photodoc/release.zip -d /opt/photodoc/
+   cd /secure/rollback
+   sha256sum -c photodoc-known-good-pre-upgrade.tar.gz.sha256
+   RESTORE_DIR="$(mktemp -d)"
+   python /opt/photodoc/scripts/verify_rollback_bundle.py \
+     --bundle photodoc-known-good-pre-upgrade.tar.gz \
+     --extract-to "${RESTORE_DIR}" \
+     --require docker-compose.yml \
+     --require backend/main.py \
+     --require frontend/nginx.conf
    ```
-3. **Restore database backup (if schema rollback is required)**:
+3. Install the verified staged release files using the approved release procedure. Preserve `.env`, uploads, database volumes, backups, and logs; none are supplied by the bundle.
+4. **Restore database backup (if schema rollback is required)**:
    ```bash
    docker run --rm \
      -v photodoc_backend-data:/data \
@@ -257,18 +323,18 @@ If the new stack fails cutover:
      alpine \
      cp "/backup/${BACKUP_NAME}" /data/orders.db
    ```
-4. **Permissions compatibility on rollback**:
+5. **Permissions compatibility on rollback**:
    The previous production backend runs as `root`. Root retains full read/write access to files owned by `UID 1000` (`OLD_ROOT_BACKEND_CAN_ACCESS_UID1000_DB=true`). No reverse chown is required.
-5. **Start previous stack**:
+6. **Start previous stack**:
    ```bash
    docker compose up -d
    ```
-6. **Verify rollback**:
+7. **Verify rollback**:
    ```bash
    curl -f http://127.0.0.1:8080/api/health
    ```
 
-### 5.2 Mode 2: Future Git-Based Container Releases Rollback
+### 5.3 Mode 2: Future Git-Based Container Releases Rollback
 
 For future releases managed via Git commits:
 
