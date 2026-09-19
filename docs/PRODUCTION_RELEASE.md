@@ -12,6 +12,7 @@ The production environment on `79.137.196.14` was audited and is **already conta
 CURRENT_PRODUCTION_ALREADY_CONTAINERIZED=true
 CURRENT_RUNTIME=docker compose
 CURRENT_PATH=/opt/photodoc
+CURRENT_ENV_FILE=/opt/photodoc/backend/.env
 ROLLBACK_ARTIFACT=/opt/photodoc/release.zip
 
 CURRENT_FRONTEND=photodoc-frontend (bound to 127.0.0.1:8080)
@@ -44,28 +45,27 @@ READY_FOR_PRODUCTION_DEPLOY=false
 
 ## 2. Storage Strategy & Production Overlay
 
-To safely reuse the existing production database and uploads without data loss or path divergence, deployment uses the production overlay:
+To safely reuse the existing production database, uploads, and runtime credentials without data loss or path divergence, deployment uses the production overlay:
 
 ```bash
 docker compose -f docker-compose.yml -f docker-compose.production.yml config
 ```
 
-### 2.1 Storage Mapping Contract
+### 2.1 Storage & Runtime Mapping Contract
 - **Database Volume**: `photodoc_db` maps to physical volume `photodoc_backend-data` (`${PHOTODOC_DB_VOLUME:-photodoc_backend-data}`).
 - **Uploads Directory**: maps to existing host bind mount `/opt/photodoc/backend/uploads` (`${PHOTODOC_UPLOADS_SOURCE:-/opt/photodoc/backend/uploads}`).
+- **Backend Secrets**: loaded directly from existing `/opt/photodoc/backend/.env` via `env_file`.
 - **Frontend Port**: bound strictly to `127.0.0.1:${PORT:-8080}:80`.
 
 ---
 
 ## 3. Required Environment Variables
 
-All production environment variables reside in `/opt/photodoc/.env`. Restrict permissions: `chmod 600 /opt/photodoc/.env`.
+All backend production secrets reside in `/opt/photodoc/backend/.env`. Restrict permissions: `chmod 600 /opt/photodoc/backend/.env`.
 
 | Variable | Description | Target Requirement |
 | :--- | :--- | :--- |
-| `DATABASE_PATH` | Path inside container | `/data/orders.db` |
-| `PHOTODOC_DB_VOLUME` | Physical volume name | `photodoc_backend-data` |
-| `PHOTODOC_UPLOADS_SOURCE` | Host uploads path | `/opt/photodoc/backend/uploads` |
+| `DATABASE_PATH` | Path inside container | `/data/orders.db` (deployment managed) |
 | `ROBOKASSA_MERCHANT_LOGIN` | Robokassa Merchant Login | *Production Login* |
 | `ROBOKASSA_PASSWORD1` | Payment Pass1 | *Production Pass1* |
 | `ROBOKASSA_PASSWORD2` | Notification Pass2 | *Production Pass2* |
@@ -79,19 +79,29 @@ All production environment variables reside in `/opt/photodoc/.env`. Restrict pe
 | `PORT` | Localhost bind | `8080` (bound to `127.0.0.1`) |
 | `VITE_API_URL` | Frontend API route | `/api` |
 | `VITE_YANDEX_METRIKA_ID` | Metrika ID | *Production ID* |
-| `VITE_SUPABASE_URL` | Supabase URL | `https://*.supabase.co` |
-| `VITE_SUPABASE_ANON_KEY` | Public Anon Key | *Rotated Public Anon Key* |
+| `VITE_SUPABASE_URL` | Supabase URL | *Optional / Unused in Production Bundle* |
+| `VITE_SUPABASE_ANON_KEY` | Public Anon Key | *Optional / Unused in Production Bundle* |
+
+> **Note on Frontend Supabase Variables**:
+> Source audit confirms `SUPABASE_CLIENT_IMPORTED_IN_PRODUCTION_BUNDLE=false`. The client `frontend/src/lib/supabase.js` is not imported anywhere in the production SPA. Therefore, missing Supabase credentials do not block the frontend build.
 
 ---
 
 ## 4. Production Upgrade Sequence (Step-by-Step)
 
-Follow this deterministic sequence for upgrading `/opt/photodoc`:
+For all production operations, consistently use the production Compose pair:
+`docker compose -f docker-compose.yml -f docker-compose.production.yml ...`
 
 ### Step 1: Preflight Verification (Fail-Closed)
-Before touching any services, verify that the existing database volume is present, readable, and non-empty:
+Before touching any services, verify that:
+1. All required environment variable names are present in `/opt/photodoc/backend/.env` (without printing secret values).
+2. The existing database volume is present, readable, and non-empty.
 
 ```bash
+# 1. Environment preflight
+python scripts/production_preflight.py --check-env /opt/photodoc/backend/.env
+
+# 2. Database preflight (via read-only mount)
 docker run --rm \
   -v photodoc_backend-data:/data:ro \
   -v "$PWD/scripts:/scripts:ro" \
@@ -100,18 +110,31 @@ docker run --rm \
 ```
 Expected output:
 ```text
+ROBOKASSA_MERCHANT_LOGIN=PRESENT
+ROBOKASSA_PASSWORD1=PRESENT
+ROBOKASSA_PASSWORD2=PRESENT
+ROBOKASSA_IS_TEST=PRESENT
+SMTP_SERVER=PRESENT
+SMTP_PORT=PRESENT
+SMTP_USER=PRESENT
+SMTP_PASSWORD=PRESENT
+EMAIL_TO=PRESENT
+YANDEX_DISK_TOKEN=PRESENT
+ENV_SECRET_VALUES_PRINTED=false
+READY_FOR_CUTOVER=true
+
 DB_EXISTS=true
 DB_NONZERO=true
 ORDERS_TABLE_PRESENT=true
 SCHEMA_READABLE=true
 READY_FOR_MIGRATION=true
 ```
-If this fails, **STOP IMMEDIATELY**. Do not proceed with cutover.
+If either check fails, **STOP IMMEDIATELY**. Do not proceed with cutover.
 
 ### Step 2: Stop Old Backend Writer
 Stop the existing backend to halt writes:
 ```bash
-docker compose stop backend
+docker compose -f docker-compose.yml -f docker-compose.production.yml stop backend
 ```
 *(Do NOT run `docker compose down -v`! Managed volumes must be preserved).*
 
@@ -138,18 +161,16 @@ docker run --rm \
 ```
 
 ### Step 5: Idempotent Schema Reconciliation
-The production DB is partially migrated (missing `order_amount` and `created_at`). Run `reconcile_payment_schema.py`:
+The production DB is partially migrated (missing `order_amount` and `created_at`). Run `reconcile_payment_schema.py` using the production compose overlay:
 
 ```bash
 # 1. Dry run check
-docker compose run --rm --no-deps \
-  -v photodoc_backend-data:/data \
+docker compose -f docker-compose.yml -f docker-compose.production.yml run --rm --no-deps \
   backend \
   python migrations/reconcile_payment_schema.py --db /data/orders.db --check
 
 # 2. Apply reconciliation
-docker compose run --rm --no-deps \
-  -v photodoc_backend-data:/data \
+docker compose -f docker-compose.yml -f docker-compose.production.yml run --rm --no-deps \
   backend \
   python migrations/reconcile_payment_schema.py --db /data/orders.db --apply
 ```
@@ -164,8 +185,7 @@ MIGRATION_REQUIRED=false
 The existing database file was owned by `root:root (0644)`. The new backend runs as non-root `UID 1000`. Prepare permissions:
 
 ```bash
-docker compose run --rm --no-deps \
-  -v photodoc_backend-data:/data \
+docker compose -f docker-compose.yml -f docker-compose.production.yml run --rm --no-deps \
   --user root \
   backend \
   sh -c '
@@ -199,7 +219,7 @@ curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8080/og/photodoc-og.jp
 # Expected: 200
 
 # 4. Backend database write verification
-docker compose exec -T backend sh -c '
+docker compose -f docker-compose.yml -f docker-compose.production.yml exec -T backend sh -c '
   test -w /data &&
   test -w /data/orders.db &&
   test -w /app/uploads

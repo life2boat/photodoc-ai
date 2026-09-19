@@ -82,13 +82,45 @@ jobs:
     - uses: actions/checkout@v4
     - name: Validate generic Docker Compose config
       run: docker compose config
-    - name: Validate production overlay Docker Compose config
+    - name: Verify synthetic production env file loading and non-override
       run: |
-        docker compose -f docker-compose.yml -f docker-compose.production.yml config
+        cat << 'EOF' > backend/.env
+        ROBOKASSA_MERCHANT_LOGIN=ci
+        ROBOKASSA_PASSWORD1=ci1
+        ROBOKASSA_PASSWORD2=ci2
+        ROBOKASSA_IS_TEST=1
+        SMTP_SERVER=example.invalid
+        SMTP_PORT=465
+        SMTP_USER=ci
+        SMTP_PASSWORD=ci
+        EMAIL_TO=ci@example.invalid
+        YANDEX_DISK_TOKEN=ci
+        EOF
+
+        # Run preflight env verification check
+        python scripts/production_preflight.py --check-env backend/.env
+
+        # Run compose config on base + production overlay
         PROD_CONFIG=$(docker compose -f docker-compose.yml -f docker-compose.production.yml config)
         echo "${PROD_CONFIG}" | grep -q "photodoc_backend-data"
         echo "${PROD_CONFIG}" | grep -q "/opt/photodoc/backend/uploads"
-        echo "Production overlay configuration verified."
+
+        # Check that synthetic values are loaded from env_file
+        echo "${PROD_CONFIG}" | grep -q "ROBOKASSA_MERCHANT_LOGIN: ci"
+        echo "${PROD_CONFIG}" | grep -q "ROBOKASSA_PASSWORD1: ci1"
+        echo "${PROD_CONFIG}" | grep -q "ROBOKASSA_PASSWORD2: ci2"
+        echo "${PROD_CONFIG}" | grep -q "SMTP_SERVER: example.invalid"
+        echo "PRODUCTION_ENV_FILE_LOADED=true"
+
+        # Verify that generic base environment does NOT override values with empty strings
+        if echo "${PROD_CONFIG}" | grep -q 'ROBOKASSA_MERCHANT_LOGIN: ""'; then
+          echo "FAIL: generic base environment overrode ROBOKASSA_MERCHANT_LOGIN with empty string!"
+          exit 1
+        fi
+        echo "EMPTY_SECRET_OVERRIDE=false"
+
+        # Clean up synthetic env file
+        rm -f backend/.env
     - name: Build Docker images
       run: docker compose build
     - name: Verify synthetic root-owned DB permission prep and rollback compatibility

@@ -460,12 +460,13 @@ async def create_order(
 
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
+        created_at_now = datetime.utcnow().isoformat()
         cursor.execute(
             """
             INSERT INTO orders (
                 name, phone, email, format, paper, crop, comment, filename,
-                status, payment_status, order_amount, payment_amount
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'new', 'unpaid', ?, ?)
+                status, payment_status, order_amount, payment_amount, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'new', 'unpaid', ?, ?, ?)
             """,
             (
                 name.strip(),
@@ -478,6 +479,7 @@ async def create_order(
                 filenames_joined,
                 formatted_order_amount,
                 formatted_order_amount,
+                created_at_now,
             ),
         )
         conn.commit()

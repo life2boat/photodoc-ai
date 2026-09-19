@@ -12,6 +12,8 @@
 
 services:
   backend:
+    env_file:
+      - ./backend/.env
     volumes:
       - photodoc_db:/data
       - ${PHOTODOC_UPLOADS_SOURCE:-/opt/photodoc/backend/uploads}:/app/uploads
