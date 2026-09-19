@@ -25,11 +25,12 @@ BACKEND_DIR = Path(__file__).resolve().parent.parent
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
-from migrations.reconcile_payment_schema import (
+from migrations.reconcile_payment_schema import (  # noqa: E402
     EXPECTED_COLUMNS,
     get_existing_columns,
     reconcile_schema,
 )
+from db_contract import APPLICATION_ID  # noqa: E402
 
 
 @pytest.fixture
@@ -66,14 +67,14 @@ def test_fixture_a_minimal_legacy_schema(temp_db):
     conn.close()
 
     # Check mode first
-    check_result = reconcile_schema(temp_db, apply=False)
+    check_result = reconcile_schema(temp_db, apply=False, allow_legacy_unmarked=True)
     assert check_result["status"] == "PARTIAL"
     assert check_result["migration_required"] is True
     assert "payment_status" in check_result["missing_columns"]
     assert "order_amount" in check_result["missing_columns"]
 
     # Apply mode
-    apply_result = reconcile_schema(temp_db, apply=True)
+    apply_result = reconcile_schema(temp_db, apply=True, allow_legacy_unmarked=True)
     assert apply_result["status"] == "COMPLETE"
     assert apply_result["migration_required"] is False
     assert len(apply_result["columns_added"]) > 0
@@ -133,13 +134,13 @@ def test_fixture_b_production_partial_schema(temp_db):
     conn.close()
 
     # Verify check mode identifies exactly the missing columns
-    check_result = reconcile_schema(temp_db, apply=False)
+    check_result = reconcile_schema(temp_db, apply=False, allow_legacy_unmarked=True)
     assert check_result["status"] == "PARTIAL"
     assert check_result["migration_required"] is True
     assert set(check_result["missing_columns"]) == {"order_amount", "created_at"}
 
     # Apply reconciliation
-    apply_result = reconcile_schema(temp_db, apply=True)
+    apply_result = reconcile_schema(temp_db, apply=True, allow_legacy_unmarked=True)
     assert apply_result["status"] == "COMPLETE"
     assert set(apply_result["columns_added"]) == {"order_amount", "created_at"}
 
@@ -167,8 +168,8 @@ def test_fixture_b_production_partial_schema(temp_db):
 # ===========================================================================
 def test_fixture_c_already_complete_schema(temp_db):
     """
-    Fixture C: Already fully migrated DB.
-    Expected: check reports COMPLETE, apply is a clean no-op with zero changes.
+    Fixture C: Complete legacy schema without an application identity.
+    Expected: schema is unchanged while apply stamps the PhotoDoc identity.
     """
     conn = sqlite3.connect(temp_db)
     conn.execute("""
@@ -196,15 +197,16 @@ def test_fixture_c_already_complete_schema(temp_db):
     conn.commit()
     conn.close()
 
-    check_result = reconcile_schema(temp_db, apply=False)
-    assert check_result["status"] == "COMPLETE"
-    assert check_result["migration_required"] is False
+    check_result = reconcile_schema(temp_db, apply=False, allow_legacy_unmarked=True)
+    assert check_result["status"] == "PARTIAL"
+    assert check_result["migration_required"] is True
     assert len(check_result["missing_columns"]) == 0
 
-    apply_result = reconcile_schema(temp_db, apply=True)
+    apply_result = reconcile_schema(temp_db, apply=True, allow_legacy_unmarked=True)
     assert apply_result["status"] == "COMPLETE"
     assert apply_result["migration_required"] is False
     assert len(apply_result["columns_added"]) == 0
+    assert apply_result["application_id"] == APPLICATION_ID
 
 
 # ===========================================================================
@@ -221,7 +223,7 @@ def test_reconciliation_idempotency(temp_db):
     conn.commit()
     conn.close()
 
-    res1 = reconcile_schema(temp_db, apply=True)
+    res1 = reconcile_schema(temp_db, apply=True, allow_legacy_unmarked=True)
     assert res1["status"] == "COMPLETE"
     assert len(res1["columns_added"]) == len(EXPECTED_COLUMNS)
 
@@ -229,6 +231,60 @@ def test_reconciliation_idempotency(temp_db):
     assert res2["status"] == "COMPLETE"
     assert len(res2["columns_added"]) == 0
     assert res2["migration_required"] is False
+
+
+def test_migration_failure_rolls_back_schema_and_application_id(temp_db):
+    """A failure after transactional DDL must leave both schema and identity unchanged."""
+    conn = sqlite3.connect(temp_db)
+    conn.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, name TEXT, phone TEXT)")
+    conn.commit()
+    schema_before = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='orders'"
+    ).fetchone()[0]
+    application_id_before = conn.execute("PRAGMA application_id").fetchone()[0]
+    conn.close()
+
+    with pytest.raises(RuntimeError, match="Injected migration failure"):
+        reconcile_schema(
+            temp_db,
+            apply=True,
+            allow_legacy_unmarked=True,
+            failure_after_columns=1,
+        )
+
+    conn = sqlite3.connect(temp_db)
+    schema_after = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='orders'"
+    ).fetchone()[0]
+    application_id_after = conn.execute("PRAGMA application_id").fetchone()[0]
+    conn.close()
+    assert schema_after == schema_before
+    assert application_id_after == application_id_before == 0
+
+
+def test_migration_sets_stable_photodoc_application_id(temp_db):
+    conn = sqlite3.connect(temp_db)
+    conn.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, name TEXT, phone TEXT)")
+    conn.commit()
+    conn.close()
+
+    result = reconcile_schema(temp_db, apply=True, allow_legacy_unmarked=True)
+    assert result["application_id"] == APPLICATION_ID == 0x50444149
+
+    conn = sqlite3.connect(temp_db)
+    assert conn.execute("PRAGMA application_id").fetchone()[0] == APPLICATION_ID
+    conn.close()
+
+
+def test_wrong_application_identity_is_rejected_even_in_legacy_mode(temp_db):
+    conn = sqlite3.connect(temp_db)
+    conn.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, name TEXT, phone TEXT)")
+    conn.execute("PRAGMA application_id = 123456")
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(RuntimeError, match="another application"):
+        reconcile_schema(temp_db, apply=True, allow_legacy_unmarked=True)
 
 
 # ===========================================================================
@@ -263,7 +319,7 @@ def test_row_preservation(temp_db):
     conn.close()
 
     # Reconcile
-    reconcile_schema(temp_db, apply=True)
+    reconcile_schema(temp_db, apply=True, allow_legacy_unmarked=True)
 
     conn = sqlite3.connect(temp_db)
     count_after = conn.execute("SELECT COUNT(*) FROM orders").fetchone()[0]
@@ -328,26 +384,85 @@ def test_preflight_missing_orders_table(temp_db):
     assert "READY_FOR_MIGRATION=false" in proc.stdout
 
 
-def test_preflight_valid_db(temp_db):
-    """Preflight succeeds on a valid DB and reports missing columns."""
+def test_preflight_legacy_db_requires_explicit_flag(temp_db):
+    """Legacy application_id=0 is rejected unless explicitly allowed."""
     conn = sqlite3.connect(temp_db)
     conn.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, name TEXT, phone TEXT);")
     conn.commit()
     conn.close()
 
     preflight_script = BACKEND_DIR.parent / "scripts" / "production_preflight.py"
-    proc = subprocess.run(
+    strict_proc = subprocess.run(
         [sys.executable, str(preflight_script), "--db", str(temp_db)],
         capture_output=True,
         text=True,
     )
-    assert proc.returncode == 0
-    assert "DB_EXISTS=true" in proc.stdout
-    assert "DB_NONZERO=true" in proc.stdout
-    assert "ORDERS_TABLE_PRESENT=true" in proc.stdout
-    assert "SCHEMA_READABLE=true" in proc.stdout
-    assert "READY_FOR_MIGRATION=true" in proc.stdout
-    assert "payment_status" in proc.stdout
+    assert strict_proc.returncode != 0
+    assert "LEGACY_UNMARKED=true" in strict_proc.stdout
+    assert "READY_FOR_STARTUP=false" in strict_proc.stdout
+
+    legacy_proc = subprocess.run(
+        [
+            sys.executable,
+            str(preflight_script),
+            "--db",
+            str(temp_db),
+            "--allow-legacy-unmarked",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert legacy_proc.returncode == 0
+    assert "READY_FOR_MIGRATION=true" in legacy_proc.stdout
+    assert "payment_status" in legacy_proc.stdout
+
+
+def test_strict_preflight_accepts_only_complete_photodoc_identity(temp_db):
+    conn = sqlite3.connect(temp_db)
+    conn.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, name TEXT, phone TEXT)")
+    conn.commit()
+    conn.close()
+    reconcile_schema(temp_db, apply=True, allow_legacy_unmarked=True)
+
+    preflight_script = BACKEND_DIR.parent / "scripts" / "production_preflight.py"
+    valid = subprocess.run(
+        [sys.executable, str(preflight_script), "--db", str(temp_db)],
+        capture_output=True,
+        text=True,
+    )
+    assert valid.returncode == 0
+    assert f"DB_APPLICATION_ID={APPLICATION_ID}" in valid.stdout
+    assert "DB_IDENTITY_VALID=true" in valid.stdout
+    assert "READY_FOR_STARTUP=true" in valid.stdout
+
+    conn = sqlite3.connect(temp_db)
+    conn.execute("PRAGMA application_id = 123456")
+    conn.commit()
+    conn.close()
+    invalid = subprocess.run(
+        [sys.executable, str(preflight_script), "--db", str(temp_db)],
+        capture_output=True,
+        text=True,
+    )
+    assert invalid.returncode != 0
+    assert "DB_IDENTITY_VALID=false" in invalid.stdout
+    assert "READY_FOR_STARTUP=false" in invalid.stdout
+
+
+def test_health_fails_when_database_identity_changes(temp_db, monkeypatch):
+    from fastapi.testclient import TestClient
+    import main
+
+    monkeypatch.setattr(main, "DB_PATH", temp_db)
+    main.init_db()
+    conn = sqlite3.connect(temp_db)
+    conn.execute("PRAGMA application_id = 123456")
+    conn.commit()
+    conn.close()
+
+    response = TestClient(main.app).get("/api/health")
+    assert response.status_code == 503
+    assert response.json() == {"status": "unavailable"}
 
 
 # ===========================================================================
@@ -370,8 +485,6 @@ def test_permission_prep_and_rollback_semantics(temp_db):
 
     # If running on POSIX with chown available, test chown semantics
     if hasattr(os, "chown") and os.name == "posix":
-        # Check current UID
-        current_uid = os.getuid()
         # Verify write test
         with open(temp_db, "a") as f:
             f.write("")
@@ -472,7 +585,7 @@ def test_reconciled_db_order_creation_sets_created_at_and_preserves_old_null(tem
     conn.close()
 
     # Reconcile schema
-    reconcile_res = reconcile_schema(temp_db, apply=True)
+    reconcile_res = reconcile_schema(temp_db, apply=True, allow_legacy_unmarked=True)
     assert reconcile_res["status"] == "COMPLETE"
     assert set(reconcile_res["columns_added"]) == {"order_amount", "created_at"}
 
@@ -554,7 +667,13 @@ def test_preflight_valid_db_unchanged(temp_db):
 
     preflight_script = BACKEND_DIR.parent / "scripts" / "production_preflight.py"
     proc = subprocess.run(
-        [sys.executable, str(preflight_script), "--db", str(temp_db)],
+        [
+            sys.executable,
+            str(preflight_script),
+            "--db",
+            str(temp_db),
+            "--allow-legacy-unmarked",
+        ],
         capture_output=True,
         text=True,
     )

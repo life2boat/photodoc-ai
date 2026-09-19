@@ -1,25 +1,26 @@
-"""
-PhotoDoc AI — Schema Reconciliation Migration Tool
-Idempotently reconciles existing SQLite databases with the canonical PhotoDoc schema.
+#!/usr/bin/env python3
+"""Atomically reconcile the PhotoDoc SQLite schema and application identity."""
 
-Safely handles:
-1. Legacy schemas (missing payment fields)
-2. Production partial schemas (e.g. missing only order_amount and created_at)
-3. Already complete schemas (no-op)
-
-Never deletes columns, never alters existing rows or values.
-Supports --check (default/dry-run) and --apply modes.
-"""
+from __future__ import annotations
 
 import argparse
 import os
 import sqlite3
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List
 
-# Canonical list of expected columns beyond minimal legacy id, name, phone
-# Map of column_name -> SQL type / default specification
+BACKEND_DIR = Path(__file__).resolve().parent.parent
+if str(BACKEND_DIR) not in sys.path:
+    sys.path.insert(0, str(BACKEND_DIR))
+
+from db_contract import (  # noqa: E402
+    APPLICATION_ID,
+    EXPECTED_ORDERS_COLUMNS,
+    read_application_id,
+)
+
+
 EXPECTED_COLUMNS: Dict[str, str] = {
     "email": "TEXT",
     "format": "TEXT",
@@ -40,129 +41,134 @@ EXPECTED_COLUMNS: Dict[str, str] = {
 
 
 def get_existing_columns(conn: sqlite3.Connection, table_name: str = "orders") -> List[str]:
-    """Return list of existing column names for the given table in lowercase."""
-    cursor = conn.cursor()
-    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table_name,))
-    if not cursor.fetchone():
+    table = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table_name,)
+    ).fetchone()
+    if not table:
         raise RuntimeError(f"Table '{table_name}' does not exist in database.")
+    return [str(row[1]).lower() for row in conn.execute(f"PRAGMA table_info({table_name})")]
 
-    cursor.execute(f"PRAGMA table_info({table_name})")
-    rows = cursor.fetchall()
-    return [row[1].lower() for row in rows]
+
+def _validate_source_identity(application_id: int, allow_legacy_unmarked: bool) -> None:
+    if application_id == APPLICATION_ID:
+        return
+    if application_id == 0 and allow_legacy_unmarked:
+        return
+    if application_id == 0:
+        raise RuntimeError(
+            "Database is legacy/unmarked; pass --allow-legacy-unmarked only during the "
+            "controlled production reconciliation"
+        )
+    raise RuntimeError("Database application_id belongs to another application")
 
 
 def reconcile_schema(
     db_path: str | Path,
     apply: bool = False,
+    *,
+    allow_legacy_unmarked: bool = False,
+    failure_after_columns: int | None = None,
 ) -> Dict[str, object]:
-    """
-    Inspects orders table in db_path.
-    If apply is False (check mode):
-        Identifies missing columns without mutating DB.
-    If apply is True:
-        Adds missing columns via ALTER TABLE orders ADD COLUMN ...
-
-    Returns structured result dict.
-    """
+    """Inspect or atomically reconcile schema plus the PhotoDoc application_id."""
     db_file = Path(db_path)
-    if not db_file.exists():
+    if not db_file.exists() or not db_file.is_file():
         raise FileNotFoundError(f"Database file not found: {db_file}")
+    if db_file.stat().st_size <= 0:
+        raise RuntimeError("Database file is empty")
 
-    conn = sqlite3.connect(str(db_file))
+    conn = sqlite3.connect(str(db_file), timeout=10.0)
     try:
+        application_id_before = read_application_id(conn)
+        _validate_source_identity(application_id_before, allow_legacy_unmarked)
         existing_cols = get_existing_columns(conn, "orders")
-        missing = [col for col in EXPECTED_COLUMNS if col.lower() not in existing_cols]
+        missing = [column for column in EXPECTED_COLUMNS if column not in existing_cols]
 
         if not apply:
-            status = "COMPLETE" if not missing else "PARTIAL"
             return {
-                "status": status,
+                "status": "COMPLETE" if not missing and application_id_before == APPLICATION_ID else "PARTIAL",
                 "missing_columns": missing,
                 "columns_added": [],
-                "migration_required": len(missing) > 0,
-                "total_expected": len(EXPECTED_COLUMNS),
+                "migration_required": bool(missing or application_id_before != APPLICATION_ID),
+                "total_expected": len(EXPECTED_ORDERS_COLUMNS),
                 "existing_count": len(existing_cols),
+                "application_id": application_id_before,
             }
 
-        # Apply mode
-        added = []
-        if missing:
-            cursor = conn.cursor()
-            for col in missing:
-                col_type = EXPECTED_COLUMNS[col]
-                sql = f"ALTER TABLE orders ADD COLUMN {col} {col_type};"
-                cursor.execute(sql)
-                added.append(col)
-            conn.commit()
+        cursor = conn.cursor()
+        cursor.execute("BEGIN IMMEDIATE")
+        added: list[str] = []
+        try:
+            for column in missing:
+                cursor.execute(
+                    f"ALTER TABLE orders ADD COLUMN {column} {EXPECTED_COLUMNS[column]};"
+                )
+                added.append(column)
+                if failure_after_columns is not None and len(added) >= failure_after_columns:
+                    raise RuntimeError("Injected migration failure")
 
-            # Verify schema after migration
+            cursor.execute(f"PRAGMA application_id = {APPLICATION_ID}")
+
             after_cols = get_existing_columns(conn, "orders")
-            still_missing = [col for col in EXPECTED_COLUMNS if col.lower() not in after_cols]
+            still_missing = [
+                column for column in EXPECTED_ORDERS_COLUMNS if column not in after_cols
+            ]
             if still_missing:
                 raise RuntimeError(f"Columns still missing after migration: {still_missing}")
+            if read_application_id(conn) != APPLICATION_ID:
+                raise RuntimeError("Application identity was not applied")
 
-            # Verify integrity
-            cursor.execute("PRAGMA integrity_check;")
-            integrity = cursor.fetchone()
+            integrity = cursor.execute("PRAGMA integrity_check;").fetchone()
             if not integrity or integrity[0] != "ok":
                 raise RuntimeError(f"Integrity check failed: {integrity}")
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
 
         return {
             "status": "COMPLETE",
             "missing_columns": [],
             "columns_added": added,
             "migration_required": False,
-            "total_expected": len(EXPECTED_COLUMNS),
+            "total_expected": len(EXPECTED_ORDERS_COLUMNS),
             "existing_count": len(get_existing_columns(conn, "orders")),
+            "application_id": read_application_id(conn),
         }
     finally:
         conn.close()
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Reconcile PhotoDoc orders table schema")
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--db", default=os.getenv("DATABASE_PATH", "/data/orders.db"))
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--check", action="store_true", help="Read-only inspection (default)")
+    mode.add_argument("--apply", action="store_true", help="Apply reconciliation atomically")
     parser.add_argument(
-        "--db",
-        default=os.getenv("DATABASE_PATH", "/data/orders.db"),
-        help="Path to SQLite database file",
-    )
-    parser.add_argument(
-        "--check",
+        "--allow-legacy-unmarked",
         action="store_true",
-        default=False,
-        help="Check schema without applying changes (default)",
+        help="Explicitly accept application_id=0 for the one-time controlled migration",
     )
-    parser.add_argument(
-        "--apply",
-        action="store_true",
-        default=False,
-        help="Apply missing column migrations",
-    )
-
     args = parser.parse_args()
-    db_path = Path(args.db)
-
-    # Safe default: unless --apply is explicitly specified, run in check mode
-    apply_mode = args.apply
 
     try:
-        result = reconcile_schema(db_path, apply=apply_mode)
-    except Exception as e:
-        print(f"ERROR: {e}", file=sys.stderr)
+        result = reconcile_schema(
+            args.db,
+            apply=args.apply,
+            allow_legacy_unmarked=args.allow_legacy_unmarked,
+        )
+    except Exception as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 
-    if not apply_mode:
-        print(f"SCHEMA_STATUS={result['status']}")
-        print(f"MISSING_COLUMNS={','.join(result['missing_columns'])}")
-        print(f"MIGRATION_REQUIRED={'true' if result['migration_required'] else 'false'}")
-    else:
-        if result["columns_added"]:
-            print(f"COLUMNS_ADDED={','.join(result['columns_added'])}")
-        print(f"SCHEMA_STATUS={result['status']}")
-        print(f"MIGRATION_REQUIRED={'true' if result['migration_required'] else 'false'}")
-
+    print(f"SCHEMA_STATUS={result['status']}")
+    print(f"MISSING_COLUMNS={','.join(result['missing_columns'])}")
+    if args.apply and result["columns_added"]:
+        print(f"COLUMNS_ADDED={','.join(result['columns_added'])}")
+    print(f"DB_APPLICATION_ID={result['application_id']}")
+    print(f"MIGRATION_REQUIRED={'true' if result['migration_required'] else 'false'}")
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())
