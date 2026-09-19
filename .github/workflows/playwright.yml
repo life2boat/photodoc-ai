@@ -189,50 +189,101 @@ jobs:
           docker compose -p "${PROJECT}" -f docker-compose.yml -f docker-compose.production.yml \
           run --rm --no-deps backend python -c "import main; assert main.database_readiness_ok()"
         echo "CORRECT_DB_IDENTITY_PASSES=true"
-    - name: Verify synthetic root-owned DB permission prep and rollback compatibility
+    - name: Verify production-like root migration and storage permission cutover
       run: |
-        echo "Creating synthetic root-owned database volume..."
-        docker volume create test_synthetic_db
-        docker run --rm -v test_synthetic_db:/data --user root alpine sh -c '
-          touch /data/orders.db &&
-          chown 0:0 /data/orders.db &&
+        set -eu
+        DB_VOLUME="photodoc-root-owned-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+        UPLOADS="$PWD/.ci-root-owned-uploads"
+        export PHOTODOC_DB_VOLUME="${DB_VOLUME}"
+        export PHOTODOC_UPLOADS_SOURCE="${UPLOADS}"
+        COMPOSE="docker compose -f docker-compose.yml -f docker-compose.production.yml"
+
+        mkdir -p "${UPLOADS}"
+        cat << 'EOF' > backend/.env
+        ROBOKASSA_MERCHANT_LOGIN=ci
+        ROBOKASSA_PASSWORD1=ci_pass1
+        ROBOKASSA_PASSWORD2=ci_pass2
+        ROBOKASSA_IS_TEST=1
+        SMTP_SERVER=example.invalid
+        SMTP_PORT=465
+        SMTP_USER=ci@example.invalid
+        SMTP_PASSWORD=ci_password
+        EMAIL_TO=ci@example.invalid
+        YANDEX_DISK_TOKEN=ci_token
+        EOF
+        cleanup() {
+          ${COMPOSE} down --remove-orphans >/dev/null 2>&1 || true
+          docker volume rm "${DB_VOLUME}" >/dev/null 2>&1 || true
+          rm -f backend/.env
+          rm -rf "${UPLOADS}"
+        }
+        trap cleanup EXIT
+
+        docker volume create "${DB_VOLUME}" >/dev/null
+        ${COMPOSE} run --rm --no-deps --user root backend python -c \
+          "import sqlite3; c=sqlite3.connect('/data/orders.db'); c.execute('CREATE TABLE orders (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, phone TEXT)'); c.execute(\"INSERT INTO orders (name, phone) VALUES ('synthetic', '+70000000000')\"); c.commit(); c.close()"
+        docker run --rm --user root -v "${DB_VOLUME}:/data" -v "${UPLOADS}:/uploads" alpine sh -c '
+          chown 0:0 /data /data/orders.db /uploads &&
+          chmod 0755 /data /uploads &&
           chmod 0644 /data/orders.db &&
-          ls -ld /data/orders.db
+          test "$(stat -c "%u:%g %a" /data/orders.db)" = "0:0 644" &&
+          test "$(stat -c "%u:%g %a" /uploads)" = "0:0 755"
         '
-        echo "ROOT_OWNED_DB_BEFORE=true"
+        echo "CURRENT_DB_OWNER=root"
+        echo "BACKEND_UID=1000"
 
-        echo "Verifying backend appuser (UID 1000) cannot write to root-owned orders.db before prep..."
-        if docker run --rm -v test_synthetic_db:/data --user 1000:1000 alpine sh -c 'test -w /data/orders.db'; then
-          echo "FAIL: appuser was able to write to root-owned DB before prep"
+        if ${COMPOSE} run --rm --no-deps backend test -w /data/orders.db; then
+          echo "FAIL: appuser could write the root-owned database before preparation"
           exit 1
-        else
-          echo "APPUSER_CAN_WRITE_BEFORE=false"
         fi
+        echo "APPUSER_DB_WRITE_BEFORE=false"
+        if ${COMPOSE} run --rm --no-deps backend test -w /app/uploads; then
+          echo "FAIL: appuser could write the root-owned uploads directory before preparation"
+          exit 1
+        fi
+        echo "APPUSER_UPLOAD_WRITE_BEFORE=false"
 
-        echo "Executing permission preparation command..."
-        docker compose run --rm --no-deps -v test_synthetic_db:/data --user root backend sh -c '
-          chown -R 1000:1000 /data &&
-          test -w /data/orders.db
+        ${COMPOSE} run --rm --no-deps --user root backend \
+          python migrations/reconcile_payment_schema.py \
+            --db /data/orders.db \
+            --apply \
+            --allow-legacy-unmarked
+        echo "PRODUCTION_MIGRATION_CAN_WRITE_ROOT_OWNED_DB=true"
+        echo "ROOT_MIGRATION_ON_ROOT_OWNED_DB=PASS"
+
+        ${COMPOSE} run --rm --no-deps --user root backend sh -c '
+          chown -R 1000:1000 /data /app/uploads &&
+          test -w /data/orders.db &&
+          test -w /app/uploads
         '
-        echo "PERMISSION_PREP=PASS"
 
-        DB_OWNER=$(docker run --rm -v test_synthetic_db:/data alpine stat -c "%u" /data/orders.db)
-        echo "DB_UID_AFTER=${DB_OWNER}"
-        test "${DB_OWNER}" = "1000"
+        ${COMPOSE} run --rm --no-deps backend python -c \
+          "import sqlite3; c=sqlite3.connect('/data/orders.db'); c.execute('BEGIN IMMEDIATE'); c.rollback(); c.close()"
+        echo "APPUSER_DB_WRITE_AFTER=true"
+        echo "DB_APPUSER_WRITABLE=true"
+        ${COMPOSE} run --rm --no-deps backend sh -c '
+          test -w /app/uploads &&
+          touch /app/uploads/.appuser-write-test &&
+          rm /app/uploads/.appuser-write-test
+        '
+        echo "APPUSER_UPLOAD_WRITE_AFTER=true"
+        echo "UPLOADS_APPUSER_WRITABLE=true"
 
-        docker run --rm -v test_synthetic_db:/data --user 1000:1000 alpine test -w /data/orders.db
-        echo "APPUSER_CAN_WRITE_AFTER=true"
+        ${COMPOSE} run --rm --no-deps backend \
+          python -c "import main; assert main.database_readiness_ok()"
+        echo "STRICT_READINESS_AFTER_PREP=PASS"
 
-        echo "Verifying old root backend container rollback compatibility..."
-        docker run --rm -v test_synthetic_db:/data --user root alpine sh -c '
+        ${COMPOSE} up -d --no-deps --wait --wait-timeout 120 backend
+        ${COMPOSE} exec -T backend curl --fail --silent http://127.0.0.1:8000/api/health >/dev/null
+        echo "BACKEND_SYNTHETIC_STORAGE_START=PASS"
+
+        docker run --rm -v "${DB_VOLUME}:/data" --user root alpine sh -c '
           test -r /data/orders.db &&
           test -w /data/orders.db &&
-          touch /data/.root_write_test &&
-          rm /data/.root_write_test
+          touch /data/.root-write-test &&
+          rm /data/.root-write-test
         '
         echo "OLD_ROOT_BACKEND_CAN_ACCESS_UID1000_DB=true"
-
-        docker volume rm test_synthetic_db
     - name: Start containers
       run: |
         docker compose up -d --wait --wait-timeout 180

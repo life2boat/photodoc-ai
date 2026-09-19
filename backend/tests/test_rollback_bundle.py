@@ -15,7 +15,12 @@ if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
 from build_rollback_bundle import build_bundle, build_bundle_from_zip  # noqa: E402
-from rollback_bundle_common import render_manifest, sha256_bytes  # noqa: E402
+from rollback_bundle_common import (  # noqa: E402
+    MANIFEST_NAME,
+    render_manifest,
+    require_secret_free_content,
+    sha256_bytes,
+)
 from verify_rollback_bundle import rehearse_extract, verify_bundle  # noqa: E402
 
 
@@ -171,3 +176,60 @@ def test_zip_normalization_refuses_secret_extra(tmp_path):
             tmp_path / "bundle.tar.gz",
             tmp_path / "manifest.sha256",
         )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"-----BEGIN PRIVATE KEY-----\nnot-a-real-key\n",
+        b"SUPABASE_SERVICE_KEY=sb_secret_embeddedcredential\n",
+        b"SMTP_PASSWORD=actual-production-style-password\n",
+        b"API_TOKEN: 'actual-production-style-token'\n",
+        b"PASSWORD=actual-production-style-password\n",
+        b"TOKEN=actual-production-style-token\n",
+    ],
+)
+def test_builder_rejects_embedded_secret_material(tmp_path, payload):
+    source = tmp_path / "release"
+    source.mkdir()
+    _synthetic_release(source)
+    (source / "config.txt").write_bytes(payload)
+
+    with pytest.raises(ValueError, match="Forbidden content-secret categories"):
+        build_bundle(source, tmp_path / "bundle.tar.gz", tmp_path / "manifest.sha256")
+
+
+def test_content_scan_accepts_explicit_placeholders():
+    require_secret_free_content(
+        "example.env",
+        b"SMTP_PASSWORD=<production-app-password>\n"
+        b"YANDEX_DISK_TOKEN=${YANDEX_DISK_TOKEN}\n"
+        b"ROBOKASSA_PASSWORD1=ci_pass1\n",
+    )
+
+
+def test_content_scan_error_never_echoes_secret_value():
+    secret_value = "do-not-print-this-credential"
+    with pytest.raises(ValueError) as exc_info:
+        require_secret_free_content(
+            "config.env", f"SMTP_PASSWORD={secret_value}\n".encode("utf-8")
+        )
+    message = str(exc_info.value)
+    assert secret_value not in message
+    assert "config.env" in message
+    assert "credential-assignment" in message
+
+
+def test_verifier_rejects_embedded_secret_with_valid_manifest(tmp_path):
+    name = "backend/config.txt"
+    data = b"API_TOKEN=embedded-production-style-token\n"
+    manifest = render_manifest([(name, sha256_bytes(data))])
+    bundle = tmp_path / "secret-bearing.tar.gz"
+    with tarfile.open(bundle, "w:gz") as archive:
+        for member_name, member_data in ((name, data), (MANIFEST_NAME, manifest)):
+            info = tarfile.TarInfo(member_name)
+            info.size = len(member_data)
+            archive.addfile(info, io.BytesIO(member_data))
+
+    with pytest.raises(ValueError, match="Forbidden content-secret categories"):
+        verify_bundle(bundle)

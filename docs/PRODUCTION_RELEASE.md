@@ -94,162 +94,199 @@ All backend production secrets reside in `/opt/photodoc/backend/.env`. Restrict 
 For all production operations, consistently use the production Compose pair:
 `docker compose -f docker-compose.yml -f docker-compose.production.yml ...`
 
-### Step 1: Preflight Verification (Fail-Closed)
-Before touching any services, verify that:
-1. All required environment variable names are present in `/opt/photodoc/backend/.env` (without printing secret values).
-2. The external database volume exists. Do this before any Compose create/start command.
-3. The existing legacy database is readable, non-empty, and has an `orders` table. The one-time unmarked exception is explicit and is valid only before reconciliation.
+The sequence below is mandatory and ordered. Do not move permission changes ahead of
+the verified backup, and stop immediately if any gate fails.
+
+### Step 1: Environment Preflight
 
 ```bash
-# 1. Environment preflight
 python scripts/production_preflight.py --check-env /opt/photodoc/backend/.env
+```
 
-# 2. External volume existence (read-only inspection; MUST succeed)
+Required: every required variable is `PRESENT`, `ENV_SECRET_VALUES_PRINTED=false`,
+and `READY_FOR_CUTOVER=true`.
+
+### Step 2: External Volume Existence
+
+This read-only inspection must succeed before any Compose create/start command:
+
+```bash
 docker volume inspect "${PHOTODOC_DB_VOLUME:-photodoc_backend-data}" >/dev/null
+```
 
-# 3. One-time legacy database preflight (via read-only mount)
+### Step 3: Legacy Read-Only Database Preflight
+
+```bash
 docker run --rm \
-  -v photodoc_backend-data:/data:ro \
+  -v "${PHOTODOC_DB_VOLUME:-photodoc_backend-data}:/data:ro" \
   -v "$PWD/scripts:/scripts:ro" \
   -v "$PWD/backend:/backend:ro" \
   python:3.11-alpine \
-  python /scripts/production_preflight.py --db /data/orders.db --check-only --allow-legacy-unmarked
+  python /scripts/production_preflight.py \
+    --db /data/orders.db \
+    --check-only \
+    --allow-legacy-unmarked
 ```
-Expected output:
-```text
-ROBOKASSA_MERCHANT_LOGIN=PRESENT
-ROBOKASSA_PASSWORD1=PRESENT
-ROBOKASSA_PASSWORD2=PRESENT
-ROBOKASSA_IS_TEST=PRESENT
-SMTP_SERVER=PRESENT
-SMTP_PORT=PRESENT
-SMTP_USER=PRESENT
-SMTP_PASSWORD=PRESENT
-EMAIL_TO=PRESENT
-YANDEX_DISK_TOKEN=PRESENT
-ENV_SECRET_VALUES_PRINTED=false
-READY_FOR_CUTOVER=true
 
-DB_EXISTS=true
-DB_NONZERO=true
-ORDERS_TABLE_PRESENT=true
-SCHEMA_READABLE=true
-READY_FOR_MIGRATION=true
-LEGACY_UNMARKED=true
+Required: `DB_EXISTS=true`, `DB_NONZERO=true`, `ORDERS_TABLE_PRESENT=true`,
+`SCHEMA_READABLE=true`, `READY_FOR_MIGRATION=true`, and `LEGACY_UNMARKED=true`.
+
+### Step 4: Confirm Rollback Artifact, Hash, and Rehearsal
+
+The rollback bundle must already have been built using Section 5.1. Verify it before
+stopping the current writer:
+
+```bash
+test -s /secure/rollback/photodoc-known-good-pre-upgrade.tar.gz
+cd /secure/rollback
+sha256sum -c photodoc-known-good-pre-upgrade.tar.gz.sha256
+RESTORE_REHEARSAL="$(mktemp -d)"
+python /opt/photodoc/scripts/verify_rollback_bundle.py \
+  --bundle photodoc-known-good-pre-upgrade.tar.gz \
+  --extract-to "${RESTORE_REHEARSAL}" \
+  --require docker-compose.yml \
+  --require backend/main.py \
+  --require frontend/nginx.conf
+cd /opt/photodoc
 ```
-If either check fails, **STOP IMMEDIATELY**. Do not proceed with cutover.
 
-### Step 2: Stop Old Backend Writer
-Stop the existing backend to halt writes:
+Required: `ROLLBACK_CONTENT_SECRET_SCAN=true`, `ROLLBACK_SECRET_VALUES_PRINTED=false`,
+`ROLLBACK_BUNDLE_SECRET_MATCHES=0`, `FORBIDDEN_PATH_MATCHES=0`,
+`MANIFEST_HASH_VERIFICATION=PASS`, and `LINUX_EXTRACTION_REHEARSAL=PASS`.
+
+### Step 5: Stop the Old Backend Writer
+
 ```bash
 docker compose -f docker-compose.yml -f docker-compose.production.yml stop backend
 ```
-*(Do NOT run `docker compose down -v`! Managed volumes must be preserved).*
 
-### Step 3: Create Volume-Aware Database Backup
+Never run `docker compose down -v`; the production volume must be preserved.
+
+### Step 6: Create the Database Backup
+
 ```bash
 mkdir -p "$PWD/backups"
 BACKUP_NAME="orders.db.preupgrade.$(date +%Y%m%d%H%M%S)"
 docker run --rm \
-  -v photodoc_backend-data:/data \
+  -v "${PHOTODOC_DB_VOLUME:-photodoc_backend-data}:/data:ro" \
   -v "$PWD/backups:/backup" \
   alpine \
   cp /data/orders.db "/backup/${BACKUP_NAME}"
-
 test -s "$PWD/backups/${BACKUP_NAME}"
 echo "BACKUP_CREATED=true"
 ```
 
-### Step 4: Pre-migration Integrity Check
+No ownership or permission changes are allowed before this backup exists.
+
+### Step 7: Verify Backup Integrity
+
 ```bash
 docker run --rm \
-  -v "$PWD/backups:/backup" \
+  -v "$PWD/backups:/backup:ro" \
   alpine sh -c "apk add --no-cache sqlite >/dev/null && sqlite3 /backup/${BACKUP_NAME} 'PRAGMA integrity_check;'"
-# Output MUST be: ok
 ```
 
-### Step 5: Idempotent Schema Reconciliation
-The production DB is partially migrated (missing `order_amount` and `created_at`). Run `reconcile_payment_schema.py` using the production compose overlay:
+The only accepted integrity result is `ok`.
+
+### Step 8: Reconcile the Schema as Root
+
+The dry-run is read-only and may execute as the image's default UID 1000. The APPLY
+must explicitly run as root because the audited database is `root:root` mode `0644`:
 
 ```bash
-# 1. Dry run check
+# Read-only dry-run
 docker compose -f docker-compose.yml -f docker-compose.production.yml run --rm --no-deps \
   backend \
-  python migrations/reconcile_payment_schema.py --db /data/orders.db --check --allow-legacy-unmarked
+  python migrations/reconcile_payment_schema.py \
+    --db /data/orders.db \
+    --check \
+    --allow-legacy-unmarked
 
-# 2. Apply reconciliation
+# Mutating reconciliation: explicit root is mandatory
 docker compose -f docker-compose.yml -f docker-compose.production.yml run --rm --no-deps \
+  --user root \
   backend \
-  python migrations/reconcile_payment_schema.py --db /data/orders.db --apply --allow-legacy-unmarked
-```
-Expected output:
-```text
-COLUMNS_ADDED=order_amount,created_at
-SCHEMA_STATUS=COMPLETE
-MIGRATION_REQUIRED=false
-DB_APPLICATION_ID=1346650441
+  python migrations/reconcile_payment_schema.py \
+    --db /data/orders.db \
+    --apply \
+    --allow-legacy-unmarked
+echo "PRODUCTION_MIGRATION_CAN_WRITE_ROOT_OWNED_DB=true"
 ```
 
-The migration uses `BEGIN IMMEDIATE`; missing `ALTER TABLE` operations, the identity update, schema verification, and integrity verification are one transaction. Any failure rolls the entire transaction back.
+Required: `SCHEMA_STATUS=COMPLETE`, `MIGRATION_REQUIRED=false`,
+`DB_APPLICATION_ID=1346650441`, and `PRODUCTION_MIGRATION_CAN_WRITE_ROOT_OWNED_DB=true`.
+The migration uses one `BEGIN IMMEDIATE` transaction for schema changes, identity,
+schema verification, and integrity verification.
 
-### Step 5b: Strict Identity-Aware Preflight
-The legacy flag is forbidden after reconciliation:
+### Step 9: Strict Identity Preflight
+
+The legacy exception is forbidden after reconciliation:
 
 ```bash
 docker run --rm \
-  -v photodoc_backend-data:/data:ro \
+  -v "${PHOTODOC_DB_VOLUME:-photodoc_backend-data}:/data:ro" \
   -v "$PWD/scripts:/scripts:ro" \
   -v "$PWD/backend:/backend:ro" \
   python:3.11-alpine \
   python /scripts/production_preflight.py --db /data/orders.db --check-only
 ```
 
-Required: `DB_IDENTITY_VALID=true`, `READY_FOR_STARTUP=true`, and `DB_APPLICATION_ID=1346650441`. Stop if any differs.
+Required: `DB_IDENTITY_VALID=true`, `READY_FOR_STARTUP=true`, and
+`DB_APPLICATION_ID=1346650441`.
 
-### Step 6: Permission Preparation for UID 1000 (`appuser`)
-The existing database file was owned by `root:root (0644)`. The new backend runs as non-root `UID 1000`. Prepare permissions:
+### Step 10: Prepare Database and Upload Permissions for UID 1000
+
+The audited uploads bind `/opt/photodoc/backend/uploads` is also `root:root` mode
+`0755`; do not omit it and do not delete or alter existing upload contents:
 
 ```bash
 docker compose -f docker-compose.yml -f docker-compose.production.yml run --rm --no-deps \
   --user root \
   backend \
   sh -c '
-    chown -R 1000:1000 /data &&
-    test -w /data/orders.db
+    chown -R 1000:1000 /data /app/uploads &&
+    test -w /data/orders.db &&
+    test -w /app/uploads
   '
 ```
 
-### Step 7: Launch New Application Stack
-```bash
-# Validate effective compose configuration
-docker compose -f docker-compose.yml -f docker-compose.production.yml config
+### Step 11: Verify UID 1000 Writability
 
-# Build and start services
+These commands run as the image's default `appuser` (UID 1000):
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.production.yml run --rm --no-deps \
+  backend \
+  python -c "import sqlite3; c=sqlite3.connect('/data/orders.db'); c.execute('BEGIN IMMEDIATE'); c.rollback(); c.close()"
+echo "DB_APPUSER_WRITABLE=true"
+
+docker compose -f docker-compose.yml -f docker-compose.production.yml run --rm --no-deps \
+  backend \
+  sh -c 'touch /app/uploads/.appuser-write-test && rm /app/uploads/.appuser-write-test'
+echo "UPLOADS_APPUSER_WRITABLE=true"
+```
+
+### Step 12: Build and Start the New Application
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.production.yml config
 docker compose -f docker-compose.yml -f docker-compose.production.yml build
 docker compose -f docker-compose.yml -f docker-compose.production.yml up -d --wait --wait-timeout 180
 ```
 
-### Step 8: Post-Deployment Smoke Verification
+### Step 13: Local Smoke Verification
+
 ```bash
-# 1. Backend health via local proxy
 curl -f http://127.0.0.1:8080/api/health
-# Expected: {"status":"ok"}
-
-# 2. Frontend SPA root
-curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8080/
-# Expected: 200
-
-# 3. Open Graph asset
-curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8080/og/photodoc-og.jpg
-# Expected: 200
-
-# 4. Backend database write verification
+curl -f -o /dev/null http://127.0.0.1:8080/
+curl -f -o /dev/null http://127.0.0.1:8080/og/photodoc-og.jpg
 docker compose -f docker-compose.yml -f docker-compose.production.yml exec -T backend sh -c '
-  test -w /data &&
-  test -w /data/orders.db &&
-  test -w /app/uploads
+  test -w /data/orders.db && test -w /app/uploads
 '
 ```
+
+Required final evidence: `PRODUCTION_SEQUENCE_VERIFIED=true` and
+`PRODUCTION_RUNBOOK_DOWN_V=false`.
 
 ---
 
@@ -292,7 +329,13 @@ ROLLBACK_BUNDLE_HASH_VALID=true
 ROLLBACK_LINUX_RESTORE_REHEARSED=true
 ```
 
-The bundle and its manifest must contain no `.env`, uploads, database, backups, logs, tokens, private keys, credentials, or runtime state.
+The bundle and its manifest must contain no `.env`, uploads, database, backups, logs,
+tokens, private keys, credentials, or runtime state. Both the builder and verifier scan
+file contents for private-key headers, `sb_secret` material, and non-placeholder
+password/token/secret/private-key/credential assignments. Findings report only the
+filename and category; matched secret values are never printed. A successful scan must
+report `ROLLBACK_CONTENT_SECRET_SCAN=true`, `ROLLBACK_SECRET_VALUES_PRINTED=false`,
+`ROLLBACK_BUNDLE_SECRET_MATCHES=0`, and `FORBIDDEN_PATH_MATCHES=0`.
 
 ### 5.2 Mode 1: Rollback to the Verified Previous Container Release
 

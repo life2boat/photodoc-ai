@@ -12,6 +12,7 @@ from rollback_bundle_common import (
     forbidden_category,
     normalize_member_name,
     parse_manifest,
+    require_secret_free_content,
     sha256_bytes,
 )
 
@@ -37,7 +38,10 @@ def verify_bundle(bundle: Path, *, required: list[str] | None = None) -> dict[st
             extracted = archive.extractfile(member)
             if extracted is None:
                 raise ValueError(f"Unable to read archive member: {name}")
-            contents[name] = extracted.read()
+            data = extracted.read()
+            if name != MANIFEST_NAME:
+                require_secret_free_content(name, data)
+            contents[name] = data
 
     if MANIFEST_NAME not in contents:
         raise ValueError(f"Bundle is missing {MANIFEST_NAME}")
@@ -81,7 +85,10 @@ def main() -> int:
     except Exception as exc:
         print(f"ERROR: {exc}")
         return 1
+    print("ROLLBACK_CONTENT_SECRET_SCAN=true")
+    print("ROLLBACK_SECRET_VALUES_PRINTED=false")
     print("ROLLBACK_BUNDLE_SECRET_MATCHES=0")
+    print("FORBIDDEN_PATH_MATCHES=0")
     print("MUTABLE_PRODUCTION_DATA_INCLUDED=false")
     print("MANIFEST_HASH_VERIFICATION=PASS")
     if args.extract_to:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import posixpath
+import re
 from pathlib import PurePosixPath
 from typing import Iterable
 
@@ -14,6 +15,34 @@ FORBIDDEN_EXACT_FILES = {".env", "orders.db"}
 RUNTIME_SUFFIXES = {".log", ".pid"}
 SECRET_SUFFIXES = {".pem", ".key", ".p12", ".pfx"}
 FORBIDDEN_NAME_FRAGMENTS = {"token", "credential", "private_key", "id_rsa"}
+
+PRIVATE_KEY_HEADER_RE = re.compile(
+    r"-----BEGIN [^-\r\n]*PRIVATE KEY(?: BLOCK)?-----", re.IGNORECASE
+)
+SB_SECRET_RE = re.compile(r"\bsb_secret_[A-Za-z0-9._-]+")
+SECRET_ASSIGNMENT_RE = re.compile(
+    r"^\s*(?:export\s+)?[\"']?(?P<name>[A-Za-z_][A-Za-z0-9_]*)[\"']?"
+    r"[ \t]*[:=][ \t]*(?P<value>[^\r\n]*?)[ \t]*,?[ \t]*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+SECRET_NAME_FRAGMENTS = (
+    "PASSWORD",
+    "PASSWD",
+    "TOKEN",
+    "SECRET",
+    "PRIVATE_KEY",
+    "API_KEY",
+    "CREDENTIAL",
+)
+PLACEHOLDER_VALUE_RE = re.compile(
+    r"(?:"
+    r"present|missing|none|null|false|true|0|1|"
+    r"(?:ci|test|example|dummy|placeholder|changeme|change_me|redacted|masked|secret)"
+    r"(?:[-_a-z0-9.]*)|"
+    r"your[-_a-z0-9.]*|x+|\*+"
+    r")",
+    re.IGNORECASE,
+)
 
 
 def normalize_member_name(name: str) -> str:
@@ -50,6 +79,44 @@ def forbidden_category(name: str) -> str | None:
     if any(fragment in basename for fragment in FORBIDDEN_NAME_FRAGMENTS):
         return "credential-like-file"
     return None
+
+
+def content_secret_categories(data: bytes) -> set[str]:
+    """Return secret categories only; never retain or report matched values."""
+    text = data.decode("utf-8", errors="ignore")
+    categories: set[str] = set()
+    if PRIVATE_KEY_HEADER_RE.search(text):
+        categories.add("private-key-header")
+    if SB_SECRET_RE.search(text):
+        categories.add("supabase-secret")
+
+    for match in SECRET_ASSIGNMENT_RE.finditer(text):
+        name = match.group("name").upper()
+        if not any(fragment in name for fragment in SECRET_NAME_FRAGMENTS):
+            continue
+        value = match.group("value").strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1].strip()
+        if (
+            not value
+            or value.startswith(("${", "$", "{{", "<"))
+            or (value.endswith(">") and value.startswith("<"))
+            or value.startswith(("{", "[", "("))
+            or re.match(r"[A-Za-z_][A-Za-z0-9_.]*\(", value)
+            or PLACEHOLDER_VALUE_RE.fullmatch(value)
+        ):
+            continue
+        categories.add("credential-assignment")
+    return categories
+
+
+def require_secret_free_content(name: str, data: bytes) -> None:
+    """Reject embedded credential material without disclosing matched values."""
+    categories = sorted(content_secret_categories(data))
+    if categories:
+        raise ValueError(
+            f"Forbidden content-secret categories {','.join(categories)}: {name}"
+        )
 
 
 def sha256_bytes(data: bytes) -> str:

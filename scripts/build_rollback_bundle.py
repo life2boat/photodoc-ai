@@ -16,6 +16,7 @@ from rollback_bundle_common import (
     forbidden_category,
     normalize_member_name,
     parse_manifest,
+    require_secret_free_content,
     render_manifest,
     sha256_bytes,
 )
@@ -59,6 +60,8 @@ def _tar_info(name: str, size: int, mode: int = 0o644) -> tarfile.TarInfo:
 def _write_bundle(
     content: list[tuple[str, bytes, int]], output: Path, manifest_output: Path
 ) -> dict[str, str | int]:
+    for name, data, _ in content:
+        require_secret_free_content(name, data)
     manifest_items = [(name, sha256_bytes(data)) for name, data, _ in content]
 
     manifest = render_manifest(manifest_items)
@@ -160,7 +163,10 @@ def main() -> int:
     print(f"ROLLBACK_FILES={result['file_count']}")
     if "omitted_mutable_files" in result:
         print(f"OMITTED_MUTABLE_FILES={result['omitted_mutable_files']}")
+    print("ROLLBACK_CONTENT_SECRET_SCAN=true")
+    print("ROLLBACK_SECRET_VALUES_PRINTED=false")
     print("ROLLBACK_BUNDLE_SECRET_MATCHES=0")
+    print("FORBIDDEN_PATH_MATCHES=0")
     print("MUTABLE_PRODUCTION_DATA_INCLUDED=false")
     print(f"ROLLBACK_BUNDLE_SHA256={result['bundle_sha256']}")
     return 0
