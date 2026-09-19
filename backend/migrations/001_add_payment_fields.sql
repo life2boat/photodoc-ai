@@ -1,5 +1,13 @@
 -- Migration 001: Add payment and fulfillment fields to orders table
--- Pre-condition: orders table exists with legacy schema (id, name, phone)
+-- STATUS: LEGACY_FULL_FORWARD_MIGRATION
+-- CAUTION: NOT_SAFE_FOR_PARTIALLY_MIGRATED_DATABASE
+--
+-- This script was designed for initial migration from minimal schema (id, name, phone).
+-- It is NOT safe for databases where some columns already exist (such as production),
+-- as ALTER TABLE ADD COLUMN will fail with duplicate column errors.
+-- For production and safe automated upgrades, use:
+-- backend/migrations/reconcile_payment_schema.py
+--
 -- Note: CURRENT_TIMESTAMP is not a constant default, so created_at uses NULL default
 -- for SQLite < 3.38 compatibility. The application layer sets this at insert time.
 

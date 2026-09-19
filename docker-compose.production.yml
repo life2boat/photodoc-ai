@@ -1,0 +1,25 @@
+# PhotoDoc AI — Production Docker Compose Overlay
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.production.yml config
+#   docker compose -f docker-compose.yml -f docker-compose.production.yml up -d
+#
+# This overlay maps storage to existing audited production assets on 79.137.196.14:
+# - DB volume: photodoc_backend-data (/var/lib/docker/volumes/photodoc_backend-data/_data/orders.db)
+# - Uploads bind mount: /opt/photodoc/backend/uploads
+# - Frontend localhost bind: 127.0.0.1:8080 (behind external TLS / reverse proxy)
+#
+# NO SECRETS ARE STORED IN THIS FILE. All credentials must come from host .env.
+
+services:
+  backend:
+    volumes:
+      - photodoc_db:/data
+      - ${PHOTODOC_UPLOADS_SOURCE:-/opt/photodoc/backend/uploads}:/app/uploads
+
+  frontend:
+    ports:
+      - "127.0.0.1:${PORT:-8080}:80"
+
+volumes:
+  photodoc_db:
+    name: ${PHOTODOC_DB_VOLUME:-photodoc_backend-data}

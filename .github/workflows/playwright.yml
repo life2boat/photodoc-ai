@@ -61,6 +61,11 @@ jobs:
       run: pip install pytest
     - name: Run payment security tests
       run: pytest tests/test_payment_security.py -v
+    - name: Run migration reconciliation tests
+      run: pytest tests/test_migration_reconciliation.py -v
+    - name: Verify preflight script
+      run: |
+        python ../scripts/production_preflight.py --db nonexistent.db || true
 
   docker-build:
     name: Docker Build
@@ -75,10 +80,61 @@ jobs:
       DATABASE_PATH: /data/orders.db
     steps:
     - uses: actions/checkout@v4
-    - name: Validate Docker Compose config
+    - name: Validate generic Docker Compose config
       run: docker compose config
+    - name: Validate production overlay Docker Compose config
+      run: |
+        docker compose -f docker-compose.yml -f docker-compose.production.yml config
+        PROD_CONFIG=$(docker compose -f docker-compose.yml -f docker-compose.production.yml config)
+        echo "${PROD_CONFIG}" | grep -q "photodoc_backend-data"
+        echo "${PROD_CONFIG}" | grep -q "/opt/photodoc/backend/uploads"
+        echo "Production overlay configuration verified."
     - name: Build Docker images
       run: docker compose build
+    - name: Verify synthetic root-owned DB permission prep and rollback compatibility
+      run: |
+        echo "Creating synthetic root-owned database volume..."
+        docker volume create test_synthetic_db
+        docker run --rm -v test_synthetic_db:/data --user root alpine sh -c '
+          touch /data/orders.db &&
+          chown 0:0 /data/orders.db &&
+          chmod 0644 /data/orders.db &&
+          ls -ld /data/orders.db
+        '
+        echo "ROOT_OWNED_DB_BEFORE=true"
+
+        echo "Verifying backend appuser (UID 1000) cannot write to root-owned orders.db before prep..."
+        if docker run --rm -v test_synthetic_db:/data --user 1000:1000 alpine sh -c 'test -w /data/orders.db'; then
+          echo "FAIL: appuser was able to write to root-owned DB before prep"
+          exit 1
+        else
+          echo "APPUSER_CAN_WRITE_BEFORE=false"
+        fi
+
+        echo "Executing permission preparation command..."
+        docker compose run --rm --no-deps -v test_synthetic_db:/data --user root backend sh -c '
+          chown -R 1000:1000 /data &&
+          test -w /data/orders.db
+        '
+        echo "PERMISSION_PREP=PASS"
+
+        DB_OWNER=$(docker run --rm -v test_synthetic_db:/data alpine stat -c "%u" /data/orders.db)
+        echo "DB_UID_AFTER=${DB_OWNER}"
+        test "${DB_OWNER}" = "1000"
+
+        docker run --rm -v test_synthetic_db:/data --user 1000:1000 alpine test -w /data/orders.db
+        echo "APPUSER_CAN_WRITE_AFTER=true"
+
+        echo "Verifying old root backend container rollback compatibility..."
+        docker run --rm -v test_synthetic_db:/data --user root alpine sh -c '
+          test -r /data/orders.db &&
+          test -w /data/orders.db &&
+          touch /data/.root_write_test &&
+          rm /data/.root_write_test
+        '
+        echo "OLD_ROOT_BACKEND_CAN_ACCESS_UID1000_DB=true"
+
+        docker volume rm test_synthetic_db
     - name: Start containers
       run: |
         docker compose up -d --wait --wait-timeout 180

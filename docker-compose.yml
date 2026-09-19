@@ -18,7 +18,7 @@ services:
       - YANDEX_DISK_TOKEN=${YANDEX_DISK_TOKEN:-}
     volumes:
       - photodoc_db:/data
-      - photodoc_uploads:/app/uploads
+      - ${PHOTODOC_UPLOADS_SOURCE:-photodoc_uploads}:/app/uploads
     networks:
       - photodoc_network
 
@@ -42,7 +42,7 @@ services:
 
 volumes:
   photodoc_db:
-    name: photodoc_db
+    name: ${PHOTODOC_DB_VOLUME:-photodoc_db}
   photodoc_uploads:
     name: photodoc_uploads
 
