@@ -13,7 +13,7 @@
 services:
   backend:
     env_file:
-      - ./backend/.env
+      - ${PHOTODOC_ENV_FILE:-./backend/.env}
     environment:
       PHOTODOC_REQUIRE_DB_IDENTITY: "1"
     volumes:

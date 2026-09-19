@@ -123,6 +123,68 @@ jobs:
 
         # Clean up synthetic env file
         rm -f backend/.env
+    - name: Verify app-image-independent migration runner
+      run: |
+        set -eu
+        DB_VOLUME="photodoc-candidate-migration-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+        cleanup() {
+          docker volume rm "${DB_VOLUME}" >/dev/null 2>&1 || true
+        }
+        trap cleanup EXIT
+
+        for app_image in $(docker compose config --images); do
+          if docker image inspect "${app_image}" >/dev/null 2>&1; then
+            echo "FAIL: PhotoDoc application image exists before migration regression"
+            exit 1
+          fi
+        done
+        docker volume create "${DB_VOLUME}" >/dev/null
+        docker run --rm --user 0 \
+          -v "${DB_VOLUME}:/data" \
+          python:3.11-alpine \
+          python -c "import sqlite3; c=sqlite3.connect('/data/orders.db'); c.execute('CREATE TABLE orders (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, phone TEXT)'); c.execute(\"INSERT INTO orders (name, phone) VALUES ('synthetic', '+70000000000')\"); c.commit(); c.close()"
+        docker run --rm --user 0 \
+          -v "${DB_VOLUME}:/data" \
+          alpine sh -c 'chown 0:0 /data/orders.db && chmod 0644 /data/orders.db && test "$(stat -c "%u:%g %a" /data/orders.db)" = "0:0 644"'
+
+        DRY_RUN_OUTPUT="$(docker run --rm --user 65534:65534 \
+          -v "${DB_VOLUME}:/data:ro" \
+          -v "$PWD/backend:/candidate/backend:ro" \
+          -w /candidate/backend \
+          python:3.11-alpine \
+          python migrations/reconcile_payment_schema.py \
+            --db /data/orders.db \
+            --check \
+            --allow-legacy-unmarked)"
+        printf '%s\n' "${DRY_RUN_OUTPUT}"
+        printf '%s\n' "${DRY_RUN_OUTPUT}" | grep -q '^MIGRATION_REQUIRED=true$'
+
+        docker run --rm --user 0 \
+          -v "${DB_VOLUME}:/data" \
+          -v "$PWD/backend:/candidate/backend:ro" \
+          -w /candidate/backend \
+          python:3.11-alpine \
+          python migrations/reconcile_payment_schema.py \
+            --db /data/orders.db \
+            --apply \
+            --allow-legacy-unmarked
+        echo "MIGRATION_RUNNER_APP_IMAGE_INDEPENDENT=true"
+        echo "ROOT_MIGRATION_ON_ROOT_OWNED_DB=PASS"
+
+        PREFLIGHT_OUTPUT="$(docker run --rm --user 65534:65534 \
+          -v "${DB_VOLUME}:/data:ro" \
+          -v "$PWD/scripts:/candidate/scripts:ro" \
+          -v "$PWD/backend:/candidate/backend:ro" \
+          -w /candidate \
+          python:3.11-alpine \
+          python scripts/production_preflight.py \
+            --db /data/orders.db \
+            --check-only)"
+        printf '%s\n' "${PREFLIGHT_OUTPUT}"
+        printf '%s\n' "${PREFLIGHT_OUTPUT}" | grep -q '^DB_APPLICATION_ID=1346650441$'
+        printf '%s\n' "${PREFLIGHT_OUTPUT}" | grep -q '^DB_IDENTITY_VALID=true$'
+        printf '%s\n' "${PREFLIGHT_OUTPUT}" | grep -q '^READY_FOR_STARTUP=true$'
+        echo "STRICT_READINESS_AFTER_MIGRATION=PASS"
     - name: Build Docker images
       run: docker compose build
     - name: Prove production external-volume and DB identity fail-closed contracts
@@ -243,13 +305,29 @@ jobs:
         fi
         echo "APPUSER_UPLOAD_WRITE_BEFORE=false"
 
-        ${COMPOSE} run --rm --no-deps --user root backend \
+        docker run --rm --user 0 \
+          -v "${DB_VOLUME}:/data" \
+          -v "$PWD/backend:/candidate/backend:ro" \
+          -w /candidate/backend \
+          python:3.11-alpine \
           python migrations/reconcile_payment_schema.py \
             --db /data/orders.db \
             --apply \
             --allow-legacy-unmarked
+        echo "MIGRATION_RUNNER_APP_IMAGE_INDEPENDENT=true"
         echo "PRODUCTION_MIGRATION_CAN_WRITE_ROOT_OWNED_DB=true"
         echo "ROOT_MIGRATION_ON_ROOT_OWNED_DB=PASS"
+
+        docker run --rm --user 65534:65534 \
+          -v "${DB_VOLUME}:/data:ro" \
+          -v "$PWD/scripts:/candidate/scripts:ro" \
+          -v "$PWD/backend:/candidate/backend:ro" \
+          -w /candidate \
+          python:3.11-alpine \
+          python scripts/production_preflight.py \
+            --db /data/orders.db \
+            --check-only
+        echo "STRICT_READINESS_AFTER_MIGRATION=PASS"
 
         ${COMPOSE} run --rm --no-deps --user root backend sh -c '
           chown -R 1000:1000 /data /app/uploads &&
