@@ -13,7 +13,8 @@ CURRENT_PRODUCTION_ALREADY_CONTAINERIZED=true
 CURRENT_RUNTIME=docker compose
 CURRENT_PATH=/opt/photodoc
 CURRENT_ENV_FILE=/opt/photodoc/backend/.env
-ROLLBACK_ARTIFACT=/opt/photodoc/release.zip
+LEGACY_ROLLBACK_ARTIFACT=/opt/photodoc/release.zip (DO NOT USE)
+ROLLBACK_FORMAT=tar.gz with POSIX paths and manifest.sha256
 
 CURRENT_FRONTEND=photodoc-frontend (bound to 127.0.0.1:8080)
 CURRENT_BACKEND=photodoc-backend (internal port 8000)
@@ -52,10 +53,12 @@ docker compose -f docker-compose.yml -f docker-compose.production.yml config
 ```
 
 ### 2.1 Storage & Runtime Mapping Contract
-- **Database Volume**: `photodoc_db` maps to physical volume `photodoc_backend-data` (`${PHOTODOC_DB_VOLUME:-photodoc_backend-data}`).
+- **Database Volume**: `photodoc_db` is an **external** volume mapping to physical volume `photodoc_backend-data` (`${PHOTODOC_DB_VOLUME:-photodoc_backend-data}`). Compose must fail if it does not already exist; it must never create an empty replacement production volume.
 - **Uploads Directory**: maps to existing host bind mount `/opt/photodoc/backend/uploads` (`${PHOTODOC_UPLOADS_SOURCE:-/opt/photodoc/backend/uploads}`).
-- **Backend Secrets**: loaded directly from existing `/opt/photodoc/backend/.env` via `env_file`.
+- **Backend Secrets**: loaded directly from existing `/opt/photodoc/backend/.env` via
+  `PHOTODOC_ENV_FILE`; the staged candidate source never receives a secret copy.
 - **Frontend Port**: bound strictly to `127.0.0.1:${PORT:-8080}:80`.
+- **Database Identity**: production sets `PHOTODOC_REQUIRE_DB_IDENTITY=1`. SQLite `PRAGMA application_id` must equal decimal `1346650441` (big-endian ASCII `PDAI`) and the complete `orders` schema must be readable before the API starts.
 
 ---
 
@@ -89,142 +92,294 @@ All backend production secrets reside in `/opt/photodoc/backend/.env`. Restrict 
 
 ## 4. Production Upgrade Sequence (Step-by-Step)
 
-For all production operations, consistently use the production Compose pair:
-`docker compose -f docker-compose.yml -f docker-compose.production.yml ...`
+For candidate application operations, consistently use the staged production Compose
+pair with `--project-directory "${RELEASE_DIR}" -p photodoc`. Migration and database
+preflight deliberately do not use Compose or a PhotoDoc application image.
 
-### Step 1: Preflight Verification (Fail-Closed)
-Before touching any services, verify that:
-1. All required environment variable names are present in `/opt/photodoc/backend/.env` (without printing secret values).
-2. The existing database volume is present, readable, and non-empty.
+The sequence below is mandatory and ordered. Do not move permission changes ahead of
+the verified backup, and stop immediately if any gate fails.
+
+### Step 1: Stage and Verify the Candidate Release
+
+The release task supplies `CANDIDATE_SHA` only after the PR has been merged and the
+exact `main` commit has qualified. Never substitute a PR head or a short SHA. Stage
+that commit beside the running release; do not copy it over `/opt/photodoc`:
 
 ```bash
-# 1. Environment preflight
-python scripts/production_preflight.py --check-env /opt/photodoc/backend/.env
+ACTIVE_RELEASE_DIR=/opt/photodoc
+RELEASE_DIR=/opt/photodoc-next
+CANDIDATE_SHA='<full 40-character SHA supplied by the release task>'
+PHOTODOC_ENV_FILE=/opt/photodoc/backend/.env
+export ACTIVE_RELEASE_DIR RELEASE_DIR CANDIDATE_SHA PHOTODOC_ENV_FILE
 
-# 2. Database preflight (via read-only mount)
+printf '%s\n' "${CANDIDATE_SHA}" | grep -Eq '^[0-9a-f]{40}$'
+test "${RELEASE_DIR}" != "${ACTIVE_RELEASE_DIR}"
+test ! -e "${RELEASE_DIR}"
+git -C "${ACTIVE_RELEASE_DIR}" fetch origin main
+git -C "${ACTIVE_RELEASE_DIR}" worktree add --detach "${RELEASE_DIR}" "${CANDIDATE_SHA}"
+
+test "$(git -C "${RELEASE_DIR}" rev-parse HEAD)" = "${CANDIDATE_SHA}"
+test -z "$(git -C "${RELEASE_DIR}" status --porcelain=v1 --untracked-files=no)"
+for required in \
+  backend/db_contract.py \
+  backend/migrations/reconcile_payment_schema.py \
+  scripts/production_preflight.py \
+  docker-compose.yml \
+  docker-compose.production.yml
+do
+  test -f "${RELEASE_DIR}/${required}"
+done
+echo "CANDIDATE_SHA=${CANDIDATE_SHA}"
+echo "CANDIDATE_RELEASE_STAGED=true"
+```
+
+If `/opt/photodoc-next` already exists, stop and choose a new, explicitly documented
+staging path. Do not delete, reuse, or overwrite an unknown release directory during
+cutover preparation.
+
+### Step 2: Environment Preflight
+
+```bash
+python "${RELEASE_DIR}/scripts/production_preflight.py" \
+  --check-env "${PHOTODOC_ENV_FILE}"
+```
+
+Required: every required variable is `PRESENT`, `ENV_SECRET_VALUES_PRINTED=false`,
+and `READY_FOR_CUTOVER=true`.
+
+### Step 3: External Volume Existence
+
+This read-only inspection must succeed before any Compose create/start command:
+
+```bash
+docker volume inspect "${PHOTODOC_DB_VOLUME:-photodoc_backend-data}" >/dev/null
+```
+
+### Step 4: Legacy Read-Only Database Preflight
+
+```bash
 docker run --rm \
-  -v photodoc_backend-data:/data:ro \
-  -v "$PWD/scripts:/scripts:ro" \
+  --user 65534:65534 \
+  -v "${PHOTODOC_DB_VOLUME:-photodoc_backend-data}:/data:ro" \
+  -v "${RELEASE_DIR}/scripts:/candidate/scripts:ro" \
+  -v "${RELEASE_DIR}/backend:/candidate/backend:ro" \
+  -w /candidate \
   python:3.11-alpine \
-  python /scripts/production_preflight.py --db /data/orders.db --check-only
+  python scripts/production_preflight.py \
+    --db /data/orders.db \
+    --check-only \
+    --allow-legacy-unmarked
 ```
-Expected output:
-```text
-ROBOKASSA_MERCHANT_LOGIN=PRESENT
-ROBOKASSA_PASSWORD1=PRESENT
-ROBOKASSA_PASSWORD2=PRESENT
-ROBOKASSA_IS_TEST=PRESENT
-SMTP_SERVER=PRESENT
-SMTP_PORT=PRESENT
-SMTP_USER=PRESENT
-SMTP_PASSWORD=PRESENT
-EMAIL_TO=PRESENT
-YANDEX_DISK_TOKEN=PRESENT
-ENV_SECRET_VALUES_PRINTED=false
-READY_FOR_CUTOVER=true
 
-DB_EXISTS=true
-DB_NONZERO=true
-ORDERS_TABLE_PRESENT=true
-SCHEMA_READABLE=true
-READY_FOR_MIGRATION=true
-```
-If either check fails, **STOP IMMEDIATELY**. Do not proceed with cutover.
+Required: `DB_EXISTS=true`, `DB_NONZERO=true`, `ORDERS_TABLE_PRESENT=true`,
+`SCHEMA_READABLE=true`, `READY_FOR_MIGRATION=true`, and `LEGACY_UNMARKED=true`.
 
-### Step 2: Stop Old Backend Writer
-Stop the existing backend to halt writes:
+### Step 5: Confirm Rollback Artifact, Hash, and Rehearsal
+
+The rollback bundle must already have been built using Section 5.1. Verify it before
+stopping the current writer:
+
 ```bash
-docker compose -f docker-compose.yml -f docker-compose.production.yml stop backend
+test -s /secure/rollback/photodoc-known-good-pre-upgrade.tar.gz
+cd /secure/rollback
+sha256sum -c photodoc-known-good-pre-upgrade.tar.gz.sha256
+RESTORE_REHEARSAL="$(mktemp -d)"
+python /opt/photodoc/scripts/verify_rollback_bundle.py \
+  --bundle photodoc-known-good-pre-upgrade.tar.gz \
+  --extract-to "${RESTORE_REHEARSAL}" \
+  --require docker-compose.yml \
+  --require backend/main.py \
+  --require frontend/nginx.conf
+cd "${ACTIVE_RELEASE_DIR}"
 ```
-*(Do NOT run `docker compose down -v`! Managed volumes must be preserved).*
 
-### Step 3: Create Volume-Aware Database Backup
+Required: `ROLLBACK_CONTENT_SECRET_SCAN=true`, `ROLLBACK_SECRET_VALUES_PRINTED=false`,
+`ROLLBACK_BUNDLE_SECRET_MATCHES=0`, `FORBIDDEN_PATH_MATCHES=0`,
+`MANIFEST_HASH_VERIFICATION=PASS`, and `LINUX_EXTRACTION_REHEARSAL=PASS`.
+
+### Step 6: Stop the Old Backend Writer
+
 ```bash
-mkdir -p "$PWD/backups"
+docker compose -p photodoc \
+  -f "${ACTIVE_RELEASE_DIR}/docker-compose.yml" \
+  -f "${ACTIVE_RELEASE_DIR}/docker-compose.production.yml" \
+  stop backend
+```
+
+Never run `docker compose down -v`; the production volume must be preserved.
+
+### Step 7: Create the Database Backup
+
+```bash
+mkdir -p "${ACTIVE_RELEASE_DIR}/backups"
 BACKUP_NAME="orders.db.preupgrade.$(date +%Y%m%d%H%M%S)"
 docker run --rm \
-  -v photodoc_backend-data:/data \
-  -v "$PWD/backups:/backup" \
+  -v "${PHOTODOC_DB_VOLUME:-photodoc_backend-data}:/data:ro" \
+  -v "${ACTIVE_RELEASE_DIR}/backups:/backup" \
   alpine \
   cp /data/orders.db "/backup/${BACKUP_NAME}"
-
-test -s "$PWD/backups/${BACKUP_NAME}"
+test -s "${ACTIVE_RELEASE_DIR}/backups/${BACKUP_NAME}"
 echo "BACKUP_CREATED=true"
 ```
 
-### Step 4: Pre-migration Integrity Check
+No ownership or permission changes are allowed before this backup exists.
+
+### Step 8: Verify Backup Integrity
+
 ```bash
 docker run --rm \
-  -v "$PWD/backups:/backup" \
+  -v "${ACTIVE_RELEASE_DIR}/backups:/backup:ro" \
   alpine sh -c "apk add --no-cache sqlite >/dev/null && sqlite3 /backup/${BACKUP_NAME} 'PRAGMA integrity_check;'"
-# Output MUST be: ok
 ```
 
-### Step 5: Idempotent Schema Reconciliation
-The production DB is partially migrated (missing `order_amount` and `created_at`). Run `reconcile_payment_schema.py` using the production compose overlay:
+The only accepted integrity result is `ok`.
+
+### Step 9: Reconcile the Schema from the Staged Candidate
+
+Both commands mount migration code from the SHA-verified candidate release. They use
+an explicit Python runtime and never create or start an application container. The
+dry-run mounts the database volume read-only. APPLY runs as root because the audited
+database is `root:root` mode `0644`:
 
 ```bash
-# 1. Dry run check
-docker compose -f docker-compose.yml -f docker-compose.production.yml run --rm --no-deps \
-  backend \
-  python migrations/reconcile_payment_schema.py --db /data/orders.db --check
+# Read-only dry-run
+docker run --rm \
+  --user 65534:65534 \
+  -v "${PHOTODOC_DB_VOLUME:-photodoc_backend-data}:/data:ro" \
+  -v "${RELEASE_DIR}/backend:/candidate/backend:ro" \
+  -w /candidate/backend \
+  python:3.11-alpine \
+  python migrations/reconcile_payment_schema.py \
+    --db /data/orders.db \
+    --check \
+    --allow-legacy-unmarked
 
-# 2. Apply reconciliation
-docker compose -f docker-compose.yml -f docker-compose.production.yml run --rm --no-deps \
-  backend \
-  python migrations/reconcile_payment_schema.py --db /data/orders.db --apply
-```
-Expected output:
-```text
-COLUMNS_ADDED=order_amount,created_at
-SCHEMA_STATUS=COMPLETE
-MIGRATION_REQUIRED=false
+# Mutating reconciliation: explicit root is mandatory
+docker run --rm \
+  --user 0 \
+  -v "${PHOTODOC_DB_VOLUME:-photodoc_backend-data}:/data" \
+  -v "${RELEASE_DIR}/backend:/candidate/backend:ro" \
+  -w /candidate/backend \
+  python:3.11-alpine \
+  python migrations/reconcile_payment_schema.py \
+    --db /data/orders.db \
+    --apply \
+    --allow-legacy-unmarked
+echo "MIGRATION_USES_CANDIDATE_CODE=true"
+echo "MIGRATION_DEPENDS_ON_EXISTING_BACKEND_IMAGE=false"
+echo "PRODUCTION_MIGRATION_CAN_WRITE_ROOT_OWNED_DB=true"
 ```
 
-### Step 6: Permission Preparation for UID 1000 (`appuser`)
-The existing database file was owned by `root:root (0644)`. The new backend runs as non-root `UID 1000`. Prepare permissions:
+Required: `SCHEMA_STATUS=COMPLETE`, `MIGRATION_REQUIRED=false`,
+`DB_APPLICATION_ID=1346650441`, and `PRODUCTION_MIGRATION_CAN_WRITE_ROOT_OWNED_DB=true`.
+The migration uses one `BEGIN IMMEDIATE` transaction for schema changes, identity,
+schema verification, and integrity verification.
+
+### Step 10: Strict Post-Migration Identity Preflight
+
+The legacy exception is forbidden after reconciliation:
 
 ```bash
-docker compose -f docker-compose.yml -f docker-compose.production.yml run --rm --no-deps \
+docker run --rm \
+  --user 65534:65534 \
+  -v "${PHOTODOC_DB_VOLUME:-photodoc_backend-data}:/data:ro" \
+  -v "${RELEASE_DIR}/scripts:/candidate/scripts:ro" \
+  -v "${RELEASE_DIR}/backend:/candidate/backend:ro" \
+  -w /candidate \
+  python:3.11-alpine \
+  python scripts/production_preflight.py --db /data/orders.db --check-only
+```
+
+Required: `DB_IDENTITY_VALID=true`, `READY_FOR_STARTUP=true`, and
+`DB_APPLICATION_ID=1346650441`.
+
+### Step 11: Build the Candidate Application Images
+
+Migration does not build application images. Build them explicitly from the staged,
+SHA-verified source before any candidate application container is created or started:
+
+```bash
+docker compose --project-directory "${RELEASE_DIR}" -p photodoc \
+  -f "${RELEASE_DIR}/docker-compose.yml" \
+  -f "${RELEASE_DIR}/docker-compose.production.yml" \
+  config --quiet
+docker compose --project-directory "${RELEASE_DIR}" -p photodoc \
+  -f "${RELEASE_DIR}/docker-compose.yml" \
+  -f "${RELEASE_DIR}/docker-compose.production.yml" \
+  build
+docker image inspect photodoc-backend photodoc-frontend >/dev/null
+echo "CANDIDATE_IMAGES_BUILT=true"
+```
+
+`PHOTODOC_ENV_FILE` deliberately points at the existing production env file. The
+candidate staging tree contains source only and must not contain copied secrets.
+
+### Step 12: Prepare Database and Upload Permissions for UID 1000
+
+The audited uploads bind `/opt/photodoc/backend/uploads` is also `root:root` mode
+`0755`; do not omit it and do not delete or alter existing upload contents:
+
+```bash
+docker compose --project-directory "${RELEASE_DIR}" -p photodoc \
+  -f "${RELEASE_DIR}/docker-compose.yml" \
+  -f "${RELEASE_DIR}/docker-compose.production.yml" \
+  run --rm --no-deps \
   --user root \
   backend \
   sh -c '
-    chown -R 1000:1000 /data &&
-    test -w /data/orders.db
+    chown -R 1000:1000 /data /app/uploads &&
+    test -w /data/orders.db &&
+    test -w /app/uploads
   '
 ```
 
-### Step 7: Launch New Application Stack
-```bash
-# Validate effective compose configuration
-docker compose -f docker-compose.yml -f docker-compose.production.yml config
+### Step 13: Verify UID 1000 Writability
 
-# Build and start services
-docker compose -f docker-compose.yml -f docker-compose.production.yml build
-docker compose -f docker-compose.yml -f docker-compose.production.yml up -d --wait --wait-timeout 180
+These commands run as the image's default `appuser` (UID 1000):
+
+```bash
+docker compose --project-directory "${RELEASE_DIR}" -p photodoc \
+  -f "${RELEASE_DIR}/docker-compose.yml" \
+  -f "${RELEASE_DIR}/docker-compose.production.yml" \
+  run --rm --no-deps \
+  backend \
+  python -c "import sqlite3; c=sqlite3.connect('/data/orders.db'); c.execute('BEGIN IMMEDIATE'); c.rollback(); c.close()"
+echo "DB_APPUSER_WRITABLE=true"
+
+docker compose --project-directory "${RELEASE_DIR}" -p photodoc \
+  -f "${RELEASE_DIR}/docker-compose.yml" \
+  -f "${RELEASE_DIR}/docker-compose.production.yml" \
+  run --rm --no-deps \
+  backend \
+  sh -c 'touch /app/uploads/.appuser-write-test && rm /app/uploads/.appuser-write-test'
+echo "UPLOADS_APPUSER_WRITABLE=true"
 ```
 
-### Step 8: Post-Deployment Smoke Verification
+### Step 14: Start the New Application from the Built Candidate Images
+
 ```bash
-# 1. Backend health via local proxy
+docker compose --project-directory "${RELEASE_DIR}" -p photodoc \
+  -f "${RELEASE_DIR}/docker-compose.yml" \
+  -f "${RELEASE_DIR}/docker-compose.production.yml" \
+  up -d --no-build --wait --wait-timeout 180
+```
+
+### Step 15: Local Smoke Verification
+
+```bash
 curl -f http://127.0.0.1:8080/api/health
-# Expected: {"status":"ok"}
-
-# 2. Frontend SPA root
-curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8080/
-# Expected: 200
-
-# 3. Open Graph asset
-curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8080/og/photodoc-og.jpg
-# Expected: 200
-
-# 4. Backend database write verification
-docker compose -f docker-compose.yml -f docker-compose.production.yml exec -T backend sh -c '
-  test -w /data &&
-  test -w /data/orders.db &&
-  test -w /app/uploads
+curl -f -o /dev/null http://127.0.0.1:8080/
+curl -f -o /dev/null http://127.0.0.1:8080/og/photodoc-og.jpg
+docker compose --project-directory "${RELEASE_DIR}" -p photodoc \
+  -f "${RELEASE_DIR}/docker-compose.yml" \
+  -f "${RELEASE_DIR}/docker-compose.production.yml" \
+  exec -T backend sh -c '
+  test -w /data/orders.db && test -w /app/uploads
 '
 ```
+
+Required final evidence: `PRODUCTION_SEQUENCE_VERIFIED=true` and
+`PRODUCTION_RUNBOOK_DOWN_V=false`.
 
 ---
 
@@ -237,7 +392,45 @@ docker compose -f docker-compose.yml -f docker-compose.production.yml exec -T ba
 > `PRODUCTION_RUNBOOK_DOWN_V=false`
 > `ROLLBACK_DELETES_PRODUCTION_VOLUME=false`
 
-### 5.1 Mode 1: Rollback to Previous Container Release (`/opt/photodoc/release.zip`)
+### 5.1 Required Rollback Artifact Gate
+
+The legacy `/opt/photodoc/release.zip` is not an acceptable rollback artifact. Build the known-good source bundle before cutover:
+
+```bash
+python scripts/build_rollback_bundle.py \
+  --source /path/to/known-good-release-tree \
+  --output /secure/rollback/photodoc-known-good-pre-upgrade.tar.gz \
+  --manifest-output /secure/rollback/manifest.sha256
+
+sha256sum /secure/rollback/photodoc-known-good-pre-upgrade.tar.gz \
+  > /secure/rollback/photodoc-known-good-pre-upgrade.tar.gz.sha256
+
+RESTORE_REHEARSAL="$(mktemp -d)"
+python scripts/verify_rollback_bundle.py \
+  --bundle /secure/rollback/photodoc-known-good-pre-upgrade.tar.gz \
+  --extract-to "${RESTORE_REHEARSAL}" \
+  --require docker-compose.yml \
+  --require backend/main.py \
+  --require frontend/nginx.conf
+```
+
+Before stopping the old production application, all of these must be true:
+
+```text
+ROLLBACK_BUNDLE_PRESENT=true
+ROLLBACK_BUNDLE_HASH_VALID=true
+ROLLBACK_LINUX_RESTORE_REHEARSED=true
+```
+
+The bundle and its manifest must contain no `.env`, uploads, database, backups, logs,
+tokens, private keys, credentials, or runtime state. Both the builder and verifier scan
+file contents for private-key headers, `sb_secret` material, and non-placeholder
+password/token/secret/private-key/credential assignments. Findings report only the
+filename and category; matched secret values are never printed. A successful scan must
+report `ROLLBACK_CONTENT_SECRET_SCAN=true`, `ROLLBACK_SECRET_VALUES_PRINTED=false`,
+`ROLLBACK_BUNDLE_SECRET_MATCHES=0`, and `FORBIDDEN_PATH_MATCHES=0`.
+
+### 5.2 Mode 1: Rollback to the Verified Previous Container Release
 
 If the new stack fails cutover:
 
@@ -245,11 +438,20 @@ If the new stack fails cutover:
    ```bash
    docker compose -f docker-compose.yml -f docker-compose.production.yml down
    ```
-2. **Restore previous application files**:
+2. **Verify the immutable bundle hash, then restore into an empty staging directory**:
    ```bash
-   unzip -o /opt/photodoc/release.zip -d /opt/photodoc/
+   cd /secure/rollback
+   sha256sum -c photodoc-known-good-pre-upgrade.tar.gz.sha256
+   RESTORE_DIR="$(mktemp -d)"
+   python /opt/photodoc/scripts/verify_rollback_bundle.py \
+     --bundle photodoc-known-good-pre-upgrade.tar.gz \
+     --extract-to "${RESTORE_DIR}" \
+     --require docker-compose.yml \
+     --require backend/main.py \
+     --require frontend/nginx.conf
    ```
-3. **Restore database backup (if schema rollback is required)**:
+3. Install the verified staged release files using the approved release procedure. Preserve `.env`, uploads, database volumes, backups, and logs; none are supplied by the bundle.
+4. **Restore database backup (if schema rollback is required)**:
    ```bash
    docker run --rm \
      -v photodoc_backend-data:/data \
@@ -257,18 +459,18 @@ If the new stack fails cutover:
      alpine \
      cp "/backup/${BACKUP_NAME}" /data/orders.db
    ```
-4. **Permissions compatibility on rollback**:
+5. **Permissions compatibility on rollback**:
    The previous production backend runs as `root`. Root retains full read/write access to files owned by `UID 1000` (`OLD_ROOT_BACKEND_CAN_ACCESS_UID1000_DB=true`). No reverse chown is required.
-5. **Start previous stack**:
+6. **Start previous stack**:
    ```bash
    docker compose up -d
    ```
-6. **Verify rollback**:
+7. **Verify rollback**:
    ```bash
    curl -f http://127.0.0.1:8080/api/health
    ```
 
-### 5.2 Mode 2: Future Git-Based Container Releases Rollback
+### 5.3 Mode 2: Future Git-Based Container Releases Rollback
 
 For future releases managed via Git commits:
 
