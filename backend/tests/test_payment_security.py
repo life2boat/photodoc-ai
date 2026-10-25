@@ -32,6 +32,7 @@ if str(backend_dir) not in sys.path:
 TEST_MERCHANT_LOGIN = "test_merchant"
 TEST_PASSWORD1 = "test_pass_1_merchant"
 TEST_PASSWORD2 = "test_pass_2_server"
+TEST_ORDER_TOKEN = "synthetic-order-token-for-tests"
 
 os.environ["ROBOKASSA_MERCHANT_LOGIN"] = TEST_MERCHANT_LOGIN
 os.environ["ROBOKASSA_PASSWORD1"] = TEST_PASSWORD1
@@ -64,6 +65,7 @@ def setup_and_teardown_db():
     """Re-create schema and wipe orders between every test."""
     init_db()
     conn = sqlite3.connect(DB_PATH)
+    conn.cursor().execute("DELETE FROM delivery_jobs")
     conn.cursor().execute("DELETE FROM orders")
     conn.commit()
     conn.close()
@@ -101,13 +103,14 @@ def create_db_order(
         """
         INSERT INTO orders (
             name, phone, format, paper, crop, filename,
-            status, payment_status, order_amount, payment_amount
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            status, payment_status, order_amount, payment_amount, order_token_hash
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             name, phone, format_str, paper, crop,
             ", ".join([f"file_{i}.jpg" for i in range(file_count)]),
             status, payment_status, order_amount, formatted_price,
+            hashlib.sha256(TEST_ORDER_TOKEN.encode()).hexdigest(),
         ),
     )
     conn.commit()
@@ -151,7 +154,7 @@ def test_paid_order_payment_create_is_terminal(client):
     ).fetchone()
     conn.close()
 
-    response = client.post("/api/payment/create", json={"order_id": order_id})
+    response = client.post("/api/payment/create", json={"order_id": order_id, "order_token": TEST_ORDER_TOKEN})
     assert response.status_code == 409
     assert response.json()["detail"] == "Order is already paid"
 
@@ -169,14 +172,14 @@ def test_paid_order_payment_create_is_terminal(client):
 
 def test_unpaid_to_pending_and_repeated_create_is_idempotent(client):
     order_id = create_db_order(status="new", payment_status="unpaid")
-    first = client.post("/api/payment/create", json={"order_id": order_id})
+    first = client.post("/api/payment/create", json={"order_id": order_id, "order_token": TEST_ORDER_TOKEN})
     assert first.status_code == 200
     first_state = get_order_by_id(order_id)
     assert first_state["payment_status"] == "pending"
     assert first_state["status"] == "awaiting_payment"
     assert first_state["payment_amount"] == "300.00"
 
-    second = client.post("/api/payment/create", json={"order_id": order_id})
+    second = client.post("/api/payment/create", json={"order_id": order_id, "order_token": TEST_ORDER_TOKEN})
     assert second.status_code == 200
     assert second.json()["payment_url"] == first.json()["payment_url"]
     second_state = get_order_by_id(order_id)
@@ -190,7 +193,7 @@ def test_unknown_payment_state_fails_closed(client):
     conn.commit()
     conn.close()
 
-    response = client.post("/api/payment/create", json={"order_id": order_id})
+    response = client.post("/api/payment/create", json={"order_id": order_id, "order_token": TEST_ORDER_TOKEN})
     assert response.status_code == 409
     assert get_order_by_id(order_id)["payment_status"] == "corrupt"
 
@@ -212,7 +215,7 @@ def test_payment_create_racing_result_url_cannot_revert_paid(client, monkeypatch
 
     def call_create():
         create_response.append(
-            client.post("/api/payment/create", json={"order_id": order_id})
+            client.post("/api/payment/create", json={"order_id": order_id, "order_token": TEST_ORDER_TOKEN})
         )
 
     create_thread = threading.Thread(target=call_create)
@@ -242,7 +245,7 @@ def test_underpayment_rejected(client):
     """
     order_id = create_db_order(format_str="3x4", file_count=1)
 
-    response = client.post("/api/payment/create", json={"order_id": order_id, "amount": 1.00})
+    response = client.post("/api/payment/create", json={"order_id": order_id, "order_token": TEST_ORDER_TOKEN, "amount": 1.00})
     assert response.status_code == 400
     assert "Payment amount mismatch" in response.json()["detail"]
 
@@ -270,17 +273,18 @@ def test_payment_amount_cannot_be_price_authority(client):
         """
         INSERT INTO orders (
             name, phone, format, paper, crop, filename,
-            status, payment_status, order_amount, payment_amount
+            status, payment_status, order_amount, payment_amount, order_token_hash
         ) VALUES ('Test', '+7999', '3x4', '', '', 'file_0.jpg',
-                  'new', 'unpaid', '300.00', '1.00')
+                  'new', 'unpaid', '300.00', '1.00', ?)
         """
+        , (hashlib.sha256(TEST_ORDER_TOKEN.encode()).hexdigest(),)
     )
     conn.commit()
     order_id = cursor.lastrowid
     conn.close()
 
     # payment/create MUST use order_amount (300.00), NOT payment_amount (1.00)
-    response = client.post("/api/payment/create", json={"order_id": order_id})
+    response = client.post("/api/payment/create", json={"order_id": order_id, "order_token": TEST_ORDER_TOKEN})
     assert response.status_code == 200
     data = response.json()
     assert data["amount"] == "300.00", (
@@ -304,16 +308,17 @@ def test_null_order_amount_recalculates_not_payment_amount(client):
         """
         INSERT INTO orders (
             name, phone, format, paper, crop, filename,
-            status, payment_status, order_amount, payment_amount
+            status, payment_status, order_amount, payment_amount, order_token_hash
         ) VALUES ('Test', '+7999', '3x4', '', '', 'file_0.jpg',
-                  'new', 'unpaid', NULL, '1.00')
+                  'new', 'unpaid', NULL, '1.00', ?)
         """
+        , (hashlib.sha256(TEST_ORDER_TOKEN.encode()).hexdigest(),)
     )
     conn.commit()
     order_id = cursor.lastrowid
     conn.close()
 
-    response = client.post("/api/payment/create", json={"order_id": order_id})
+    response = client.post("/api/payment/create", json={"order_id": order_id, "order_token": TEST_ORDER_TOKEN})
     assert response.status_code == 200
     data = response.json()
     assert data["amount"] == "300.00", (
@@ -331,7 +336,7 @@ def test_payment_create_authoritative_without_client_amount(client):
     Server derives 300.00 authoritatively.
     """
     order_id = create_db_order(format_str="3.5x4.5", file_count=1)
-    response = client.post("/api/payment/create", json={"order_id": order_id})
+    response = client.post("/api/payment/create", json={"order_id": order_id, "order_token": TEST_ORDER_TOKEN})
     assert response.status_code == 200
     data = response.json()
     assert data["ok"] is True
@@ -502,7 +507,7 @@ def test_success_url_displays_paid_only_after_result_url(client):
 # TEST 7 — Unknown order not found
 # ===========================================================================
 def test_unknown_order_not_found(client):
-    res = client.post("/api/payment/create", json={"order_id": 999999})
+    res = client.post("/api/payment/create", json={"order_id": 999999, "order_token": TEST_ORDER_TOKEN})
     assert res.status_code == 404
     assert "Order not found" in res.json()["detail"]
 

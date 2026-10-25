@@ -2,8 +2,15 @@ import os
 import logging
 import sqlite3
 import hashlib
+import hmac
 import smtplib
 import urllib.parse
+import secrets
+import uuid
+import threading
+import tempfile
+import re
+from contextlib import asynccontextmanager
 from pathlib import Path
 from datetime import datetime
 from email.mime.text import MIMEText
@@ -18,6 +25,7 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 
 from db_contract import APPLICATION_ID, inspect_database, read_application_id
+from delivery import DELIVERY_SCHEMA, enqueue, process_due, worker_loop
 
 # Загрузка переменных окружения
 load_dotenv()
@@ -25,7 +33,22 @@ load_dotenv()
 # Настройка базового логирования
 logging.basicConfig(level=logging.INFO)
 
-app = FastAPI(title="PhotoDoc AI API")
+@asynccontextmanager
+async def lifespan(_app):
+    stop = threading.Event()
+    thread = None
+    if os.getenv("DELIVERY_WORKER_ENABLED", "1") != "0":
+        thread = threading.Thread(target=worker_loop, args=(DB_PATH, deliver_job, stop), daemon=True)
+        thread.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        if thread is not None:
+            thread.join(timeout=5)
+
+
+app = FastAPI(title="PhotoDoc AI API", lifespan=lifespan)
 
 # Настройка CORS
 app.add_middleware(
@@ -81,9 +104,13 @@ def init_db():
             robokassa_inv_id TEXT,
             paid_at TEXT,
             payment_email_sent_at TEXT,
+            order_token_hash TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
         ''')
+        for statement in DELIVERY_SCHEMA.split(";"):
+            if statement.strip():
+                conn.execute(statement)
         if read_application_id(conn) != APPLICATION_ID:
             raise RuntimeError("Failed to initialize PhotoDoc database identity")
         conn.commit()
@@ -119,9 +146,27 @@ else:
     init_db()
 
 
+def delivery_schema_ready() -> bool:
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(orders)")}
+        table = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='delivery_jobs'").fetchone()
+        indexes = {row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='delivery_jobs'"
+        )}
+        return ("order_token_hash" in columns and table is not None and
+                {"idx_delivery_due", "idx_paid_email_once", "idx_admin_email_once"} <= indexes)
+    finally:
+        conn.close()
+
+
+if not delivery_schema_ready():
+    raise RuntimeError("P1 delivery schema is missing; run reconcile_delivery_schema.py")
+
+
 @app.get("/api/health")
 def health_check():
-    if not database_readiness_ok():
+    if not database_readiness_ok() or not delivery_schema_ready():
         return JSONResponse({"status": "unavailable"}, status_code=503)
     return {"status": "ok"}
 
@@ -334,9 +379,11 @@ def mark_order_paid(order_id: int, amount: str) -> bool:
             """,
             (amount, paid_timestamp, order_id),
         )
-        conn.commit()
         if cursor.rowcount == 1:
+            enqueue(conn, order_id=order_id, kind="paid_email")
+            conn.commit()
             return True
+        conn.commit()
         row = cursor.execute(
             "SELECT payment_status FROM orders WHERE id = ?", (order_id,)
         ).fetchone()
@@ -356,6 +403,55 @@ def sanitize_upload_filename(filename: str | None) -> str:
     return cleaned.strip() or "upload"
 
 
+MAX_FILES = 10
+MAX_FILE_BYTES = 20 * 1024 * 1024
+MAX_ORDER_BYTES = 80 * 1024 * 1024
+UPLOAD_CHUNK_BYTES = 64 * 1024
+IMAGE_TYPES = {"image/jpeg": ("jpg", b"\xff\xd8\xff"),
+               "image/png": ("png", b"\x89PNG\r\n\x1a\n"),
+               "image/webp": ("webp", b"RIFF")}
+
+
+def _folder_component(value: str) -> str:
+    component = re.sub(r"[^\w-]+", "_", value.strip(), flags=re.UNICODE).strip("_")[:100]
+    return component or "Не_указано"
+
+
+async def _stage_upload(file: UploadFile, used_bytes: int) -> dict:
+    if file.content_type not in IMAGE_TYPES:
+        raise HTTPException(status_code=400, detail="Only JPEG, PNG and WebP images are accepted")
+    descriptor, temporary_path = tempfile.mkstemp(prefix=".incoming-", dir=UPLOAD_DIR)
+    path = Path(temporary_path)
+    digest = hashlib.sha256()
+    size = 0
+    try:
+        with os.fdopen(descriptor, "wb") as output:
+            first = True
+            while chunk := await file.read(UPLOAD_CHUNK_BYTES):
+                if first:
+                    suffix, magic = IMAGE_TYPES[file.content_type]
+                    valid = chunk.startswith(magic)
+                    if file.content_type == "image/webp":
+                        valid = valid and chunk[8:12] == b"WEBP"
+                    if not valid:
+                        raise HTTPException(status_code=400, detail="Image content does not match its type")
+                    first = False
+                size += len(chunk)
+                if size > MAX_FILE_BYTES or used_bytes + size > MAX_ORDER_BYTES:
+                    raise HTTPException(status_code=413, detail="Upload size limit exceeded")
+                output.write(chunk)
+                digest.update(chunk)
+            if size == 0:
+                raise HTTPException(status_code=400, detail="Empty image")
+            output.flush()
+            os.fsync(output.fileno())
+        return {"path": path, "size": size, "sha256": digest.hexdigest(),
+                "original_name": file.filename or "upload", "suffix": suffix}
+    except Exception:
+        path.unlink(missing_ok=True)
+        raise
+
+
 # --- Фоновые задачи ---
 def send_order_email(order_id: int, name: str, phone: str, comment: str, format: str = "Не указан", paper: str = "Не указана", crop: str = "Не указано"):
     smtp_server = os.getenv("SMTP_SERVER")
@@ -366,12 +462,13 @@ def send_order_email(order_id: int, name: str, phone: str, comment: str, format:
 
     if not all([smtp_server, smtp_user, smtp_password, email_to]):
         logging.warning("SMTP настройки не заданы в .env — отправка email пропущена.")
-        return
+        return False
 
     msg = MIMEMultipart()
     msg["From"] = smtp_user
     msg["To"] = email_to
     msg["Subject"] = f"Новый заказ #{order_id} | PhotoDoc AI"
+    msg["Message-ID"] = f"<photodoc-order-{order_id}-new@photodoc-ai.ru>"
 
     safe_folder_name = f"Заказ_{order_id}_{name.replace(' ', '_')}"
     raw_path = f"PhotoDoc_Orders/{safe_folder_name}"
@@ -390,8 +487,10 @@ def send_order_email(order_id: int, name: str, phone: str, comment: str, format:
             server.login(smtp_user, smtp_password)
             server.send_message(msg)
         logging.info("Email для заказа %s успешно отправлен.", order_id)
+        return True
     except Exception as e:
         logging.error("Ошибка при отправке Email заказа %s: %s", order_id, e)
+        return False
 
 
 def send_paid_order_email(order_id: int):
@@ -402,12 +501,12 @@ def send_paid_order_email(order_id: int):
     """
     order = get_order_by_id(order_id)
     if not order:
-        return
+        return False
 
     # Idempotency guard: skip if email was already successfully sent
     if order.get("payment_email_sent_at"):
         logging.info("Email об оплате заказа #%s уже был отправлен ранее, пропуск.", order_id)
-        return
+        return True
 
     smtp_server = os.getenv("SMTP_SERVER")
     smtp_port = int(os.getenv("SMTP_PORT", 465))
@@ -422,12 +521,13 @@ def send_paid_order_email(order_id: int):
             "payment_email_sent_at остаётся NULL для возможности повтора.",
             order_id,
         )
-        return
+        return False
 
     msg = MIMEMultipart()
     msg["From"] = smtp_user
     msg["To"] = email_to
     msg["Subject"] = f"✅ Заказ #{order_id} ОПЛАЧЕН ({order.get('payment_amount', '0.00')} руб.) | PhotoDoc AI"
+    msg["Message-ID"] = f"<photodoc-order-{order_id}-paid@photodoc-ai.ru>"
     body = (
         f"Заказ #{order_id} успешно оплачен!\n"
         f"Клиент: {order.get('name')}\n"
@@ -450,9 +550,11 @@ def send_paid_order_email(order_id: int):
         conn.commit()
         conn.close()
         logging.info("Email об оплате заказа #%s успешно отправлен.", order_id)
+        return True
     except Exception as e:
         # SMTP failure: payment_email_sent_at stays NULL → retry remains possible
         logging.error("Ошибка при отправке email об оплате заказа #%s: %s", order_id, e)
+        return False
 
 
 def ensure_yandex_folder(token: str, path: str):
@@ -461,71 +563,118 @@ def ensure_yandex_folder(token: str, path: str):
     current_path = ""
     for part in parts:
         current_path = f"{current_path}/{part}" if current_path else part
-        try:
-            httpx.put(
-                "https://cloud-api.yandex.net/v1/disk/resources",
-                headers=headers,
-                params={"path": current_path},
-                timeout=10,
-            )
-        except Exception:
-            pass
+        response = httpx.put(
+            "https://cloud-api.yandex.net/v1/disk/resources",
+            headers=headers,
+            params={"path": current_path},
+            timeout=10,
+        )
+        if response.status_code not in (201, 409):
+            response.raise_for_status()
+            raise RuntimeError("Yandex folder creation was not confirmed")
+
+
+def _remote_verified(token: str, remote_path: str, expected_sha256: str, expected_size: int) -> bool:
+    response = httpx.get(
+        "https://cloud-api.yandex.net/v1/disk/resources",
+        headers={"Authorization": f"OAuth {token}"},
+        params={"path": remote_path, "fields": "sha256,size,type"},
+        timeout=15,
+    )
+    if response.status_code == 404:
+        return False
+    response.raise_for_status()
+    metadata = response.json()
+    if metadata.get("type") != "file" or metadata.get("sha256", "").lower() != expected_sha256.lower() or metadata.get("size") != expected_size:
+        raise RuntimeError("Remote file exists but its content does not match this job")
+    return True
 
 
 def upload_to_yandex_disk(local_file_path: str, remote_folder_path: str, remote_file_name: str):
     token = os.getenv("YANDEX_DISK_TOKEN")
     if not token:
-        return
+        raise RuntimeError("Yandex Disk OAuth token is unavailable")
 
+    local = Path(local_file_path)
+    digest = hashlib.sha256()
+    size = 0
+    with local.open("rb") as source:
+        for chunk in iter(lambda: source.read(65536), b""):
+            digest.update(chunk)
+            size += len(chunk)
     ensure_yandex_folder(token, remote_folder_path)
     headers = {"Authorization": f"OAuth {token}"}
     remote_path = f"{remote_folder_path}/{remote_file_name}"
+    if _remote_verified(token, remote_path, digest.hexdigest(), size):
+        return True
+    upload_url_response = httpx.get(
+        "https://cloud-api.yandex.net/v1/disk/resources/upload",
+        headers=headers,
+        params={"path": remote_path, "overwrite": "false"},
+        timeout=30,
+    )
+    if upload_url_response.status_code == 409 and _remote_verified(token, remote_path, digest.hexdigest(), size):
+        return True
+    upload_url_response.raise_for_status()
+    href = upload_url_response.json().get("href")
+    if not href or not href.startswith("https://"):
+        raise RuntimeError("Yandex upload URL is missing or invalid")
+    with local.open("rb") as source:
+        def chunks():
+            for chunk in iter(lambda: source.read(65536), b""):
+                yield chunk
+        put_response = httpx.put(href, content=chunks(), headers={"Content-Length": str(size)}, timeout=60)
+        put_response.raise_for_status()
+    if not _remote_verified(token, remote_path, digest.hexdigest(), size):
+        raise RuntimeError("Yandex upload was not confirmed by resource metadata")
+    return True
 
-    try:
-        upload_url_response = httpx.get(
-            "https://cloud-api.yandex.net/v1/disk/resources/upload",
-            headers=headers,
-            params={"path": remote_path, "overwrite": "true"},
-            timeout=30,
-        )
-        upload_url_response.raise_for_status()
-        href = upload_url_response.json().get("href")
-        if not href:
-            return
 
-        with open(local_file_path, "rb") as f:
-            put_response = httpx.put(href, content=f.read(), timeout=60)
-            put_response.raise_for_status()
-    except Exception as e:
-        logging.error("Ошибка загрузки на Яндекс.Диск: %s", e)
-
-
-def upload_info_to_yandex_disk(order_id: int, name: str, phone: str, format: str, paper: str, crop: str, comment: str, remote_folder_path: str):
-    token = os.getenv("YANDEX_DISK_TOKEN")
-    if not token:
-        return
-
-    ensure_yandex_folder(token, remote_folder_path)
+def order_info_bytes(order_id: int, name: str, phone: str, format: str, paper: str, crop: str, comment: str) -> bytes:
     order_info_text = (
         f"Заказ №: {order_id}\nИмя: {name}\nТелефон: {phone}\n"
         f"Формат: {format}\nБумага: {paper}\nКадрирование: {crop}\nКомментарий: {comment}"
     )
-    headers = {"Authorization": f"OAuth {token}"}
-    info_file_path = f"{remote_folder_path}/info.txt"
+    return order_info_text.encode("utf-8")
 
-    try:
-        res = httpx.get(
-            "https://cloud-api.yandex.net/v1/disk/resources/upload",
-            headers=headers,
-            params={"path": info_file_path, "overwrite": "true"},
-            timeout=30,
-        )
-        if res.status_code == 200:
-            upload_url = res.json().get("href")
-            if upload_url:
-                httpx.put(upload_url, content=order_info_text.encode("utf-8"), timeout=30)
-    except Exception as e:
-        logging.error("Ошибка загрузки info.txt: %s", e)
+
+def upload_info_to_yandex_disk(order_id: int, name: str, phone: str, format: str, paper: str,
+                               crop: str, comment: str, remote_folder_path: str,
+                               source_path: str | None = None):
+    if source_path:
+        return upload_to_yandex_disk(source_path, remote_folder_path, "info.txt")
+    with tempfile.TemporaryDirectory() as directory:
+        source = Path(directory) / "info.txt"
+        source.write_bytes(order_info_bytes(order_id, name, phone, format, paper, crop, comment))
+        return upload_to_yandex_disk(str(source), remote_folder_path, "info.txt")
+
+
+def deliver_job(job: dict) -> None:
+    order = get_order_by_id(job["order_id"])
+    if not order:
+        raise RuntimeError("Order for delivery job is missing")
+    if job["kind"] in ("file", "info"):
+        path = Path(job["local_path"])
+        if not path.is_file() or UPLOAD_DIR.resolve() not in path.resolve().parents:
+            raise RuntimeError("Local delivery source is missing or outside uploads")
+        remote_folder, remote_name = job["remote_path"].rsplit("/", 1)
+        if job["kind"] == "info":
+            ok = upload_info_to_yandex_disk(
+                order["id"], order["name"], order["phone"], order["format"],
+                order["paper"], order["crop"], order["comment"], remote_folder,
+                source_path=str(path),
+            )
+        else:
+            ok = upload_to_yandex_disk(str(path), remote_folder, remote_name)
+    elif job["kind"] == "admin_email":
+        ok = send_order_email(order["id"], order["name"], order["phone"], order["comment"],
+                              order["format"], order["paper"], order["crop"])
+    elif job["kind"] == "paid_email":
+        ok = send_paid_order_email(order["id"])
+    else:
+        raise RuntimeError("Unknown delivery job kind")
+    if not ok:
+        raise RuntimeError("Delivery was not confirmed")
 
 
 # --- Эндпоинт приема заказа ---
@@ -541,78 +690,81 @@ async def create_order(
     crop: str = Form("Не указано"),
     files: List[UploadFile] = File(...),
 ):
+    if not 1 <= len(files) <= MAX_FILES:
+        raise HTTPException(status_code=400, detail="Invalid number of files")
+    amount = format_robokassa_amount(calculate_authoritative_price(format, paper, crop, len(files)))
+    staged = []
+    finalized = []
+    conn = None
+    commit_started = False
     try:
-        safe_filenames = [sanitize_upload_filename(f.filename) for f in files]
-        filenames_joined = ", ".join(safe_filenames)
+        total = 0
+        for file in files:
+            item = await _stage_upload(file, total)
+            staged.append(item)
+            total += item["size"]
 
-        # Вычисляем авторитетную стоимость на сервере
-        order_price = calculate_authoritative_price(format, paper, crop, len(files))
-        formatted_order_amount = format_robokassa_amount(order_price)
-
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        created_at_now = datetime.utcnow().isoformat()
-        cursor.execute(
-            """
-            INSERT INTO orders (
-                name, phone, email, format, paper, crop, comment, filename,
-                status, payment_status, order_amount, payment_amount, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'new', 'unpaid', ?, ?, ?)
-            """,
-            (
-                name.strip(),
-                phone.strip(),
-                email.strip(),
-                format.strip(),
-                paper.strip(),
-                crop.strip(),
-                comment.strip(),
-                filenames_joined,
-                formatted_order_amount,
-                formatted_order_amount,
-                created_at_now,
-            ),
+        token = secrets.token_urlsafe(32)
+        token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        conn = sqlite3.connect(DB_PATH, timeout=10)
+        conn.execute("BEGIN IMMEDIATE")
+        cursor = conn.execute(
+            "INSERT INTO orders (name, phone, email, format, paper, crop, comment, filename, "
+            "status, payment_status, order_amount, payment_amount, created_at, order_token_hash) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'new', 'unpaid', ?, ?, ?, ?)",
+            (name.strip(), phone.strip(), email.strip(), format.strip(), paper.strip(), crop.strip(),
+             comment.strip(), ", ".join(sanitize_upload_filename(x["original_name"]) for x in staged),
+             amount, amount, datetime.utcnow().isoformat(), token_hash),
         )
-        conn.commit()
         order_id = cursor.lastrowid
-        conn.close()
+        folder = (f"PhotoDoc_Orders/Заказ_{order_id}_{_folder_component(name)}/"
+                  f"{_folder_component(format)}_{_folder_component(paper)}_{_folder_component(crop)}")
+        for item in staged:
+            attachment_id = uuid.uuid4().hex
+            stored_name = f"{order_id}_{attachment_id}.{item['suffix']}"
+            final_path = UPLOAD_DIR / stored_name
+            item["path"].replace(final_path)
+            finalized.append(final_path)
+            enqueue(conn, order_id=order_id, kind="file", local_path=str(final_path),
+                    original_name=item["original_name"], remote_path=f"{folder}/{stored_name}",
+                    sha256=item["sha256"], size=item["size"])
 
-        safe_name = name.replace(" ", "_")
-        safe_settings = f"{format}_{paper}_{crop}".replace(" ", "_")
-        remote_folder_path = f"PhotoDoc_Orders/Заказ_{order_id}_{safe_name}/{safe_settings}"
-
-        for file, safe_filename in zip(files, safe_filenames):
-            local_filename = f"{order_id}_{safe_filename}"
-            local_file_path = (UPLOAD_DIR / local_filename).resolve()
-            if UPLOAD_DIR.resolve() not in local_file_path.parents:
-                raise HTTPException(status_code=400, detail="Invalid filename")
-
-            content = await file.read()
-            with open(local_file_path, "wb") as f:
-                f.write(content)
-
-            background_tasks.add_task(upload_to_yandex_disk, str(local_file_path), remote_folder_path, local_filename)
-
-        background_tasks.add_task(send_order_email, order_id, name, phone, comment, format, paper, crop)
-        background_tasks.add_task(upload_info_to_yandex_disk, order_id, name, phone, format, paper, crop, comment, remote_folder_path)
-
-        return {
-            "ok": True,
-            "message": "Заказ успешно создан",
-            "order_id": order_id,
-            "amount": formatted_order_amount,
-        }
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logging.error("Критическая ошибка при создании заказа: %s", e)
-        raise HTTPException(status_code=500, detail="Внутренняя ошибка сервера")
+        info_path = UPLOAD_DIR / f"{order_id}_{uuid.uuid4().hex}_info.txt"
+        info = order_info_bytes(order_id, name, phone, format, paper, crop, comment)
+        with info_path.open("xb") as output:
+            output.write(info)
+            output.flush()
+            os.fsync(output.fileno())
+        finalized.append(info_path)
+        enqueue(conn, order_id=order_id, kind="info", local_path=str(info_path),
+                original_name="info.txt", remote_path=f"{folder}/info.txt",
+                sha256=hashlib.sha256(info).hexdigest(), size=len(info))
+        enqueue(conn, order_id=order_id, kind="admin_email")
+        commit_started = True
+        conn.commit()
+        return {"ok": True, "message": "Заказ успешно создан", "order_id": order_id,
+                "order_token": token, "amount": amount}
+    except Exception as exc:
+        if conn is not None:
+            conn.rollback()
+        for item in staged:
+            item["path"].unlink(missing_ok=True)
+        if not commit_started:
+            for path in finalized:
+                path.unlink(missing_ok=True)
+        if isinstance(exc, HTTPException):
+            raise
+        logging.error("Критическая ошибка при создании заказа: %s", type(exc).__name__)
+        raise HTTPException(status_code=500, detail="Внутренняя ошибка сервера") from exc
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 # --- Эндпоинты платежной системы Robokassa ---
 class PaymentCreateRequest(BaseModel):
     order_id: int | str
+    order_token: str
     amount: Optional[float | str] = None
     email: Optional[str] = None
 
@@ -633,6 +785,12 @@ async def create_payment(payment: PaymentCreateRequest):
 
     order = get_order_by_id(order_id_int)
     if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    stored_token_hash = order.get("order_token_hash")
+    if not stored_token_hash:
+        raise HTTPException(status_code=409, detail="Legacy order requires manual payment handling")
+    supplied_hash = hashlib.sha256(payment.order_token.encode("utf-8")).hexdigest()
+    if not hmac.compare_digest(stored_token_hash, supplied_hash):
         raise HTTPException(status_code=404, detail="Order not found")
     if order.get("payment_status") == "paid":
         raise HTTPException(status_code=409, detail="Order is already paid")
@@ -667,7 +825,7 @@ async def create_payment(payment: PaymentCreateRequest):
         raise HTTPException(status_code=404, detail="Order not found")
 
     order_id_str = str(order_id_int)
-    customer_email = (payment.email or order.get("email") or "").strip()
+    customer_email = (order.get("email") or "").strip()
     signature_source = f"{merchant_login}:{amount_to_pay}:{order_id_str}:{password1}"
     signature = hashlib.md5(signature_source.encode("utf-8")).hexdigest()
 
@@ -757,8 +915,7 @@ async def robokassa_result(request: Request, background_tasks: BackgroundTasks):
 
     if was_transition_owner:
         logging.info("Result URL: Заказ #%s успешно отмечен как оплачен.", order_id)
-        # Schedule email only for the one call that owned the transition
-        background_tasks.add_task(send_paid_order_email, order_id)
+        # The paid-email job was committed in the same transaction as the paid state.
     else:
         logging.info(
             "Result URL: Заказ #%s уже отмечен как оплачен (конкурентный дубликат). "

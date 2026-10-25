@@ -2,8 +2,8 @@ import { API_BASE_URL } from '../config';
 
 const PAYMENT_API_URL = `${API_BASE_URL}/payment/create`;
 
-export async function createPaymentUrl(orderId, amount) {
-  const body = { order_id: orderId };
+export async function createPaymentUrl(orderId, orderToken, amount) {
+  const body = { order_id: orderId, order_token: orderToken };
   if (amount !== undefined && amount !== null) {
     body.amount = amount;
   }
@@ -29,7 +29,7 @@ export async function createPaymentUrl(orderId, amount) {
   return data.payment_url;
 }
 
-export async function redirectToPayment(orderId, amount) {
-  const paymentUrl = await createPaymentUrl(orderId, amount);
+export async function redirectToPayment(orderId, orderToken, amount) {
+  const paymentUrl = await createPaymentUrl(orderId, orderToken, amount);
   window.location.href = paymentUrl;
 }

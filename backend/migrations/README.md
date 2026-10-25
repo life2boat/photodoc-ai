@@ -39,3 +39,11 @@ If rollback of a database migration is required:
 3. Validate integrity:
    `sqlite3 /data/orders.db "PRAGMA integrity_check;"`
 4. Restart backend.
+
+# P1 additive order delivery migration
+
+After the PR #8 schema is fully reconciled and its backup verified, run
+`reconcile_delivery_schema.py --db PATH` in check mode, then with `--apply`,
+then in check mode again. It adds `order_token_hash` and the persistent
+`delivery_jobs` outbox without altering historical orders or files. See
+`docs/P1_ORDER_DELIVERY.md` for release ordering and recovery behavior.

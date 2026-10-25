@@ -66,6 +66,7 @@ export function RestoreWidget({ onSuccess, onReset }) {
   const [serviceName, setServiceName] = useState("");
   const [isSuccess, setIsSuccess] = useState(false);
   const [orderId, setOrderId] = useState(null);
+  const [orderToken, setOrderToken] = useState(null);
   const [paymentAmount, setPaymentAmount] = useState(0);
 
   const totalPrice = serviceName ? selectedFiles.length * SERVICES[serviceName] : 0;
@@ -157,6 +158,7 @@ export function RestoreWidget({ onSuccess, onReset }) {
 
       const data = await response.json();
       setOrderId(data.order_id || '...');
+      setOrderToken(data.order_token);
       setPaymentAmount(data.amount ? parseFloat(data.amount) : totalPrice);
       setIsSuccess(true);
       scrollToWidget();
@@ -187,6 +189,7 @@ export function RestoreWidget({ onSuccess, onReset }) {
     setServiceName("");
     setIsSuccess(false);
     setOrderId(null);
+    setOrderToken(null);
     setPaymentAmount(0);
     if (onReset) onReset();
     if (fileInputRef.current) {
@@ -202,7 +205,7 @@ export function RestoreWidget({ onSuccess, onReset }) {
         <div className="flex flex-col sm:flex-row gap-4 justify-center mt-6">
           <button
             type="button"
-            onClick={() => redirectToPayment(orderId, paymentAmount)}
+            onClick={() => redirectToPayment(orderId, orderToken, paymentAmount)}
             className="px-8 py-3 bg-yellow-400 text-black font-bold rounded-full hover:bg-yellow-500 transition-colors shadow-sm"
           >
             Перейти к оплате
