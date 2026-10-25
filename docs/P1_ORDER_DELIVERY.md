@@ -34,13 +34,20 @@ and removed only after checking the database; no automatic cleanup is performed.
 
 The worker claims due jobs with a SQLite write transaction and a three-minute
 lease. Failures retain local files and retry with bounded exponential backoff.
-Expired leases are eligible again after a process crash. Delivery state is in
-the same persistent database as the order. The Yandex upload uses the existing
-OAuth token, `overwrite=false`, and verifies remote SHA-256 and size before
+Expired leases are eligible again after a process crash. Lease fencing ensures
+that a delayed worker whose lease expired cannot clobber a newly claimed active lease.
+Retries are capped at a maximum attempt limit (default: 10, configurable via
+`DELIVERY_MAX_ATTEMPTS`) to quarantine unrecoverable tasks for inspection.
+Delivery state is in the same persistent database as the order. The Yandex upload uses
+the existing OAuth token, `overwrite=false`, and verifies remote SHA-256 and size before
 marking a job delivered. A matching remote file makes retries idempotent; a
 different file at that path is an error. Local sources remain available after
 delivery for manual recovery and backup; plan storage monitoring and a separate
 retention policy before deleting them.
+
+Upload limits are aligned across the containerized reverse proxy (`client_max_body_size 100M`)
+and backend (20 MiB per file, 80 MiB per order) to guarantee that multipart requests within
+backend constraints are accepted.
 
 Old orders have no token hash. They remain readable in the database, and
 existing signed Robokassa ResultURL callbacks can still complete initiated

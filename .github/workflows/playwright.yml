@@ -2,9 +2,10 @@ name: CI
 
 on:
   push:
-    branches: [ main, master ]
+    branches: [ main, master, fix/p1-order-delivery-hardening ]
   pull_request:
-    branches: [ main, master ]
+    branches: [ main, master, fix/p0-production-readiness ]
+  workflow_dispatch:
 
 jobs:
   playwright-tests:
@@ -405,6 +406,9 @@ jobs:
         HEALTH_RESP=$(curl --fail -sS "http://127.0.0.1:${PORT}/api/health")
         echo "API Health Response: ${HEALTH_RESP}"
         echo "${HEALTH_RESP}" | grep -q '"status"[[:space:]]*:[[:space:]]*"ok"'
+
+        echo "Testing containerized Nginx upload limits and contracts..."
+        python scripts/test_container_upload_limits.py --url "http://127.0.0.1:${PORT}"
     - name: Dump logs on failure
       if: failure()
       run: |

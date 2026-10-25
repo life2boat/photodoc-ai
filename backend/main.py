@@ -623,7 +623,7 @@ def upload_to_yandex_disk(local_file_path: str, remote_folder_path: str, remote_
         def chunks():
             for chunk in iter(lambda: source.read(65536), b""):
                 yield chunk
-        put_response = httpx.put(href, content=chunks(), headers={"Content-Length": str(size)}, timeout=60)
+        put_response = httpx.put(href, content=chunks(), headers={"Content-Length": str(size)}, timeout=httpx.Timeout(120.0, connect=30.0))
         put_response.raise_for_status()
     if not _remote_verified(token, remote_path, digest.hexdigest(), size):
         raise RuntimeError("Yandex upload was not confirmed by resource metadata")
