@@ -65,6 +65,12 @@ UPLOAD_DIR = BASE_DIR / "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 
+def get_yandex_disk_root() -> str:
+    root = (os.getenv("YANDEX_DISK_ROOT_DIR") or "PhotoDoc_Orders").strip()
+    clean = root.strip("/")
+    return clean or "PhotoDoc_Orders"
+
+
 # --- Инициализация базы данных ---
 def init_db():
     """Create only a genuinely fresh DB; never bless an existing unknown DB."""
@@ -471,7 +477,7 @@ def send_order_email(order_id: int, name: str, phone: str, comment: str, format:
     msg["Message-ID"] = f"<photodoc-order-{order_id}-new@photodoc-ai.ru>"
 
     safe_folder_name = f"Заказ_{order_id}_{name.replace(' ', '_')}"
-    raw_path = f"PhotoDoc_Orders/{safe_folder_name}"
+    raw_path = f"{get_yandex_disk_root()}/{safe_folder_name}"
     safe_url_path = urllib.parse.quote(raw_path)
     yandex_disk_link = f"https://disk.yandex.ru/client/disk/{safe_url_path}"
 
@@ -717,7 +723,7 @@ async def create_order(
              amount, amount, datetime.utcnow().isoformat(), token_hash),
         )
         order_id = cursor.lastrowid
-        folder = (f"PhotoDoc_Orders/Заказ_{order_id}_{_folder_component(name)}/"
+        folder = (f"{get_yandex_disk_root()}/Заказ_{order_id}_{_folder_component(name)}/"
                   f"{_folder_component(format)}_{_folder_component(paper)}_{_folder_component(crop)}")
         for item in staged:
             attachment_id = uuid.uuid4().hex

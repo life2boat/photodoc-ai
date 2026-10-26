@@ -1,0 +1,65 @@
+# PhotoDoc AI - Staging Docker Compose Configuration
+# Project: photodoc-staging
+# Isolated volumes, test secrets, disabled external workers, no access to production assets.
+#
+# Usage:
+#   docker compose -p photodoc-staging -f docker-compose.staging.yml config
+#   docker compose -p photodoc-staging -f docker-compose.staging.yml up -d --build
+
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: photodoc-staging-backend
+    restart: unless-stopped
+    env_file:
+      - ${PHOTODOC_STAGING_ENV_FILE:-./backend/.env.staging.example}
+    environment:
+      DATABASE_PATH: /data/orders.db
+      PHOTODOC_REQUIRE_DB_IDENTITY: "1"
+      DELIVERY_WORKER_ENABLED: "0"
+      ROBOKASSA_IS_TEST: "1"
+      ROBOKASSA_MERCHANT_LOGIN: ${ROBOKASSA_MERCHANT_LOGIN:-staging_merchant}
+      ROBOKASSA_PASSWORD1: ${ROBOKASSA_PASSWORD1:-staging_pass1}
+      ROBOKASSA_PASSWORD2: ${ROBOKASSA_PASSWORD2:-staging_pass2}
+      YANDEX_DISK_ROOT_DIR: "PhotoDoc_Staging"
+      SMTP_SERVER: ${SMTP_SERVER:-127.0.0.1}
+      SMTP_PORT: ${SMTP_PORT:-2525}
+      SMTP_USER: ${SMTP_USER:-staging@photodoc-ai.ru}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-staging_secret}
+      EMAIL_TO: ${EMAIL_TO:-staging_owner@photodoc-ai.ru}
+    volumes:
+      - photodoc_staging_db:/data
+      - photodoc_staging_uploads:/app/uploads
+    networks:
+      - photodoc_staging_network
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        - VITE_YANDEX_METRIKA_ID=
+        - VITE_SUPABASE_URL=
+        - VITE_SUPABASE_ANON_KEY=
+        - VITE_API_URL=/api
+    container_name: photodoc-staging-frontend
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${STAGING_PORT:-8081}:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - photodoc_staging_network
+
+volumes:
+  photodoc_staging_db:
+    name: photodoc_staging_backend-data
+  photodoc_staging_uploads:
+    name: photodoc_staging_uploads
+
+networks:
+  photodoc_staging_network:
+    name: photodoc_staging_network

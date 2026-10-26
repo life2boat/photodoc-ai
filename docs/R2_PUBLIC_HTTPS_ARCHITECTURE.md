@@ -119,48 +119,195 @@ Read-only диагностика существующего файла `/var/lib
 
 ---
 
-## 4. Планы развёртывания: Staging и Production Cutover
+## 4. Изоляция Staging и Безопасный Регламент Production Cutover
 
-### 4.1 План Staging (Изолированное окружение)
-- **Цель:** Полная проверка всего цикла без боевых клиентов, денег и риска для данных.
-- **Инфраструктура:**
-  - Отдельный Docker Compose стек с префиксом `photodoc-staging`.
-  - Переменные окружения: `ROBOKASSA_IS_TEST=1`, тестовые пароли `ROBOKASSA_PASSWORD1`, `ROBOKASSA_PASSWORD2`.
-  - Свежая независимая база SQLite (инициализируется автоматически через `main.init_db()`).
-  - Папка Яндекс.Диска: `/PhotoDoc_Staging/`.
-  - Тестовый почтовый ящик для SMTP-уведомлений.
-- **Порядок тестирования:** 10-шаговый сценарий (см. Раздел 5).
+### 4.1 Архитектура и Изоляция Staging-окружения
+Для сквозного тестирования функциональности до переноса боевых данных развёртывается полностью изолированное Staging-окружение:
+- **Конфигурация Docker Compose (`docker-compose.staging.yml`):**
+  - Имя проекта: `photodoc-staging`.
+  - Изолированные тома хранения:
+    - База данных: `photodoc_staging_backend-data` (монтируется в `/data` контейнера).
+    - Файлы загрузок: `photodoc_staging_uploads` (монтируется в `/app/uploads`).
+  - Изолированная сеть: `photodoc_staging_network` (bridge, без связей с production).
+  - Порты: frontend опубликован на `8081:80` (исключает конфликт с портами 80, 8080, 443).
+  - Контейнеры: `photodoc-staging-frontend` и `photodoc-staging-backend`.
+- **Конфигурация окружения (`backend/.env.staging.example`):**
+  - `ROBOKASSA_IS_TEST="1"` — принудительный тестовый режим платежей.
+  - `DELIVERY_WORKER_ENABLED="0"` — фоновые внешние отправки по умолчанию отключены; запуск воркера только контролируемо вручную при тестах доставки.
+  - `YANDEX_DISK_ROOT_DIR="PhotoDoc_Staging"` — корневой каталог в облаке Яндекс.Диск переопределён на изолированную папку `/PhotoDoc_Staging/`.
+  - Независимый тестовый OAuth-токен Яндекс.Диска и тестовый SMTP-аккаунт.
+- **Гарантии безопасности изоляции:**
+  - Нулевой доступ к volume боевого сервера (`photodoc_backend-data`), боевым файлам клиентов и рабочим секретам.
+  - Свежая база SQLite автоматически создаётся с `PRAGMA application_id = 1346650441` (`PDAI`) и структурой P1 (`orders`, `delivery_jobs`) при первом запуске через `main.init_db()`.
+  - Успешность запуска проверяется эндпоинтом `GET /api/health` (`{"status": "ok"}`).
 
-### 4.2 План Production Cutover (Перенос данных с `79.137.196.14`)
-*Выполняется строго после отдельного явного разрешения владельца проекта.*
-1. **Остановка старого бэкенда на `79.137.196.14`:**
+### 4.2 Регламент резервного копирования и переносимости контрольных сумм
+На основе анализа выявленных дефектов зафиксирован регламент создания и проверки бэкапа:
+1. **Выделенный каталог бэкапа:**
+   - Категорически запрещено создавать временные копии базы внутри действующего Docker volume `/data` (во избежание засорения и рисков повреждения).
+   - Бэкапы сохраняются в выделенный защищённый каталог хоста `/var/backups/photodoc/` с правами доступа `chmod 700 /var/backups/photodoc`.
+2. **Сброс SQLite WAL (Write-Ahead Log):**
+   - Перед созданием снапшота базы обязательно выполняется сброс всех накопленных страниц из WAL в основной файл:
+     ```sql
+     PRAGMA wal_checkpoint(TRUNCATE);
+     ```
+   - Создание консистентного снапшота выполняется средствами SQLite API: `.backup /var/backups/photodoc/orders.db.cutover`.
+3. **Единая точка восстановления (DB + Uploads):**
+   - База данных и каталог клиентских фотографий упаковываются в один согласованный архив:
+     ```bash
+     tar -czf /var/backups/photodoc/photodoc_cutover_$(date +%Y%m%d_%H%M%S).tar.gz \
+       -C /var/backups/photodoc orders.db.cutover \
+       -C /opt/photodoc/backend uploads
+     ```
+4. **Переносимые относительные контрольные суммы:**
+   - Файл `manifest.sha256` формируется строго с относительными именами файлов (без абсолютных путей источника):
+     ```bash
+     cd /var/backups/photodoc
+     sha256sum photodoc_cutover.tar.gz > manifest.sha256
+     ```
+   - При переносе на целевой сервер проверка выполняется локально:
+     ```bash
+     cd /var/backups/photodoc && sha256sum -c manifest.sha256
+     ```
+   - Это гарантирует успешность проверки независимо от несовпадения каталогов источника и приёмника (подтверждено тестом `test_portable_backup_transfer_rehearsal`).
+5. **Проверка ресурсов и прав:**
+   - Проверка свободного места (`df -h /var/backups/photodoc` — доступно не менее 3x от объёма данных).
+   - Проверка прав на файлы архивов (`chmod 600 /var/backups/photodoc/*`).
+   - Исходные боевые данные на сервере не модифицируются.
+
+### 4.3 Безопасная последовательность Production Cutover (13 шагов)
+Переключение боевой системы на новый Web VPS выполняется строго по 13 шагам с явными точками авторизации:
+
+```
+[Шаг 1: Подготовка нового Web VPS и Staging]
+       │
+[Шаг 2: Тестирование Staging (HTTPS, API, Upload, Payment, Delivery)]
+       │
+   ▼ CHECKPOINT 1: Явное разрешение владельца на остановку старого VPS
+       │
+[Шаг 4: Заморозка писателей на 79.137.196.14 (docker compose stop backend)]
+       │
+[Шаг 5: Согласованный бэкап DB WAL + Uploads в /var/backups/photodoc/]
+       │
+[Шаг 6: Пробное восстановление (Dry-Run Restore) и проверка целостности]
+       │
+[Шаг 7: Перенос архива на новый VPS и сверка относительных SHA-256]
+       │
+[Шаг 8: Миграция P0 → P1 на новом VPS (reconcile_payment + reconcile_delivery)]
+       │
+[Шаг 9: Запуск боевых контейнеров на новом VPS на локальном порту]
+       │
+[Шаг 10: Проверка readiness, HTTPS, Edge Nginx и целостности БД]
+       │
+   ▼ CHECKPOINT 2: Явное разрешение владельца на переключение DNS
+       │
+[Шаг 11: Переключение DNS A-записей (photodoc-ai.ru → IP нового Web VPS)]
+       │
+[Шаг 12: Мониторинг боевого трафика, Robokassa и фоновой доставки P1]
+       │
+[Шаг 13: Регламент Rollback (До / После смены DNS)]
+```
+
+#### Детальный регламент каждого шага:
+1. **Шаг 1. Подготовка нового Web VPS и независимого staging-окружения:**
+   - Настройка ОС Ubuntu 24.04, Docker Engine, Docker Compose, системного Nginx.
+   - Развёртывание `docker-compose.staging.yml` и создание тестового каталога.
+2. **Шаг 2. Комплексное тестирование Staging:**
+   - Выполнение 10-шагового тестового сценария (см. Раздел 5): HTTPS, API, загрузка до 80 MiB, тестовая оплата Robokassa, доставка в `/PhotoDoc_Staging/`, SMTP.
+3. **Шаг 3. Авторизация владельца проекта (CHECKPOINT 1):**
+   - Получение отдельного недвусмысленного подтверждения от владельца на перевод системы в регламентные работы и остановку старого бэкенда.
+4. **Шаг 4. Блокировка записи на старом приложении (Freeze Writers):**
    ```bash
+   # Выполняется на 79.137.196.14
    docker compose -p photodoc stop backend
    ```
-2. **Снятие консистентного снапшота базы и uploads:**
+   - Запрещает параллельную запись новых заказов в старую базу. Исключает состояние split-brain и рассинхронизацию двух production-БД.
+5. **Шаг 5. Согласованный бэкап БД и фотографий:**
    ```bash
-   docker run --rm -v photodoc_backend-data:/data alpine sh -c "apk add --no-cache sqlite && sqlite3 /data/orders.db 'PRAGMA wal_checkpoint(TRUNCATE);' && sqlite3 /data/orders.db '.backup /data/orders.db.cutover'"
-   tar -czf /root/photodoc_cutover.tar.gz -C /var/lib/docker/volumes/photodoc_backend-data/_data orders.db.cutover -C /opt/photodoc/backend uploads
-   sha256sum /root/photodoc_cutover.tar.gz > /root/photodoc_cutover.tar.gz.sha256
+   # 1. Принудительный сброс WAL
+   docker run --rm -v photodoc_backend-data:/data alpine sh -c \
+     "apk add --no-cache sqlite && sqlite3 /data/orders.db 'PRAGMA wal_checkpoint(TRUNCATE);' && sqlite3 /data/orders.db '.backup /tmp/orders.db.cutover'"
+   # 2. Копирование снапшота в выделенный каталог бэкапа
+   mkdir -p /var/backups/photodoc
+   docker cp $(docker compose -p photodoc ps -q backend 2>/dev/null || docker ps -aqf "name=photodoc.*backend" | head -n1):/tmp/orders.db.cutover /var/backups/photodoc/orders.db.cutover
+   # 3. Упаковка DB и uploads
+   cd /var/backups/photodoc
+   tar -czf photodoc_cutover.tar.gz orders.db.cutover -C /opt/photodoc/backend uploads
+   sha256sum photodoc_cutover.tar.gz > manifest.sha256
+   chmod 600 photodoc_cutover.tar.gz manifest.sha256
    ```
-3. **Безопасная передача на новый Web VPS (по SSH / scp):**
-   ```bash
-   scp /root/photodoc_cutover.tar.gz* user@<NEW_WEB_VPS_IP>:/var/backups/photodoc/
-   ```
-4. **Проверка контрольной суммы на новом сервере:**
-   ```bash
-   sha256sum -c /var/backups/photodoc/photodoc_cutover.tar.gz.sha256
-   ```
-5. **Распаковка в production volume и uploads нового сервера.**
-6. **Выполнение миграции P0 → P1 на новом сервере:**
-   ```bash
-   python backend/migrations/reconcile_payment_schema.py --db /data/orders.db --allow-legacy-unmarked --apply
-   python backend/migrations/reconcile_delivery_schema.py --db /data/orders.db --apply
-   python scripts/verify_backup_integrity.py --db /data/orders.db --uploads /app/uploads
-   ```
-7. **Переключение DNS A-записей на IP нового Web VPS.**
-8. **Запуск боевого контейнера на новом Web VPS.**
-9. **План отката (Rollback):** При любом сбое до смены DNS старый бэкенд на `79.137.196.14` запускается одной командой `docker compose start backend`.
+6. **Шаг 6. Проверка восстановления из бэкапа (Restore Dry-Run):**
+   - Временная тестовая распаковка на старом VPS в `/tmp/verify_restore`:
+     ```bash
+     mkdir -p /tmp/verify_restore && tar -xzf /var/backups/photodoc/photodoc_cutover.tar.gz -C /tmp/verify_restore
+     python scripts/verify_backup_integrity.py --db /tmp/verify_restore/orders.db.cutover --uploads /tmp/verify_restore/uploads
+     rm -rf /tmp/verify_restore
+     ```
+   - Подтверждение: статус `VERDICT: INTEGRITY_CHECK_PASSED`.
+7. **Шаг 7. Перенос данных на новый Web VPS:**
+   - Передача по зашифрованному SSH/SCP-каналу:
+     ```bash
+     scp /var/backups/photodoc/photodoc_cutover.tar.gz /var/backups/photodoc/manifest.sha256 user@<NEW_WEB_VPS_IP>:/var/backups/photodoc/
+     ```
+   - На новом Web VPS:
+     ```bash
+     cd /var/backups/photodoc && sha256sum -c manifest.sha256
+     ```
+8. **Шаг 8. Выполнение P0 → P1 миграции:**
+   - Распаковка файлов в боевые тома нового сервера:
+     ```bash
+     docker volume create photodoc_backend-data
+     # Распаковка orders.db.cutover в /var/lib/docker/volumes/photodoc_backend-data/_data/orders.db
+     # Распаковка uploads в /opt/photodoc/backend/uploads
+     ```
+   - Выполнение последовательной миграции:
+     ```bash
+     python backend/migrations/reconcile_payment_schema.py --db /data/orders.db --allow-legacy-unmarked --apply
+     python backend/migrations/reconcile_delivery_schema.py --db /data/orders.db --apply
+     python scripts/verify_backup_integrity.py --db /data/orders.db --uploads /app/uploads
+     ```
+9. **Шаг 9. Запуск production-контейнеров на новом VPS без клиентского трафика:**
+   - Запуск боевого Docker Compose на новом Web VPS:
+     ```bash
+     docker compose -p photodoc up -d
+     ```
+   - Порт приложения слушает только внутренний интерфейс `127.0.0.1:8000` и `127.0.0.1:8080`.
+10. **Шаг 10. Проверка readiness, Nginx, HTTPS и сохранности данных:**
+    - Проверка локального API: `curl -I http://127.0.0.1:8000/api/health`.
+    - Проверка корректности конфигурации Nginx (`nginx -t`).
+    - Проверка валидности TLS-сертификатов Let's Encrypt.
+11. **Шаг 11. Переключение DNS (CHECKPOINT 2):**
+    - Строго после получения подтверждения владельца проекта:
+    - Изменение DNS A-записей домена `photodoc-ai.ru` и `www.photodoc-ai.ru` на IP-адрес нового Web VPS.
+    - Время жизни TTL предварительно уменьшено до 300 секунд (5 минут).
+12. **Шаг 12. Контроль боевых заказов, платежей и доставки:**
+    - Мониторинг логов Edge Nginx и backend.
+    - Проверка поступления реальных заказов, успешности генерации ссылок Robokassa и приёма платежей.
+    - Включение рабочего процесса доставки: `DELIVERY_WORKER_ENABLED=1`.
+    - Контроль очереди `delivery_jobs` (отсутствие зависших lease).
+    - Старый бэкенд на `79.137.196.14` остаётся выключенным — дублирование записи заказов полностью исключено.
+13. **Шаг 13. Регламент безопасного отката (Rollback Procedures):**
+    - **Сценарий 13.A: Откат ДО переключения DNS (Шаги 4–10):**
+      - При возникновении неустранимой проблемы на новом VPS до смены DNS.
+      - Публичный DNS всё ещё указывает на старый VPS.
+      - Действие: на сервере `79.137.196.14` выполняется запуск бэкенда:
+        ```bash
+        docker compose -p photodoc start backend
+        ```
+      - Время восстановления — менее 30 секунд. Потеря данных — нулевая.
+    - **Сценарий 13.B: Откат ПОСЛЕ переключения DNS (Шаг 11+):**
+      - Если после переключения DNS обнаружен критический дефект, а новый сервер уже принял боевые заказы от пользователей.
+      - Процедура предотвращения потери заказов:
+        1. Включить заглушку обслуживания на Edge Nginx нового VPS (`return 503;` для `/api/orders`), чтобы гарантированно заблокировать приём новых заказов.
+        2. Экспортировать дельту заказов, принятых новым сервером (все записи с `id`, превышающим последний `id` из снапшота переноса):
+           ```sql
+           .mode insert orders
+           SELECT * FROM orders WHERE id > <LAST_CUTOVER_ID>;
+           ```
+        3. Переключить DNS A-записи обратно на `79.137.196.14`.
+        4. На старом сервере импортировать дельту заказов и скопировать новые файлы из каталога uploads.
+        5. Запустить бэкенд на старом сервере: `docker compose -p photodoc start backend`.
+        6. Снять заглушку. Все заказы сохранены, состояние баз синхронизировано.
 
 ---
 
