@@ -226,17 +226,24 @@ Read-only диагностика существующего файла `/var/lib
    - Запрещает параллельную запись новых заказов в старую базу. Исключает состояние split-brain и рассинхронизацию двух production-БД.
 5. **Шаг 5. Согласованный бэкап БД и фотографий:**
    ```bash
-   # 1. Принудительный сброс WAL
-   docker run --rm -v photodoc_backend-data:/data alpine sh -c \
-     "apk add --no-cache sqlite && sqlite3 /data/orders.db 'PRAGMA wal_checkpoint(TRUNCATE);' && sqlite3 /data/orders.db '.backup /tmp/orders.db.cutover'"
-   # 2. Копирование снапшота в выделенный каталог бэкапа
+   # 1. Подготовка защищённого каталога бэкапа хоста
    mkdir -p /var/backups/photodoc
-   docker cp $(docker compose -p photodoc ps -q backend 2>/dev/null || docker ps -aqf "name=photodoc.*backend" | head -n1):/tmp/orders.db.cutover /var/backups/photodoc/orders.db.cutover
-   # 3. Упаковка DB и uploads
+   chmod 700 /var/backups/photodoc
+
+   # 2. Принудительный сброс WAL и создание .backup НАПРЯМУЮ в смонтированный каталог бэкапа
+   docker run --rm \
+     -v photodoc_backend-data:/data:ro \
+     -v /var/backups/photodoc:/backup \
+     alpine sh -c "apk add --no-cache sqlite && sqlite3 /data/orders.db 'PRAGMA wal_checkpoint(TRUNCATE);' && sqlite3 /data/orders.db '.backup /backup/orders.db.cutover'"
+
+   chmod 600 /var/backups/photodoc/orders.db.cutover
+
+   # 3. Упаковка единой точки восстановления (БД + uploads) под детерминированным именем
+   ARCHIVE_NAME="photodoc_cutover.tar.gz"
    cd /var/backups/photodoc
-   tar -czf photodoc_cutover.tar.gz orders.db.cutover -C /opt/photodoc/backend uploads
-   sha256sum photodoc_cutover.tar.gz > manifest.sha256
-   chmod 600 photodoc_cutover.tar.gz manifest.sha256
+   tar -czf "${ARCHIVE_NAME}" orders.db.cutover -C /opt/photodoc/backend uploads
+   sha256sum "${ARCHIVE_NAME}" > manifest.sha256
+   chmod 600 "${ARCHIVE_NAME}" manifest.sha256
    ```
 6. **Шаг 6. Проверка восстановления из бэкапа (Restore Dry-Run):**
    - Временная тестовая распаковка на старом VPS в `/tmp/verify_restore`:
@@ -318,14 +325,22 @@ Read-only диагностика существующего файла `/var/lib
            }
            ```
            `nginx -s reload`. Новые заказы не принимаются, состояние базы данных зафиксировано.
-        2. **Локальный откат релизного контейнера на новом VPS:**
-           Откат версии backend/frontend на предыдущий стабильный образ без удаления томов `photodoc_backend-data` и `uploads`:
+        2. **Проверка совместимости схемы БД (Schema Compatibility Gate):**
+           Перед переключением контейнера обязательно проверяется совместимость текущей базы данных с кодом целевого отката:
            ```bash
-           docker compose -p photodoc stop backend frontend
-           # Переключение на проверенный тег/образ
-           docker compose -p photodoc up -d --no-recreate
+           docker run --rm -v photodoc_backend-data:/data:ro photodoc-backend:rollback-target \
+             python -c "import main; assert main.database_readiness_ok(); assert main.delivery_schema_ready()"
            ```
-        3. **Верификация целостности базы и очереди:**
+           - Если проверка не пройдена (несовместимая деструктивная миграция): **откат отклоняется (`ROLLBACK_ABORTED_SCHEMA_INCOMPATIBLE`)**, система остаётся в режиме обслуживания для прямого исправления (forward-fix), предотвращая повреждение БД.
+           - Если совместимость подтверждена: выполняется переход к шагу 3.
+
+        3. **Переключение контейнера на закреплённый образ отката:**
+           Пересоздание контейнера с закреплённым образом через `--force-recreate` (без удаления томов `photodoc_backend-data` и `uploads`):
+           ```bash
+           docker tag photodoc-backend:rollback-target photodoc-backend:latest
+           docker compose -p photodoc up -d --force-recreate --no-deps backend
+           ```
+        4. **Верификация целостности базы и очереди:**
            ```bash
            python scripts/verify_backup_integrity.py --db /data/orders.db --uploads /app/uploads
            ```

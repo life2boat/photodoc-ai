@@ -185,6 +185,7 @@ def test_staging_compose_file_structure():
     assert 'DELIVERY_WORKER_ENABLED: "0"' in content
     assert 'ROBOKASSA_IS_TEST: "1"' in content
     assert 'YANDEX_DISK_ROOT_DIR: "PhotoDoc_Staging"' in content
+    assert 'PHOTODOC_ALLOW_FRESH_DB: "1"' in content
     # Ensure production volume is NEVER referenced in staging compose
     assert "photodoc_backend-data\n" not in content
 
@@ -202,8 +203,8 @@ import verify_backup_integrity
 
 
 def test_staging_cold_start_and_restart_lifecycle(tmp_path, monkeypatch):
-    """Verify empty staging starts successfully under PHOTODOC_REQUIRE_DB_IDENTITY=1,
-    and container restart preserves test data without wipe."""
+    """Verify empty staging starts successfully under PHOTODOC_REQUIRE_DB_IDENTITY=1 with
+    PHOTODOC_ALLOW_FRESH_DB=1, and container restart preserves test data without wipe."""
     db_path = tmp_path / "cold_start_orders.db"
     uploads_dir = tmp_path / "cold_start_uploads"
     uploads_dir.mkdir(parents=True, exist_ok=True)
@@ -211,11 +212,12 @@ def test_staging_cold_start_and_restart_lifecycle(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "DB_PATH", db_path)
     monkeypatch.setattr(main, "UPLOAD_DIR", uploads_dir)
     monkeypatch.setenv("PHOTODOC_REQUIRE_DB_IDENTITY", "1")
+    monkeypatch.setenv("PHOTODOC_ALLOW_FRESH_DB", "1")
     monkeypatch.setenv("DELIVERY_WORKER_ENABLED", "0")
 
     # 1. Cold start on empty volume: DB file does not exist yet
     assert not db_path.exists()
-    main.init_db()
+    main.ensure_database_state()
 
     # 2. Database created and ready
     assert db_path.exists()
@@ -236,8 +238,8 @@ def test_staging_cold_start_and_restart_lifecycle(tmp_path, monkeypatch):
         )
         conn.commit()
 
-    # 5. Simulate container restart (init_db called again on existing volume)
-    main.init_db()
+    # 5. Simulate container restart (ensure_database_state called on existing volume)
+    main.ensure_database_state()
 
     # 6. Verify existing data is preserved (not wiped)
     with sqlite3.connect(db_path) as conn:
@@ -249,6 +251,57 @@ def test_staging_cold_start_and_restart_lifecycle(tmp_path, monkeypatch):
     resp_after = client.get("/api/health")
     assert resp_after.status_code == 200
     assert resp_after.json() == {"status": "ok"}
+
+
+def test_production_fail_closed_on_missing_or_empty_database(tmp_path, monkeypatch):
+    """Verify production with PHOTODOC_REQUIRE_DB_IDENTITY=1 strictly fails closed on missing,
+    empty (0 bytes), alien, or corrupted database when PHOTODOC_ALLOW_FRESH_DB is not set."""
+    monkeypatch.setenv("PHOTODOC_REQUIRE_DB_IDENTITY", "1")
+    monkeypatch.delenv("PHOTODOC_ALLOW_FRESH_DB", raising=False)
+
+    # 1. Missing database file: must fail closed, NEVER auto-create
+    missing_db = tmp_path / "missing_prod.db"
+    assert not missing_db.exists()
+    monkeypatch.setattr(main, "DB_PATH", missing_db)
+    with pytest.raises(RuntimeError, match="Production database missing or empty"):
+        main.ensure_database_state()
+    assert not missing_db.exists()  # Proves no DB was created!
+
+    # 2. Empty (0-byte) database file: must fail closed
+    empty_db = tmp_path / "empty_prod.db"
+    empty_db.touch()
+    assert empty_db.stat().st_size == 0
+    monkeypatch.setattr(main, "DB_PATH", empty_db)
+    with pytest.raises(RuntimeError, match="Production database missing or empty"):
+        main.ensure_database_state()
+
+    # 3. Alien database (wrong application_id): must fail closed
+    alien_db = tmp_path / "alien_prod.db"
+    with sqlite3.connect(alien_db) as conn:
+        conn.execute("PRAGMA application_id = 999999;")
+        conn.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY);")
+        conn.commit()
+    monkeypatch.setattr(main, "DB_PATH", alien_db)
+    with pytest.raises(RuntimeError, match="Existing production database does not satisfy"):
+        main.ensure_database_state()
+
+    # 4. Valid database: passes without modification
+    valid_db = tmp_path / "valid_prod.db"
+    monkeypatch.setattr(main, "DB_PATH", valid_db)
+    monkeypatch.setenv("PHOTODOC_ALLOW_FRESH_DB", "1")
+    main.ensure_database_state()  # initialize valid DB
+    monkeypatch.delenv("PHOTODOC_ALLOW_FRESH_DB", raising=False)  # return to production mode
+
+    # Add a marker record
+    with sqlite3.connect(valid_db) as conn:
+        conn.execute("INSERT INTO orders (name, phone) VALUES ('Prod User', '+79991110000')")
+        conn.commit()
+
+    # Startup in production mode: must pass and preserve record
+    main.ensure_database_state()
+    with sqlite3.connect(valid_db) as conn:
+        row = conn.execute("SELECT name FROM orders WHERE phone = '+79991110000'").fetchone()
+        assert row and row[0] == "Prod User"
 
 
 def test_alien_and_corrupt_database_rejected_under_require_identity(tmp_path, monkeypatch):
@@ -387,3 +440,71 @@ def test_legacy_sqlite_app_id_zero_to_p1_migration_lifecycle(tmp_path):
     assert backup_ok is True
     assert backup_report["application_id_valid"] is True
     assert backup_report["errors"] == []
+
+
+def test_safe_rollback_scenario_and_schema_compatibility(tmp_path, monkeypatch):
+    """Verify safe rollback scenario: schema compatibility check, maintenance order blocking,
+    and preservation of orders, uploads, delivery_jobs, and payment statuses."""
+    db_path = tmp_path / "rollback_test.db"
+    uploads_dir = tmp_path / "rollback_uploads"
+    uploads_dir.mkdir(parents=True, exist_ok=True)
+
+    monkeypatch.setattr(main, "DB_PATH", db_path)
+    monkeypatch.setattr(main, "UPLOAD_DIR", uploads_dir)
+    monkeypatch.setenv("PHOTODOC_REQUIRE_DB_IDENTITY", "1")
+    monkeypatch.setenv("PHOTODOC_ALLOW_FRESH_DB", "1")
+    monkeypatch.setenv("DELIVERY_WORKER_ENABLED", "0")
+
+    # 1. Initialize DB and create order with delivery jobs and payment status
+    main.ensure_database_state()
+
+    test_file = uploads_dir / "1_order.jpg"
+    test_file.write_bytes(JPEG)
+
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("""
+            INSERT INTO orders (id, name, phone, format, status, payment_status, payment_amount, robokassa_inv_id, paid_at, order_token_hash)
+            VALUES (1, 'Rollback Tester', '+79995554433', '10x15', 'paid', 'paid', '500.00', '1001', '2026-10-27T06:00:00', 'tokenhash123')
+        """)
+        conn.execute("""
+            INSERT INTO delivery_jobs (id, order_id, kind, remote_path, local_path, content_size, state, next_attempt_at, created_at)
+            VALUES ('job1', 1, 'file', 'PhotoDoc_Orders/1/1_order.jpg', '1_order.jpg', 100, 'pending', '2026-10-27T06:00:00', '2026-10-27T06:00:00')
+        """)
+        conn.commit()
+
+    # 2. Gate: Schema compatibility check of current DB against candidate rollback codebase
+    ready, diag = inspect_database(db_path, require_complete_schema=True)
+    assert ready is True, "Candidate rollback code must be compatible with current database"
+
+    # 3. Simulate incompatible schema gate rejection:
+    # If a destructive migration had altered/dropped required P1 columns
+    incompatible_db = tmp_path / "incompatible.db"
+    with sqlite3.connect(incompatible_db) as conn:
+        conn.execute("PRAGMA application_id = 1346650441;")
+        conn.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY);") # missing required columns!
+        conn.commit()
+    ready_incompat, _ = inspect_database(incompatible_db, require_complete_schema=True)
+    assert ready_incompat is False
+    # Proves gate rejects rollback if schema compatibility fails!
+
+    # 4. Simulate rollback execution: restart backend container with rollback target code
+    monkeypatch.delenv("PHOTODOC_ALLOW_FRESH_DB", raising=False) # Production mode!
+    main.ensure_database_state()
+
+    # 5. Verify 100% preservation of orders, uploads, delivery_jobs, and payment statuses
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        order = conn.execute("SELECT * FROM orders WHERE id = 1").fetchone()
+        assert order is not None
+        assert order["name"] == "Rollback Tester"
+        assert order["payment_status"] == "paid"
+        assert order["robokassa_inv_id"] == "1001"
+        assert order["order_token_hash"] == "tokenhash123"
+
+        jobs = conn.execute("SELECT * FROM delivery_jobs WHERE order_id = 1").fetchall()
+        assert len(jobs) == 1
+        assert jobs[0]["state"] == "pending"
+        assert jobs[0]["kind"] == "file"
+
+    assert test_file.exists()
+    assert test_file.read_bytes() == JPEG

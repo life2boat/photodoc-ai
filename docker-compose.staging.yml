@@ -18,6 +18,7 @@ services:
     environment:
       DATABASE_PATH: /data/orders.db
       PHOTODOC_REQUIRE_DB_IDENTITY: "1"
+      PHOTODOC_ALLOW_FRESH_DB: "1"
       DELIVERY_WORKER_ENABLED: "0"
       ROBOKASSA_IS_TEST: "1"
       ROBOKASSA_MERCHANT_LOGIN: ${ROBOKASSA_MERCHANT_LOGIN:-staging_merchant}

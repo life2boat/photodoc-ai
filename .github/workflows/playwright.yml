@@ -215,7 +215,7 @@ jobs:
         EOF
         cleanup() {
           docker compose -p "${PROJECT}" -f docker-compose.yml -f docker-compose.production.yml down --remove-orphans >/dev/null 2>&1 || true
-          docker volume rm "${WRONG}" "${CORRECT}" >/dev/null 2>&1 || true
+          docker volume rm "${WRONG}" "${CORRECT}" "${EMPTY_PROD:-}" >/dev/null 2>&1 || true
           rm -f backend/.env
           rm -rf "${UPLOADS}"
         }
@@ -231,6 +231,17 @@ jobs:
           exit 1
         fi
         echo "MISSING_EXTERNAL_VOLUME_FAILS=true"
+
+        EMPTY_PROD="photodoc-empty-${GITHUB_RUN_ID}"
+        docker volume create "${EMPTY_PROD}" >/dev/null
+        if PHOTODOC_DB_VOLUME="${EMPTY_PROD}" PHOTODOC_UPLOADS_SOURCE="${UPLOADS}" \
+          docker compose -p "${PROJECT}" -f docker-compose.yml -f docker-compose.production.yml \
+          run --rm --no-deps backend python -c "import main"; then
+          echo "FAIL: production backend created a fresh DB on empty volume instead of failing closed"
+          exit 1
+        fi
+        echo "EMPTY_PRODUCTION_VOLUME_FAILS_CLOSED=true"
+        docker volume rm "${EMPTY_PROD}" >/dev/null
 
         docker volume create "${WRONG}" >/dev/null
         docker volume create "${CORRECT}" >/dev/null

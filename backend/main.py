@@ -145,11 +145,42 @@ def _require_existing_database_identity() -> bool:
     }
 
 
-init_db()
+def _allow_fresh_db() -> bool:
+    return os.getenv("PHOTODOC_ALLOW_FRESH_DB", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
-if _require_existing_database_identity():
+
+def ensure_database_state():
+    """Manage database startup state with strict production fail-closed semantics."""
+    db_size = DB_PATH.stat().st_size if DB_PATH.exists() else 0
+
+    if _require_existing_database_identity():
+        if db_size == 0:
+            if _allow_fresh_db():
+                init_db()
+            else:
+                raise RuntimeError(
+                    "Production database missing or empty; automatic DB creation is "
+                    "forbidden under PHOTODOC_REQUIRE_DB_IDENTITY=1"
+                )
+        else:
+            ready, diag = inspect_database(DB_PATH, require_complete_schema=True)
+            if not ready:
+                raise RuntimeError(
+                    "Existing production database does not satisfy the PhotoDoc identity/schema contract"
+                )
+    else:
+        init_db()
+
     if not database_readiness_ok():
         raise RuntimeError("Production database identity/readiness verification failed")
+
+
+ensure_database_state()
 
 
 def delivery_schema_ready() -> bool:
