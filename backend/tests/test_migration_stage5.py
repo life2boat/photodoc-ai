@@ -13,12 +13,16 @@ import pytest
 from fastapi.testclient import TestClient
 
 BACKEND = Path(__file__).resolve().parents[1]
+SCRIPTS = BACKEND.parent / "scripts"
 if str(BACKEND) not in sys.path:
     sys.path.insert(0, str(BACKEND))
+if str(SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS))
 import main  # noqa: E402
 from db_contract import APPLICATION_ID, inspect_database  # noqa: E402
 from delivery import claim_due, enqueue, finish, process_due, utc_now  # noqa: E402
 from migrations.reconcile_delivery_schema import reconcile  # noqa: E402
+from verify_backup_integrity import verify_backup  # noqa: E402
 
 P0_COLUMNS = (
     "id", "name", "phone", "email", "format", "paper", "crop", "comment",
@@ -314,20 +318,13 @@ def test_stage5_hardened_sqlite_wal_backup_and_uploads_rehearsal(tmp_path):
     restored_db = restore_sandbox / "orders.db"
     restored_uploads = restore_sandbox / "uploads"
 
-    rconn = sqlite3.connect(restored_db)
-    assert rconn.execute("PRAGMA integrity_check;").fetchone()[0] == "ok"
-    assert rconn.execute("PRAGMA application_id;").fetchone()[0] == APPLICATION_ID
-    assert rconn.execute("SELECT COUNT(*) FROM orders;").fetchone()[0] == metadata["orders_count"]
-
-    order_files = rconn.execute(
-        "SELECT id, filename FROM orders WHERE filename IS NOT NULL AND filename != ''"
-    ).fetchall()
-    for oid, fnames in order_files:
-        for f in fnames.split(","):
-            f = f.strip()
-            if f:
-                assert (restored_uploads / f).is_file(), f"Photo {f} missing from restored uploads for order {oid}"
-    rconn.close()
+    is_valid, report = verify_backup(restored_db, restored_uploads)
+    assert is_valid is True
+    assert report["sqlite_integrity"] == "ok"
+    assert report["application_id"] == APPLICATION_ID
+    assert report["orders_count"] == metadata["orders_count"]
+    assert report["p0_confirmed_local_files"] == metadata["orders_count"]
+    assert len(report["errors"]) == 0
 
     # 7. Step 6: P1 migration compatibility & rollback
     mig_res = reconcile(restored_db, apply=True)

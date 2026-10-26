@@ -61,11 +61,27 @@ docker run --rm \
 
 ### 2. Transactionally Consistent SQLite Snapshot via Backup API
 
-Create the backup directory and perform an atomic snapshot using SQLite's native Online Backup API (`.backup`):
+Target backup storage must reside completely outside the active release tree (`/opt/photodoc`)
+and outside any web server document root to prevent accidental exposure via Nginx.
+Default target: `/var/backups/photodoc`.
+
+Ensure sufficient disk space and overwrite protection before snapshotting:
 
 ```bash
-BACKUP_DIR="${ACTIVE_RELEASE_DIR}/backups/release_$(date +%Y%m%d_%H%M%S)"
+PHOTODOC_BACKUP_ROOT="${PHOTODOC_BACKUP_ROOT:-/var/backups/photodoc}"
+mkdir -p "${PHOTODOC_BACKUP_ROOT}"
+
+# Disk space check: require at least 500 MB free space
+AVAILABLE_KB=$(df -k "${PHOTODOC_BACKUP_ROOT}" | awk 'NR==2 {print $4}')
+if [ "${AVAILABLE_KB}" -lt 512000 ]; then
+  echo "ERROR: Insufficient disk space for backup in ${PHOTODOC_BACKUP_ROOT}" >&2
+  exit 1
+fi
+
+BACKUP_DIR="${PHOTODOC_BACKUP_ROOT}/release_$(date -u +%Y%m%d_%H%M%S)"
+test ! -e "${BACKUP_DIR}"
 mkdir -p "${BACKUP_DIR}"
+chmod 700 "${BACKUP_DIR}"
 
 docker run --rm \
   -v "${PHOTODOC_DB_VOLUME:-photodoc_backend-data}:/data:ro" \
@@ -90,7 +106,7 @@ With the backend writer stopped, no new files can be written to `/opt/photodoc/b
 tar --numeric-owner -czvf "${BACKUP_DIR}/uploads.tar.gz" -C /opt/photodoc/backend uploads
 ```
 
-### 4. Cryptographic Manifest and Metadata Generation
+### 4. Cryptographic Manifest, Metadata, and Accidental Overwrite Protection
 
 Generate SHA-256 checksums for both artifacts:
 
@@ -124,10 +140,23 @@ EOF
 ```
 
 Confirm that `application_id` matches `1346650441` (`PDAI`).
+Protect completed backup artifacts from accidental modification or deletion:
+
+```bash
+chmod 600 "${BACKUP_DIR}/orders.db" "${BACKUP_DIR}/uploads.tar.gz" "${BACKUP_DIR}/manifest.sha256"
+chmod a-w "${BACKUP_DIR}"
+```
 
 ### 5. Independent Sandbox Restore Rehearsal
 
-Before modifying the active production database, verify the restorable state in an isolated scratch environment:
+Before modifying the active production database, verify the restorable state in an isolated scratch environment using the standalone verification CLI (`scripts/verify_backup_integrity.py`).
+
+The verifier:
+- Reconciles P1 attachments via `delivery_jobs` (safe path confinement, physical existence, exact size, and SHA-256).
+- Supports historical P0 orders without false-positive failures if old local files were not retained.
+- Blocks directory traversal (`..` escape attempts).
+- Returns non-zero exit code on corrupted/missing data.
+- Emits a sanitized report free of customer PII.
 
 ```bash
 RESTORE_DIR=$(mktemp -d /tmp/photodoc_restore_XXXXXX)
@@ -140,33 +169,10 @@ sha256sum -c manifest.sha256
 cp "${BACKUP_DIR}/orders.db" "${RESTORE_DIR}/orders.db"
 tar -xzf "${BACKUP_DIR}/uploads.tar.gz" -C "${RESTORE_DIR}"
 
-# 3. Verify SQLite integrity and identity in sandbox
-sqlite3 "${RESTORE_DIR}/orders.db" "PRAGMA integrity_check;"
-sqlite3 "${RESTORE_DIR}/orders.db" "PRAGMA application_id;"
+# 3. Execute integrity and storage verification CLI
+python3 /candidate/scripts/verify_backup_integrity.py --backup-dir "${RESTORE_DIR}"
 
-# 4. Cross-verify photo consistency between database and uploads
-python3 - <<EOF
-import sqlite3, sys
-from pathlib import Path
-
-db = Path("${RESTORE_DIR}/orders.db")
-uploads = Path("${RESTORE_DIR}/uploads")
-conn = sqlite3.connect(db)
-rows = conn.execute("SELECT id, filename FROM orders WHERE filename IS NOT NULL AND filename != ''").fetchall()
-missing = []
-for oid, fnames in rows:
-    for f in fnames.split(","):
-        f = f.strip()
-        if f and not (uploads / f).is_file():
-            missing.append((oid, f))
-conn.close()
-if missing:
-    print(f"FAILED: missing attachment files: {missing}")
-    sys.exit(1)
-print(f"PASS: all attachment files accounted for ({len(rows)} order rows checked)")
-EOF
-
-# Clean up sandbox
+# 4. Clean up sandbox
 rm -rf "${RESTORE_DIR}"
 ```
 
