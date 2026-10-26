@@ -145,11 +145,11 @@ def _require_existing_database_identity() -> bool:
     }
 
 
+init_db()
+
 if _require_existing_database_identity():
     if not database_readiness_ok():
         raise RuntimeError("Production database identity/readiness verification failed")
-else:
-    init_db()
 
 
 def delivery_schema_ready() -> bool:

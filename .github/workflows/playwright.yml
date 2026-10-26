@@ -409,6 +409,46 @@ jobs:
 
         echo "Testing containerized Nginx upload limits and contracts..."
         python scripts/test_container_upload_limits.py --url "http://127.0.0.1:${PORT}"
+    - name: Verify isolated staging Docker Compose cold-start and restart
+      run: |
+        set -eu
+        STAGING_PROJECT="staging-ci-${GITHUB_RUN_ID}"
+        STAGING_PORT="8081"
+        cleanup_staging() {
+          docker compose -p "${STAGING_PROJECT}" -f docker-compose.staging.yml logs --no-color 2>/dev/null || true
+          docker compose -p "${STAGING_PROJECT}" -f docker-compose.staging.yml down -v --remove-orphans >/dev/null 2>&1 || true
+        }
+        trap cleanup_staging EXIT
+
+        echo "1. Performing staging cold-start on fresh empty volume..."
+        STAGING_PORT="${STAGING_PORT}" docker compose -p "${STAGING_PROJECT}" -f docker-compose.staging.yml up -d --wait --wait-timeout 180
+
+        echo "2. Verifying staging /api/health returns HTTP 200 and status ok..."
+        STAGING_HEALTH=$(curl --fail -sS "http://127.0.0.1:${STAGING_PORT}/api/health")
+        echo "Staging Health: ${STAGING_HEALTH}"
+        echo "${STAGING_HEALTH}" | grep -q '"status"[[:space:]]*:[[:space:]]*"ok"'
+
+        echo "3. Inserting synthetic staging record..."
+        docker compose -p "${STAGING_PROJECT}" -f docker-compose.staging.yml exec -T backend python -c \
+          "import sqlite3; conn = sqlite3.connect('/data/orders.db'); conn.execute(\"INSERT INTO orders (name, phone, format, status) VALUES ('Staging Persistence Test', '+79998887766', '10x15', 'new')\"); conn.commit(); conn.close()"
+
+        echo "4. Restarting staging backend container..."
+        docker compose -p "${STAGING_PROJECT}" -f docker-compose.staging.yml restart backend
+        sleep 5
+        docker compose -p "${STAGING_PROJECT}" -f docker-compose.staging.yml exec -T backend curl --fail --silent http://127.0.0.1:8000/api/health >/dev/null
+
+        echo "5. Verifying test data survived restart..."
+        docker compose -p "${STAGING_PROJECT}" -f docker-compose.staging.yml exec -T backend python -c \
+          "import sqlite3; conn = sqlite3.connect('/data/orders.db'); row = conn.execute(\"SELECT name FROM orders WHERE phone = '+79998887766'\").fetchone(); assert row and row[0] == 'Staging Persistence Test'; conn.close()"
+
+        echo "6. Verifying staging /api/health still passes after restart..."
+        STAGING_HEALTH_AFTER=$(curl --fail -sS "http://127.0.0.1:${STAGING_PORT}/api/health")
+        echo "Staging Health After Restart: ${STAGING_HEALTH_AFTER}"
+        echo "${STAGING_HEALTH_AFTER}" | grep -q '"status"[[:space:]]*:[[:space:]]*"ok"'
+
+        echo "STAGING_COLD_START_AND_RESTART=PASS"
+        cleanup_staging
+        trap - EXIT
     - name: Dump logs on failure
       if: failure()
       run: |

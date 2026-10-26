@@ -187,3 +187,203 @@ def test_staging_compose_file_structure():
     assert 'YANDEX_DISK_ROOT_DIR: "PhotoDoc_Staging"' in content
     # Ensure production volume is NEVER referenced in staging compose
     assert "photodoc_backend-data\n" not in content
+
+SCRIPTS_DIR = BACKEND.parent / "scripts"
+MIGRATIONS_DIR = BACKEND / "migrations"
+if str(SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_DIR))
+if str(MIGRATIONS_DIR) not in sys.path:
+    sys.path.insert(0, str(MIGRATIONS_DIR))
+
+from reconcile_payment_schema import reconcile_schema
+from reconcile_delivery_schema import reconcile as reconcile_delivery
+import production_preflight
+import verify_backup_integrity
+
+
+def test_staging_cold_start_and_restart_lifecycle(tmp_path, monkeypatch):
+    """Verify empty staging starts successfully under PHOTODOC_REQUIRE_DB_IDENTITY=1,
+    and container restart preserves test data without wipe."""
+    db_path = tmp_path / "cold_start_orders.db"
+    uploads_dir = tmp_path / "cold_start_uploads"
+    uploads_dir.mkdir(parents=True, exist_ok=True)
+
+    monkeypatch.setattr(main, "DB_PATH", db_path)
+    monkeypatch.setattr(main, "UPLOAD_DIR", uploads_dir)
+    monkeypatch.setenv("PHOTODOC_REQUIRE_DB_IDENTITY", "1")
+    monkeypatch.setenv("DELIVERY_WORKER_ENABLED", "0")
+
+    # 1. Cold start on empty volume: DB file does not exist yet
+    assert not db_path.exists()
+    main.init_db()
+
+    # 2. Database created and ready
+    assert db_path.exists()
+    assert main.database_readiness_ok() is True
+    assert main.delivery_schema_ready() is True
+
+    # 3. Health check returns 200 {"status": "ok"}
+    client = TestClient(main.app)
+    resp = client.get("/api/health")
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "ok"}
+
+    # 4. Insert synthetic order record
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "INSERT INTO orders (name, phone, format, status) VALUES (?, ?, ?, ?)",
+            ("Cold Start Tester", "+79990001122", "10x15", "new"),
+        )
+        conn.commit()
+
+    # 5. Simulate container restart (init_db called again on existing volume)
+    main.init_db()
+
+    # 6. Verify existing data is preserved (not wiped)
+    with sqlite3.connect(db_path) as conn:
+        row = conn.execute("SELECT name, phone FROM orders WHERE phone = '+79990001122'").fetchone()
+        assert row is not None
+        assert row[0] == "Cold Start Tester"
+
+    # 7. Health check still 200
+    resp_after = client.get("/api/health")
+    assert resp_after.status_code == 200
+    assert resp_after.json() == {"status": "ok"}
+
+
+def test_alien_and_corrupt_database_rejected_under_require_identity(tmp_path, monkeypatch):
+    """Verify alien or corrupted database is strictly rejected under PHOTODOC_REQUIRE_DB_IDENTITY=1."""
+    monkeypatch.setenv("PHOTODOC_REQUIRE_DB_IDENTITY", "1")
+
+    # 1. Alien database with wrong application_id
+    alien_db = tmp_path / "alien.db"
+    with sqlite3.connect(alien_db) as conn:
+        conn.execute("PRAGMA application_id = 999999;")
+        conn.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, name TEXT);")
+        conn.commit()
+
+    monkeypatch.setattr(main, "DB_PATH", alien_db)
+    with pytest.raises(RuntimeError, match="Existing database does not satisfy"):
+        main.init_db()
+    assert main.database_readiness_ok() is False
+
+    # 2. Corrupted database (garbage bytes)
+    corrupt_db = tmp_path / "corrupt.db"
+    corrupt_db.write_bytes(b"NOT_A_SQLITE_DATABASE_CORRUPT_BYTES")
+
+    monkeypatch.setattr(main, "DB_PATH", corrupt_db)
+    with pytest.raises(Exception):
+        main.init_db()
+    assert main.database_readiness_ok() is False
+
+
+def test_consistent_single_archive_name_transfer_rehearsal(tmp_path):
+    """Verify single consistent archive name across create, checksum, transfer, extract, and verify."""
+    archive_name = "photodoc_cutover.tar.gz"
+    manifest_name = "manifest.sha256"
+
+    src_dir = tmp_path / "backup_src"
+    dst_dir = tmp_path / "backup_dst"
+    src_dir.mkdir()
+    dst_dir.mkdir()
+
+    # Create synthetic backup contents
+    staging_dir = src_dir / "staging_content"
+    staging_dir.mkdir()
+    db_file = staging_dir / "orders.db.cutover"
+    uploads_dir = staging_dir / "uploads"
+    uploads_dir.mkdir()
+
+    with sqlite3.connect(db_file) as conn:
+        conn.execute("PRAGMA application_id = 1346650441;")
+        conn.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, name TEXT);")
+        conn.commit()
+    (uploads_dir / "sample.jpg").write_bytes(JPEG)
+
+    # 1. Pack with exact archive_name
+    archive_path = src_dir / archive_name
+    with tarfile.open(archive_path, "w:gz") as tar:
+        for item in staging_dir.iterdir():
+            tar.add(item, arcname=item.name)
+
+    # 2. Compute checksum into manifest.sha256 using consistent relative archive_name
+    digest = hashlib.sha256(archive_path.read_bytes()).hexdigest()
+    manifest_path = src_dir / manifest_name
+    manifest_path.write_text(f"{digest}  {archive_name}\n", encoding="utf-8")
+
+    # 3. Transfer archive and manifest
+    shutil.copy(archive_path, dst_dir / archive_name)
+    shutil.copy(manifest_path, dst_dir / manifest_name)
+
+    # 4. Verify checksum at destination using single consistent name
+    dst_manifest = (dst_dir / manifest_name).read_text(encoding="utf-8").strip()
+    dst_digest, dst_rel_target = dst_manifest.split("  ")
+    assert dst_rel_target == archive_name
+    actual_dst_digest = hashlib.sha256((dst_dir / dst_rel_target).read_bytes()).hexdigest()
+    assert actual_dst_digest == dst_digest
+
+    # 5. Extract and verify recovered contents
+    extract_dir = dst_dir / "recovered"
+    extract_dir.mkdir()
+    with tarfile.open(dst_dir / archive_name, "r:gz") as tar:
+        tar.extractall(extract_dir)
+
+    assert (extract_dir / "orders.db.cutover").exists()
+    assert (extract_dir / "uploads" / "sample.jpg").read_bytes() == JPEG
+
+
+def test_legacy_sqlite_app_id_zero_to_p1_migration_lifecycle(tmp_path):
+    """Verify legacy SQLite DB (application_id=0) correctly migrates to P0/P1 and passes integrity checks."""
+    legacy_db = tmp_path / "legacy_orders.db"
+    legacy_uploads = tmp_path / "legacy_uploads"
+    legacy_uploads.mkdir()
+
+    # Create legacy P0 unmarked DB (application_id=0, without order_amount, created_at, order_token_hash)
+    with sqlite3.connect(legacy_db) as conn:
+        conn.execute("PRAGMA application_id = 0;")
+        conn.execute("""
+        CREATE TABLE orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT,
+            phone TEXT,
+            email TEXT,
+            format TEXT,
+            paper TEXT,
+            crop TEXT,
+            comment TEXT,
+            filename TEXT,
+            status TEXT DEFAULT 'new',
+            payment_status TEXT DEFAULT 'unpaid',
+            payment_amount TEXT,
+            payment_method TEXT DEFAULT 'robokassa',
+            robokassa_inv_id TEXT,
+            paid_at TEXT,
+            payment_email_sent_at TEXT
+        );
+        """)
+        conn.commit()
+
+    # Before migration: DB identity is invalid (unmarked 0)
+    ready_before, diag_before = inspect_database(legacy_db, require_complete_schema=True)
+    assert ready_before is False
+
+    # Step 1: P0 Payment Schema Reconciliation (sets application_id=1346650441, adds order_amount, created_at)
+    res_p0 = reconcile_schema(legacy_db, apply=True, allow_legacy_unmarked=True)
+    assert res_p0["status"] == "COMPLETE"
+    assert res_p0["application_id"] == 1346650441
+
+    # Step 2: P1 Delivery Schema Reconciliation (adds order_token_hash, creates delivery_jobs)
+    res_p1 = reconcile_delivery(legacy_db, apply=True)
+    assert res_p1["applied"] is True
+
+    # Step 3: Production preflight verification
+    preflight_ok, preflight_diag = production_preflight.verify_database(legacy_db)
+    assert preflight_ok is True
+    assert preflight_diag["identity_valid"] is True
+    assert preflight_diag["application_id"] == 1346650441
+
+    # Step 4: Backup integrity verification
+    backup_ok, backup_report = verify_backup_integrity.verify_backup(legacy_db, legacy_uploads)
+    assert backup_ok is True
+    assert backup_report["application_id_valid"] is True
+    assert backup_report["errors"] == []
