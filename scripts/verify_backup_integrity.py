@@ -30,6 +30,23 @@ APPLICATION_ID_TAG = "PDAI"
 APPLICATION_ID = int.from_bytes(APPLICATION_ID_TAG.encode("ascii"), "big")  # 1346650441
 
 
+SHA256_HEX_RE = re.compile(r"^[0-9a-fA-F]{64}$")
+
+
+def is_valid_sha256(val: Any) -> bool:
+    if not isinstance(val, str):
+        return False
+    return bool(SHA256_HEX_RE.match(val))
+
+
+def is_valid_size(val: Any) -> bool:
+    if val is None or isinstance(val, bool):
+        return False
+    if isinstance(val, int) and val >= 0:
+        return True
+    return False
+
+
 def sanitize_filename(filename: str | None) -> str:
     base = (filename or "upload").replace("\\", "/").split("/")[-1]
     safe = re.sub(r"[^\w\.-]", "_", base, flags=re.UNICODE).strip("._")
@@ -74,6 +91,9 @@ def verify_backup(
         "p1_missing_files": [],
         "p1_size_mismatches": [],
         "p1_checksum_mismatches": [],
+        "p1_metadata_errors": [],
+        "p1_completeness_errors": [],
+        "orphan_delivery_jobs": [],
         "p0_orders_count": 0,
         "p0_confirmed_local_files": 0,
         "p0_unretained_historical_files": 0,
@@ -129,31 +149,144 @@ def verify_backup(
 
         report["orders_count"] = conn.execute("SELECT COUNT(*) FROM orders;").fetchone()[0]
 
-        # 3. Detect P1 delivery_jobs
-        has_delivery = conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='delivery_jobs';"
-        ).fetchone()
+        # 3. Detect P1 schema vs P0 schema
+        has_delivery = bool(
+            conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='delivery_jobs';"
+            ).fetchone()
+        )
         orders_cols = {row[1] for row in conn.execute("PRAGMA table_info(orders);").fetchall()}
         has_order_token = "order_token_hash" in orders_cols
 
+        # Partition orders into P1 vs P0 strictly by order_token_hash
+        if has_order_token:
+            p1_orders = conn.execute(
+                "SELECT id, filename, order_token_hash FROM orders "
+                "WHERE order_token_hash IS NOT NULL AND order_token_hash != '' ORDER BY id;"
+            ).fetchall()
+            p0_orders = conn.execute(
+                "SELECT id, filename, order_token_hash FROM orders "
+                "WHERE order_token_hash IS NULL OR order_token_hash = '' ORDER BY id;"
+            ).fetchall()
+        else:
+            p1_orders = []
+            p0_orders = conn.execute("SELECT id, filename FROM orders ORDER BY id;").fetchall()
+
+        report["p1_orders_count"] = len(p1_orders)
+        report["p0_orders_count"] = len(p0_orders)
         report["schema_generation"] = "P1" if (has_delivery and has_order_token) else "P0"
 
-        # 4. P1 Verification via delivery_jobs
-        p1_order_ids = set()
+        # If database contains P1 orders but delivery_jobs table is missing -> critical failure
+        if p1_orders and not has_delivery:
+            report["errors"].append(
+                f"Database contains {len(p1_orders)} P1 orders but 'delivery_jobs' table is missing"
+            )
+
+        # 4. Delivery jobs verification
         if has_delivery:
-            jobs = conn.execute(
+            # 4.1 Check for orphan delivery jobs (jobs pointing to non-existent orders)
+            orphan_jobs = conn.execute(
+                "SELECT id, order_id, kind FROM delivery_jobs "
+                "WHERE order_id NOT IN (SELECT id FROM orders) ORDER BY id;"
+            ).fetchall()
+            for oj in orphan_jobs:
+                report["orphan_delivery_jobs"].append(
+                    {"job_id": oj["id"], "order_id": oj["order_id"], "kind": oj["kind"]}
+                )
+            if orphan_jobs:
+                report["errors"].append(
+                    f"Found {len(orphan_jobs)} orphan delivery job(s) referencing non-existent order_id"
+                )
+
+            # 4.2 Check completeness for each P1 order
+            for p1_order in p1_orders:
+                oid = p1_order["id"]
+                raw_filename = p1_order["filename"] or ""
+                expected_attachments = [n.strip() for n in raw_filename.split(",") if n.strip()]
+
+                # Fetch all jobs for this P1 order
+                o_jobs = conn.execute(
+                    "SELECT id, order_id, kind, local_path, original_name, content_sha256, content_size "
+                    "FROM delivery_jobs WHERE order_id = ? ORDER BY kind, id;",
+                    (oid,),
+                ).fetchall()
+
+                # If a P1 order has zero delivery_jobs -> FAIL
+                if not o_jobs:
+                    report["p1_completeness_errors"].append(
+                        f"P1 order #{oid} has NO entries in delivery_jobs"
+                    )
+                    continue
+
+                info_jobs = [j for j in o_jobs if j["kind"] == "info"]
+                file_jobs = [j for j in o_jobs if j["kind"] == "file"]
+
+                # Must have exactly one info job
+                if len(info_jobs) != 1:
+                    report["p1_completeness_errors"].append(
+                        f"P1 order #{oid} must have exactly 1 'info' job in delivery_jobs, found {len(info_jobs)}"
+                    )
+
+                # Must have file jobs matching expected_attachments
+                if len(file_jobs) != len(expected_attachments):
+                    report["p1_completeness_errors"].append(
+                        f"P1 order #{oid} file count mismatch: {len(file_jobs)} 'file' job(s) in delivery_jobs "
+                        f"vs {len(expected_attachments)} in orders.filename"
+                    )
+                else:
+                    # Compare sanitized names
+                    exp_names_sorted = sorted(sanitize_filename(n) for n in expected_attachments)
+                    act_names_sorted = sorted(sanitize_filename(j["original_name"]) for j in file_jobs)
+                    if exp_names_sorted != act_names_sorted:
+                        report["p1_completeness_errors"].append(
+                            f"P1 order #{oid} attachment names mismatch: "
+                            f"{act_names_sorted} vs expected {exp_names_sorted}"
+                        )
+
+            # 4.3 Mandatory Integrity Metadata and file presence for all file/info delivery jobs
+            file_and_info_jobs = conn.execute(
                 "SELECT id, order_id, kind, local_path, original_name, content_sha256, content_size "
                 "FROM delivery_jobs WHERE kind IN ('file', 'info') ORDER BY order_id, id;"
             ).fetchall()
 
-            for job in jobs:
-                p1_order_ids.add(job["order_id"])
+            for job in file_and_info_jobs:
                 job_id = job["id"]
                 order_id = job["order_id"]
                 kind = job["kind"]
                 local_path_raw = job["local_path"] or ""
-                expected_sha256 = (job["content_sha256"] or "").lower()
-                expected_size = job["content_size"]
+                raw_sha256 = job["content_sha256"]
+                raw_size = job["content_size"]
+
+                # Mandatory SHA-256 validation
+                if not is_valid_sha256(raw_sha256):
+                    report["p1_metadata_errors"].append(
+                        {
+                            "order_id": order_id,
+                            "job_id": job_id,
+                            "kind": kind,
+                            "field": "content_sha256",
+                            "value": raw_sha256,
+                            "error": "Missing, empty, or non-64-hex SHA-256",
+                        }
+                    )
+                    continue
+
+                # Mandatory Size validation
+                if not is_valid_size(raw_size):
+                    report["p1_metadata_errors"].append(
+                        {
+                            "order_id": order_id,
+                            "job_id": job_id,
+                            "kind": kind,
+                            "field": "content_size",
+                            "value": raw_size,
+                            "error": "Missing, non-integer, or negative size",
+                        }
+                    )
+                    continue
+
+                expected_sha256 = raw_sha256.lower()
+                expected_size = raw_size
 
                 if not local_path_raw:
                     report["errors"].append(f"Order #{order_id} job #{job_id} ({kind}) has empty local_path")
@@ -181,7 +314,7 @@ def verify_backup(
                     continue
 
                 actual_size = candidate_file.stat().st_size
-                if expected_size is not None and actual_size != expected_size:
+                if actual_size != expected_size:
                     report["p1_size_mismatches"].append(
                         {
                             "order_id": order_id,
@@ -195,7 +328,7 @@ def verify_backup(
                     continue
 
                 actual_sha256 = sha256_file(candidate_file).lower()
-                if expected_sha256 and actual_sha256 != expected_sha256:
+                if actual_sha256 != expected_sha256:
                     report["p1_checksum_mismatches"].append(
                         {
                             "order_id": order_id,
@@ -213,18 +346,7 @@ def verify_backup(
                 elif kind == "info":
                     report["p1_verified_info"] += 1
 
-        report["p1_orders_count"] = len(p1_order_ids)
-
-        # 5. P0 Verification (orders without delivery_jobs)
-        p0_query = (
-            "SELECT id, filename FROM orders WHERE id NOT IN ({}) ORDER BY id;"
-            .format(",".join(str(i) for i in p1_order_ids))
-            if p1_order_ids
-            else "SELECT id, filename FROM orders ORDER BY id;"
-        )
-        p0_orders = conn.execute(p0_query).fetchall()
-        report["p0_orders_count"] = len(p0_orders)
-
+        # 5. P0 Verification (orders without order_token_hash)
         for order in p0_orders:
             order_id = order["id"]
             filenames_raw = order["filename"] or ""
@@ -266,6 +388,9 @@ def verify_backup(
         and len(report["p1_size_mismatches"]) == 0
         and len(report["p1_checksum_mismatches"]) == 0
         and len(report["path_traversal_violations"]) == 0
+        and len(report["orphan_delivery_jobs"]) == 0
+        and len(report["p1_metadata_errors"]) == 0
+        and len(report["p1_completeness_errors"]) == 0
         and len(report["errors"]) == 0
     )
 
@@ -288,9 +413,12 @@ def print_report(is_valid: bool, report: Dict[str, Any], *, as_json: bool = Fals
     print(f"P1 Orders:                {report['p1_orders_count']}")
     print(f"P1 Verified Photos:       {report['p1_verified_files']}")
     print(f"P1 Verified Info Files:   {report['p1_verified_info']}")
+    print(f"P1 Completeness Errors:   {len(report['p1_completeness_errors'])}")
+    print(f"P1 Metadata Errors:       {len(report['p1_metadata_errors'])}")
     print(f"P1 Missing Files:         {len(report['p1_missing_files'])}")
     print(f"P1 Size Mismatches:       {len(report['p1_size_mismatches'])}")
     print(f"P1 Checksum Mismatches:   {len(report['p1_checksum_mismatches'])}")
+    print(f"Orphan Delivery Jobs:     {len(report['orphan_delivery_jobs'])}")
     print(f"P0 Orders:                {report['p0_orders_count']}")
     print(f"P0 Confirmed Local Files: {report['p0_confirmed_local_files']}")
     print(f"P0 Unretained Historical: {report['p0_unretained_historical_files']}")
@@ -300,6 +428,21 @@ def print_report(is_valid: bool, report: Dict[str, Any], *, as_json: bool = Fals
         print("\nErrors / Warnings:")
         for err in report["errors"]:
             print(f"  [!] {err}")
+
+    if report["p1_completeness_errors"]:
+        print("\nP1 Completeness Errors:")
+        for item in report["p1_completeness_errors"][:10]:
+            print(f"  - {item}")
+
+    if report["p1_metadata_errors"]:
+        print("\nP1 Metadata Errors:")
+        for item in report["p1_metadata_errors"][:10]:
+            print(f"  - Order #{item['order_id']} job #{item['job_id']} ({item['kind']}): {item['field']}={item['value']!r} ({item['error']})")
+
+    if report["orphan_delivery_jobs"]:
+        print("\nOrphan Delivery Jobs:")
+        for item in report["orphan_delivery_jobs"][:10]:
+            print(f"  - Job #{item['job_id']} references non-existent order #{item['order_id']} ({item['kind']})")
 
     if report["p1_missing_files"]:
         print("\nMissing P1 Files:")

@@ -418,3 +418,225 @@ def test_cli_execution_success_and_failure(tmp_path):
     )
     assert proc_bad.returncode == 1
     assert "INTEGRITY_CHECK_FAILED" in proc_bad.stdout
+
+
+def test_p1_order_without_any_delivery_jobs_fails(test_env):
+    """1. P1-заказ без всех delivery_jobs: отказ верификации (не должен считаться P0)."""
+    client, db_path, uploads_dir = test_env
+    resp = client.post(
+        "/api/order",
+        data={"name": "Client Lost Jobs", "phone": "+79991112233", "format": "10x15"},
+        files=[("files", ("photo.jpg", JPEG, "image/jpeg"))],
+    )
+    assert resp.status_code == 200
+    order_id = resp.json()["order_id"]
+
+    # Delete all delivery jobs for this P1 order
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("DELETE FROM delivery_jobs WHERE order_id = ?", (order_id,))
+
+    is_valid, report = verify_backup(db_path, uploads_dir)
+    assert is_valid is False
+    assert report["p1_orders_count"] == 1
+    assert report["p0_orders_count"] == 0  # Crucial: NOT silently reclassified as P0!
+    assert any("has NO entries in delivery_jobs" in e for e in report["p1_completeness_errors"])
+
+
+def test_p1_order_with_missing_single_file_job_fails(test_env):
+    """2. P1-заказ с удалённой одной файловой задачей: отказ верификации."""
+    client, db_path, uploads_dir = test_env
+    resp = client.post(
+        "/api/order",
+        data={"name": "Client Partial Jobs", "phone": "+79991112233", "format": "10x15"},
+        files=[
+            ("files", ("one.jpg", JPEG, "image/jpeg")),
+            ("files", ("two.png", PNG, "image/png")),
+        ],
+    )
+    assert resp.status_code == 200
+    order_id = resp.json()["order_id"]
+
+    # Delete one file job
+    with sqlite3.connect(db_path) as conn:
+        job_id = conn.execute(
+            "SELECT id FROM delivery_jobs WHERE order_id = ? AND kind = 'file' LIMIT 1",
+            (order_id,),
+        ).fetchone()[0]
+        conn.execute("DELETE FROM delivery_jobs WHERE id = ?", (job_id,))
+
+    is_valid, report = verify_backup(db_path, uploads_dir)
+    assert is_valid is False
+    assert any("file count mismatch" in e for e in report["p1_completeness_errors"])
+
+
+def test_p1_order_without_info_job_fails(test_env):
+    """3. P1-заказ без задачи info: отказ верификации."""
+    client, db_path, uploads_dir = test_env
+    resp = client.post(
+        "/api/order",
+        data={"name": "Client No Info", "phone": "+79991112233", "format": "10x15"},
+        files=[("files", ("photo.jpg", JPEG, "image/jpeg"))],
+    )
+    assert resp.status_code == 200
+    order_id = resp.json()["order_id"]
+
+    # Delete info job
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("DELETE FROM delivery_jobs WHERE order_id = ? AND kind = 'info'", (order_id,))
+
+    is_valid, report = verify_backup(db_path, uploads_dir)
+    assert is_valid is False
+    assert any("must have exactly 1 'info' job" in e for e in report["p1_completeness_errors"])
+
+
+def test_orphan_delivery_job_without_order_fails(test_env):
+    """4. Задача доставки без существующего заказа: отказ верификации."""
+    client, db_path, uploads_dir = test_env
+    resp = client.post(
+        "/api/order",
+        data={"name": "Client Base", "phone": "+79991112233", "format": "10x15"},
+        files=[("files", ("photo.jpg", JPEG, "image/jpeg"))],
+    )
+    assert resp.status_code == 200
+
+    # Insert an orphan delivery job pointing to non-existent order #99999
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "INSERT INTO delivery_jobs (id, order_id, kind, state, attempts, next_attempt_at, created_at, local_path, content_sha256, content_size) "
+            "VALUES ('orphan-job-id', ?, 'file', 'pending', 0, '2026-01-01', '2026-01-01', '/app/uploads/orphan.jpg', ?, 100)",
+            (99999, "a" * 64),
+        )
+
+    is_valid, report = verify_backup(db_path, uploads_dir)
+    assert is_valid is False
+    assert len(report["orphan_delivery_jobs"]) == 1
+    assert report["orphan_delivery_jobs"][0]["order_id"] == 99999
+
+
+def test_p1_job_missing_or_malformed_sha256_fails(test_env):
+    """5. Отсутствующий, пустой или некорректный SHA-256: отказ верификации."""
+    client, db_path, uploads_dir = test_env
+    resp = client.post(
+        "/api/order",
+        data={"name": "Client Bad Hash", "phone": "+79991112233", "format": "10x15"},
+        files=[("files", ("photo.jpg", JPEG, "image/jpeg"))],
+    )
+    assert resp.status_code == 200
+    order_id = resp.json()["order_id"]
+
+    for bad_hash in [None, "", "not-a-hash", "short"]:
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                "UPDATE delivery_jobs SET content_sha256 = ? WHERE order_id = ? AND kind = 'file'",
+                (bad_hash, order_id),
+            )
+        is_valid, report = verify_backup(db_path, uploads_dir)
+        assert is_valid is False
+        assert any(e["field"] == "content_sha256" for e in report["p1_metadata_errors"])
+
+
+def test_p1_job_missing_or_invalid_size_fails(test_env):
+    """6. Отсутствующий, отрицательный или нецелочисленный размер: отказ верификации."""
+    client, db_path, uploads_dir = test_env
+    resp = client.post(
+        "/api/order",
+        data={"name": "Client Bad Size", "phone": "+79991112233", "format": "10x15"},
+        files=[("files", ("photo.jpg", JPEG, "image/jpeg"))],
+    )
+    assert resp.status_code == 200
+    order_id = resp.json()["order_id"]
+
+    for bad_size in [None, -1, -100]:
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                "UPDATE delivery_jobs SET content_size = ? WHERE order_id = ? AND kind = 'file'",
+                (bad_size, order_id),
+            )
+        is_valid, report = verify_backup(db_path, uploads_dir)
+        assert is_valid is False
+        assert any(e["field"] == "content_size" for e in report["p1_metadata_errors"])
+
+
+def test_p1_corrupt_content_with_missing_control_metadata_fails(test_env):
+    """7. Повреждённое содержимое при отсутствующих контрольных метаданных: отказ верификации."""
+    client, db_path, uploads_dir = test_env
+    resp = client.post(
+        "/api/order",
+        data={"name": "Client Corrupt Null Hash", "phone": "+79991112233", "format": "10x15"},
+        files=[("files", ("photo.jpg", JPEG, "image/jpeg"))],
+    )
+    assert resp.status_code == 200
+    order_id = resp.json()["order_id"]
+
+    # Corrupt file on disk
+    stored_photos = list(uploads_dir.glob("*.jpg"))
+    assert len(stored_photos) == 1
+    stored_photos[0].write_bytes(b"\x00" * len(JPEG))
+
+    # Strip control metadata from DB
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "UPDATE delivery_jobs SET content_sha256 = NULL, content_size = NULL WHERE order_id = ? AND kind = 'file'",
+            (order_id,),
+        )
+
+    # Must fail because control metadata is missing (does NOT mask corruption!)
+    is_valid, report = verify_backup(db_path, uploads_dir)
+    assert is_valid is False
+    assert len(report["p1_metadata_errors"]) >= 1
+
+
+def test_intact_mixed_p0_p1_database_passes(tmp_path, monkeypatch):
+    """8. Неповреждённая смешанная P0/P1-база: успешное прохождение (PASS)."""
+    db_path = tmp_path / "mixed.db"
+    uploads_dir = tmp_path / "uploads"
+    uploads_dir.mkdir(parents=True)
+
+    monkeypatch.setattr(main, "DB_PATH", db_path)
+    monkeypatch.setattr(main, "UPLOAD_DIR", uploads_dir)
+    monkeypatch.setenv("ROBOKASSA_MERCHANT_LOGIN", "test-merchant")
+    monkeypatch.setenv("ROBOKASSA_PASSWORD1", "test-pass-1")
+    monkeypatch.setenv("ROBOKASSA_PASSWORD2", "test-pass-2")
+    monkeypatch.setenv("DELIVERY_WORKER_ENABLED", "0")
+
+    main.init_db()
+
+    # P0 order 1 with local file
+    create_p0_order(db_path, order_id=1, original_filename="p0_one.jpg")
+    (uploads_dir / "1_p0_one.jpg").write_bytes(JPEG)
+
+    # P0 order 2 without local file (unretained)
+    create_p0_order(db_path, order_id=2, original_filename="p0_two.jpg")
+
+    # P1 orders created via real API
+    client = TestClient(main.app)
+    resp3 = client.post(
+        "/api/order",
+        data={"name": "Alice P1", "phone": "+79991110001", "format": "10x15"},
+        files=[("files", ("alice.jpg", JPEG, "image/jpeg"))],
+    )
+    assert resp3.status_code == 200
+
+    resp4 = client.post(
+        "/api/order",
+        data={"name": "Bob P1", "phone": "+79991110002", "format": "Polaroid"},
+        files=[
+            ("files", ("shot1.jpg", JPEG, "image/jpeg")),
+            ("files", ("shot2.png", PNG, "image/png")),
+        ],
+    )
+    assert resp4.status_code == 200
+
+    is_valid, report = verify_backup(db_path, uploads_dir)
+    assert is_valid is True
+    assert report["orders_count"] == 4
+    assert report["p0_orders_count"] == 2
+    assert report["p1_orders_count"] == 2
+    assert report["p0_confirmed_local_files"] == 1
+    assert report["p0_unretained_historical_files"] == 1
+    assert report["p1_verified_files"] == 3
+    assert report["p1_verified_info"] == 2
+    assert len(report["p1_completeness_errors"]) == 0
+    assert len(report["p1_metadata_errors"]) == 0
+    assert len(report["orphan_delivery_jobs"]) == 0
+    assert len(report["errors"]) == 0
