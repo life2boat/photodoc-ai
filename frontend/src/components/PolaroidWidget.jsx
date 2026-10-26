@@ -11,6 +11,7 @@ export default function PolaroidWidget({ onSuccess, onReset }) {
   const [isLoading, setIsLoading] = useState(false);
   const [isSuccess, setIsSuccess] = useState(false);
   const [orderId, setOrderId] = useState(null);
+  const [orderToken, setOrderToken] = useState(null);
   const [paymentAmount, setPaymentAmount] = useState(0);
   const [printFormat, setPrintFormat] = useState('10x15');
   const [isFileDragging, setIsFileDragging] = useState(false);
@@ -159,6 +160,7 @@ export default function PolaroidWidget({ onSuccess, onReset }) {
       if (response.ok) {
         const data = await response.json();
         setOrderId(data.order_id || '...');
+        setOrderToken(data.order_token);
         setPaymentAmount(data.amount ? parseFloat(data.amount) : photos.length * PRICE_PER_PHOTO);
         setIsSuccess(true);
         scrollToWidget();
@@ -194,12 +196,12 @@ export default function PolaroidWidget({ onSuccess, onReset }) {
         <div className="flex flex-col sm:flex-row gap-4 justify-center mt-6">
           <button
             type="button"
-            onClick={() => redirectToPayment(orderId, paymentAmount)}
+            onClick={() => redirectToPayment(orderId, orderToken, paymentAmount)}
             className="px-8 py-3 bg-yellow-400 text-black font-bold rounded-full hover:bg-yellow-500 transition-colors shadow-sm"
           >
             Перейти к оплате
           </button>
-          <button type="button" onClick={() => { setIsSuccess(false); setOrderId(null); setPaymentAmount(0); if (onReset) onReset(); }} className="px-6 py-3 bg-gray-200 text-gray-800 font-medium rounded-full hover:bg-gray-300 transition-colors">
+          <button type="button" onClick={() => { setIsSuccess(false); setOrderId(null); setOrderToken(null); setPaymentAmount(0); if (onReset) onReset(); }} className="px-6 py-3 bg-gray-200 text-gray-800 font-medium rounded-full hover:bg-gray-300 transition-colors">
             Оформить новый заказ
           </button>
         </div>

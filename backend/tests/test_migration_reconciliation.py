@@ -30,6 +30,7 @@ from migrations.reconcile_payment_schema import (  # noqa: E402
     get_existing_columns,
     reconcile_schema,
 )
+from migrations.reconcile_delivery_schema import reconcile as reconcile_delivery  # noqa: E402
 from db_contract import APPLICATION_ID  # noqa: E402
 
 
@@ -522,7 +523,7 @@ def test_fresh_db_order_creation_sets_created_at(temp_db, monkeypatch):
                 "crop": "Без обрезки",
                 "comment": "Fresh order test",
             },
-            files=[("files", ("test.jpg", b"fake image bytes", "image/jpeg"))],
+            files=[("files", ("test.jpg", b"\xff\xd8\xffsynthetic", "image/jpeg"))],
         )
 
     assert resp.status_code == 200
@@ -595,6 +596,8 @@ def test_reconciled_db_order_creation_sets_created_at_and_preserves_old_null(tem
     conn.close()
     assert old_row[2] is None, "Historical order must keep NULL created_at"
 
+    # P1 delivery tables are a separate additive migration.
+    reconcile_delivery(temp_db, apply=True)
     # Now create new order via API on the reconciled DB
     monkeypatch.setattr(main, "DB_PATH", temp_db)
     client = TestClient(main.app)
@@ -611,7 +614,7 @@ def test_reconciled_db_order_creation_sets_created_at_and_preserves_old_null(tem
                 "crop": "Без обрезки",
                 "comment": "Reconciled order test",
             },
-            files=[("files", ("new_doc.jpg", b"fake bytes", "image/jpeg"))],
+            files=[("files", ("new_doc.jpg", b"\xff\xd8\xffsynthetic", "image/jpeg"))],
         )
 
     assert resp.status_code == 200

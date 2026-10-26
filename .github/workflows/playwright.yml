@@ -2,9 +2,10 @@ name: CI
 
 on:
   push:
-    branches: [ main, master ]
+    branches: [ main, master, fix/p1-order-delivery-hardening ]
   pull_request:
-    branches: [ main, master ]
+    branches: [ main, master, fix/p0-production-readiness ]
+  workflow_dispatch:
 
 jobs:
   playwright-tests:
@@ -59,12 +60,8 @@ jobs:
       run: pip install -r requirements.txt
     - name: Install pytest
       run: pip install pytest
-    - name: Run payment security tests
-      run: pytest tests/test_payment_security.py -v
-    - name: Run migration reconciliation tests
-      run: pytest tests/test_migration_reconciliation.py -v
-    - name: Run rollback bundle tests
-      run: pytest tests/test_rollback_bundle.py -v
+    - name: Run backend security, migration, and delivery tests
+      run: pytest tests -v
     - name: Verify preflight script
       run: |
         python ../scripts/production_preflight.py --db nonexistent.db || true
@@ -168,6 +165,14 @@ jobs:
             --db /data/orders.db \
             --apply \
             --allow-legacy-unmarked
+        docker run --rm --user 0 \
+          -v "${DB_VOLUME}:/data" \
+          -v "$PWD/backend:/candidate/backend:ro" \
+          -w /candidate/backend \
+          python:3.11-alpine \
+          python migrations/reconcile_delivery_schema.py \
+            --db /data/orders.db \
+            --apply
         echo "MIGRATION_RUNNER_APP_IMAGE_INDEPENDENT=true"
         echo "ROOT_MIGRATION_ON_ROOT_OWNED_DB=PASS"
 
@@ -314,6 +319,14 @@ jobs:
             --db /data/orders.db \
             --apply \
             --allow-legacy-unmarked
+        docker run --rm --user 0 \
+          -v "${DB_VOLUME}:/data" \
+          -v "$PWD/backend:/candidate/backend:ro" \
+          -w /candidate/backend \
+          python:3.11-alpine \
+          python migrations/reconcile_delivery_schema.py \
+            --db /data/orders.db \
+            --apply
         echo "MIGRATION_RUNNER_APP_IMAGE_INDEPENDENT=true"
         echo "PRODUCTION_MIGRATION_CAN_WRITE_ROOT_OWNED_DB=true"
         echo "ROOT_MIGRATION_ON_ROOT_OWNED_DB=PASS"
@@ -393,6 +406,9 @@ jobs:
         HEALTH_RESP=$(curl --fail -sS "http://127.0.0.1:${PORT}/api/health")
         echo "API Health Response: ${HEALTH_RESP}"
         echo "${HEALTH_RESP}" | grep -q '"status"[[:space:]]*:[[:space:]]*"ok"'
+
+        echo "Testing containerized Nginx upload limits and contracts..."
+        python scripts/test_container_upload_limits.py --url "http://127.0.0.1:${PORT}"
     - name: Dump logs on failure
       if: failure()
       run: |
