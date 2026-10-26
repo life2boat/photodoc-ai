@@ -56,7 +56,7 @@ def check_http_redirect(domain: str, port: int = 80, timeout: float = 5.0) -> Di
     opener = urllib.request.build_opener(NoRedirectHandler)
     req = urllib.request.Request(
         f"http://{domain}:{port}/",
-        headers={"User-Agent": "PhotoDoc-Staging-Preflight/1.0"},
+        headers={"User-Agent": "PhotoDoc-Staging-Preflight/2.1"},
     )
 
     try:
@@ -76,6 +76,24 @@ def check_http_redirect(domain: str, port: int = 80, timeout: float = 5.0) -> Di
     return result
 
 
+def domain_matches_san(domain: str, san_list: List[str], subject_cn: Optional[str]) -> bool:
+    """Check if the domain matches any SAN entry or Subject CN, including wildcards."""
+    target = domain.lower()
+    candidates = [s.lower() for s in san_list]
+    if subject_cn:
+        candidates.append(subject_cn.lower())
+
+    for c in candidates:
+        if c == target:
+            return True
+        if c.startswith("*."):
+            base = c[2:]
+            parts = target.split(".", 1)
+            if len(parts) == 2 and parts[1] == base:
+                return True
+    return False
+
+
 def check_tls_certificate(
     domain: str,
     port: int = 443,
@@ -92,6 +110,7 @@ def check_tls_certificate(
         "issuer": None,
         "subject": None,
         "san": [],
+        "domain_matches": False,
         "not_after": None,
         "days_remaining": None,
         "is_expired": None,
@@ -121,10 +140,12 @@ def check_tls_certificate(
                 sans = [v for k, v in cert.get("subjectAltName", []) if k == "DNS"]
                 result["san"] = sans
 
+                # Match domain against SAN and Subject
+                result["domain_matches"] = domain_matches_san(domain, sans, result["subject"])
+
                 # Expiration calculation
                 not_after_str = cert.get("notAfter")
                 if not_after_str:
-                    # e.g., 'May 23 01:11:25 2027 GMT'
                     not_after_dt = datetime.datetime.strptime(
                         not_after_str, "%b %d %H:%M:%S %Y %Z"
                     ).replace(tzinfo=datetime.timezone.utc)
@@ -144,13 +165,17 @@ def check_api_health(
     timeout: float = 5.0,
     verify: bool = True,
 ) -> Dict[str, Any]:
-    """Verify that /api/health responds with 200 OK and valid status."""
+    """Verify that /api/health responds with strict HTTP 200 and valid JSON {'status': 'ok'}.
+
+    Any HTML, empty body, non-200 status, or arbitrary JSON is treated as FAIL.
+    """
     url = f"{base_url.rstrip('/')}/api/health"
     result: Dict[str, Any] = {
         "url": url,
         "reachable": False,
         "status_code": None,
         "response_body": None,
+        "is_json": False,
         "healthy": False,
         "error": None,
     }
@@ -163,7 +188,7 @@ def check_api_health(
 
     req = urllib.request.Request(
         url,
-        headers={"User-Agent": "PhotoDoc-Staging-Preflight/1.0"},
+        headers={"User-Agent": "PhotoDoc-Staging-Preflight/2.1"},
     )
 
     try:
@@ -171,15 +196,28 @@ def check_api_health(
             result["reachable"] = True
             result["status_code"] = resp.status
             body_bytes = resp.read()
+
+            if not body_bytes:
+                result["error"] = "Empty response body received from /api/health"
+                return result
+
             try:
                 body_json = json.loads(body_bytes.decode("utf-8"))
                 result["response_body"] = body_json
-                if resp.status == 200 and body_json.get("status") in ("ok", "healthy"):
-                    result["healthy"] = True
-            except Exception:
-                result["response_body"] = body_bytes.decode("utf-8", errors="replace")[:200]
-                if resp.status == 200:
-                    result["healthy"] = True
+                result["is_json"] = True
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                preview = body_bytes.decode("utf-8", errors="replace")[:100]
+                result["response_body"] = preview
+                result["error"] = f"Response is not valid JSON (HTML or plaintext received: {preview!r})"
+                return result
+
+            # Strict check: must be a dict with status == "ok"
+            if isinstance(body_json, dict) and body_json.get("status") == "ok":
+                result["healthy"] = True
+            else:
+                actual_status = body_json.get("status") if isinstance(body_json, dict) else None
+                result["error"] = f"Expected JSON status 'ok', got: {actual_status!r}"
+
     except urllib.error.HTTPError as exc:
         result["reachable"] = True
         result["status_code"] = exc.code
@@ -223,6 +261,7 @@ def run_preflight(
     report: Dict[str, Any] = {
         "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "domain": domain,
+        "verify_tls": verify_tls,
         "dns": check_dns(domain, expected_ip),
         "http_redirect": {},
         "tls": {},
@@ -231,6 +270,12 @@ def run_preflight(
         "pass": False,
         "blockers": [],
     }
+
+    # Strict Production Guardrail: Never grant production PASS if TLS verification was bypassed
+    if not verify_tls:
+        report["blockers"].append(
+            "TLS verification disabled (--skip-tls-verify). Production PASS is forbidden with unverified TLS."
+        )
 
     # 1. DNS Check
     if not report["dns"]["resolved"]:
@@ -242,23 +287,39 @@ def run_preflight(
 
     # If DNS resolved, proceed with network checks
     if report["dns"]["resolved"]:
+        # 2. HTTP -> HTTPS Redirect Check
         report["http_redirect"] = check_http_redirect(domain)
         if not report["http_redirect"]["redirects_to_https"]:
             report["blockers"].append(
-                f"HTTP port 80 did not issue HTTPS redirect (status={report['http_redirect'].get('status_code')})"
+                f"HTTP port 80 did not redirect to HTTPS (status={report['http_redirect'].get('status_code')}, location={report['http_redirect'].get('location')})"
             )
 
+        # 3. TLS Certificate Check
         report["tls"] = check_tls_certificate(domain, verify=verify_tls)
         if not report["tls"]["handshake_success"]:
             report["blockers"].append(f"TLS handshake failed: {report['tls'].get('error')}")
-        elif report["tls"].get("is_expired"):
-            report["blockers"].append(f"TLS certificate is expired (not_after={report['tls'].get('not_after')})")
+        else:
+            if not report["tls"]["domain_matches"]:
+                report["blockers"].append(
+                    f"TLS certificate does not match domain {domain} (SANs: {report['tls']['san']}, Subject: {report['tls']['subject']})"
+                )
+            if report["tls"].get("is_expired"):
+                report["blockers"].append(
+                    f"TLS certificate is expired (not_after={report['tls'].get('not_after')})"
+                )
+            elif report["tls"].get("days_remaining") is not None and report["tls"]["days_remaining"] < 7:
+                report["blockers"].append(
+                    f"TLS certificate expires in less than 7 days ({report['tls']['days_remaining']} days remaining)"
+                )
 
+        # 4. API Health Check (Strict 200 + JSON {'status': 'ok'})
         report["api_health"] = check_api_health(f"https://{domain}", verify=verify_tls)
         if not report["api_health"]["healthy"]:
-            report["blockers"].append(f"API /api/health returned non-healthy state: {report['api_health'].get('error')}")
+            report["blockers"].append(
+                f"API /api/health returned non-healthy state: {report['api_health'].get('error')}"
+            )
 
-    # 2. Port Isolation Check
+    # 5. Port Isolation Check
     target_ip = expected_ip or (report["dns"]["ips"][0] if report["dns"]["ips"] else None)
     if target_ip and forbidden_ports:
         report["port_isolation"] = check_port_isolation(target_ip, forbidden_ports)
@@ -298,6 +359,7 @@ def main() -> int:
         print(f" DNS Resolved:         {report['dns']['resolved']} ({', '.join(report['dns']['ips']) or 'None'})")
         print(f" HTTP -> HTTPS 301:    {report.get('http_redirect', {}).get('redirects_to_https', 'N/A')}")
         print(f" TLS Handshake:        {report.get('tls', {}).get('handshake_success', 'N/A')}")
+        print(f" TLS Domain Match:     {report.get('tls', {}).get('domain_matches', 'N/A')}")
         print(f" TLS Days Left:        {report.get('tls', {}).get('days_remaining', 'N/A')}")
         print(f" API Health (/api):    {report.get('api_health', {}).get('healthy', 'N/A')}")
         if report.get("port_isolation"):
