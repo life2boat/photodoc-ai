@@ -6,9 +6,9 @@ existing persistent volume/bind mount.
 
 ## Before starting the P1 backend
 
-Stop the old backend writer and make a verified backup of `orders.db` and the
-uploads directory using the PR #8 release runbook. Keep the backup outside the
-release tree. On the backed-up, identified PhotoDoc database, run:
+Stop the old backend writer and execute the verified backup protocol detailed below
+for `orders.db` and the uploads directory. Keep the backup outside the release tree.
+On the backed-up, identified PhotoDoc database, run:
 
 ```bash
 python backend/migrations/reconcile_delivery_schema.py --db /data/orders.db
@@ -22,6 +22,171 @@ and local files are not rewritten. The P1 backend refuses to start against a
 database missing these additions. Run these commands in an isolated container
 with the real persistent volume mounted only during an approved release. This
 document is not an instruction to deploy from a draft PR.
+
+## Hardened Backup and Recovery Protocol
+
+Copying an active SQLite database file using `cp` while writers are active or before WAL
+checkpointing can produce torn pages or lose uncheckpointed transactions, and can cause
+desynchronization between database records and customer photo uploads on disk.
+
+To guarantee consistent, verifiable backups prior to schema migration or deployment cutover,
+follow this strict procedure:
+
+### 1. Writer Shutdown and SQLite WAL Checkpoint
+
+Before snapshotting, guarantee zero write concurrency by stopping the backend container:
+
+```bash
+docker compose -p photodoc \
+  -f "${ACTIVE_RELEASE_DIR}/docker-compose.yml" \
+  -f "${ACTIVE_RELEASE_DIR}/docker-compose.production.yml" \
+  stop backend
+```
+
+Once the writer is stopped, flush and truncate any SQLite Write-Ahead Log (`orders.db-wal`):
+
+```bash
+docker run --rm \
+  -v "${PHOTODOC_DB_VOLUME:-photodoc_backend-data}:/data" \
+  alpine sh -c "apk add --no-cache sqlite >/dev/null && sqlite3 /data/orders.db 'PRAGMA wal_checkpoint(TRUNCATE);'"
+```
+
+Verify that the command returns `0` (not busy) and that the database integrity check returns `ok`:
+
+```bash
+docker run --rm \
+  -v "${PHOTODOC_DB_VOLUME:-photodoc_backend-data}:/data:ro" \
+  alpine sh -c "apk add --no-cache sqlite >/dev/null && sqlite3 /data/orders.db 'PRAGMA integrity_check;'"
+```
+
+### 2. Transactionally Consistent SQLite Snapshot via Backup API
+
+Create the backup directory and perform an atomic snapshot using SQLite's native Online Backup API (`.backup`):
+
+```bash
+BACKUP_DIR="${ACTIVE_RELEASE_DIR}/backups/release_$(date +%Y%m%d_%H%M%S)"
+mkdir -p "${BACKUP_DIR}"
+
+docker run --rm \
+  -v "${PHOTODOC_DB_VOLUME:-photodoc_backend-data}:/data:ro" \
+  -v "${BACKUP_DIR}:/backup" \
+  alpine sh -c "apk add --no-cache sqlite >/dev/null && sqlite3 /data/orders.db '.backup /backup/orders.db'"
+```
+
+Verify integrity of the backup file:
+
+```bash
+docker run --rm \
+  -v "${BACKUP_DIR}:/backup:ro" \
+  alpine sh -c "apk add --no-cache sqlite >/dev/null && sqlite3 /backup/orders.db 'PRAGMA integrity_check;'"
+```
+The result must be strictly `ok`.
+
+### 3. Synchronized Uploads Directory Archive
+
+With the backend writer stopped, no new files can be written to `/opt/photodoc/backend/uploads`. Archive the uploads directory while preserving directory structure, permissions, and numeric ownership:
+
+```bash
+tar --numeric-owner -czvf "${BACKUP_DIR}/uploads.tar.gz" -C /opt/photodoc/backend uploads
+```
+
+### 4. Cryptographic Manifest and Metadata Generation
+
+Generate SHA-256 checksums for both artifacts:
+
+```bash
+cd "${BACKUP_DIR}"
+sha256sum orders.db uploads.tar.gz > manifest.sha256
+```
+
+Record the metadata manifest `backup_manifest.json` capturing database application identity, record counts, and file counts:
+
+```bash
+DB_APP_ID=$(sqlite3 "${BACKUP_DIR}/orders.db" "PRAGMA application_id;")
+ORDER_COUNT=$(sqlite3 "${BACKUP_DIR}/orders.db" "SELECT COUNT(*) FROM orders;")
+MAX_ORDER_ID=$(sqlite3 "${BACKUP_DIR}/orders.db" "SELECT COALESCE(MAX(id), 0) FROM orders;")
+FILE_COUNT=$(find /opt/photodoc/backend/uploads -type f | wc -l)
+DB_SHA256=$(sha256sum "${BACKUP_DIR}/orders.db" | awk '{print $1}')
+UPLOADS_SHA256=$(sha256sum "${BACKUP_DIR}/uploads.tar.gz" | awk '{print $1}')
+
+cat <<EOF > "${BACKUP_DIR}/backup_manifest.json"
+{
+  "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "application_id": ${DB_APP_ID},
+  "application_id_tag": "PDAI",
+  "orders_count": ${ORDER_COUNT},
+  "max_order_id": ${MAX_ORDER_ID},
+  "uploads_files_count": ${FILE_COUNT},
+  "orders_db_sha256": "${DB_SHA256}",
+  "uploads_tar_sha256": "${UPLOADS_SHA256}"
+}
+EOF
+```
+
+Confirm that `application_id` matches `1346650441` (`PDAI`).
+
+### 5. Independent Sandbox Restore Rehearsal
+
+Before modifying the active production database, verify the restorable state in an isolated scratch environment:
+
+```bash
+RESTORE_DIR=$(mktemp -d /tmp/photodoc_restore_XXXXXX)
+
+# 1. Verify checksums against manifest
+cd "${BACKUP_DIR}"
+sha256sum -c manifest.sha256
+
+# 2. Extract into sandbox
+cp "${BACKUP_DIR}/orders.db" "${RESTORE_DIR}/orders.db"
+tar -xzf "${BACKUP_DIR}/uploads.tar.gz" -C "${RESTORE_DIR}"
+
+# 3. Verify SQLite integrity and identity in sandbox
+sqlite3 "${RESTORE_DIR}/orders.db" "PRAGMA integrity_check;"
+sqlite3 "${RESTORE_DIR}/orders.db" "PRAGMA application_id;"
+
+# 4. Cross-verify photo consistency between database and uploads
+python3 - <<EOF
+import sqlite3, sys
+from pathlib import Path
+
+db = Path("${RESTORE_DIR}/orders.db")
+uploads = Path("${RESTORE_DIR}/uploads")
+conn = sqlite3.connect(db)
+rows = conn.execute("SELECT id, filename FROM orders WHERE filename IS NOT NULL AND filename != ''").fetchall()
+missing = []
+for oid, fnames in rows:
+    for f in fnames.split(","):
+        f = f.strip()
+        if f and not (uploads / f).is_file():
+            missing.append((oid, f))
+conn.close()
+if missing:
+    print(f"FAILED: missing attachment files: {missing}")
+    sys.exit(1)
+print(f"PASS: all attachment files accounted for ({len(rows)} order rows checked)")
+EOF
+
+# Clean up sandbox
+rm -rf "${RESTORE_DIR}"
+```
+
+### 6. Rollback Protocol and Migration Compatibility
+
+- **Rollback before new orders are accepted:**
+  If migration fails or candidate verification aborts before opening public traffic:
+  1. Stop candidate containers.
+  2. Restore `/data/orders.db` from `${BACKUP_DIR}/orders.db`.
+  3. Ensure ownership and mode: `chmod 644 /data/orders.db`.
+  4. Restart the verified previous release backend.
+- **Rollback after new orders are accepted (Additive Migration Compatibility):**
+  P1 migration is strictly additive:
+  - Adds `order_token_hash` column to `orders`.
+  - Creates `delivery_jobs` table and indexes.
+  The P0 backend inspection (`inspect_database` in `backend/db_contract.py`) verifies required columns and application identity `1346650441`, and gracefully tolerates additional columns or tables.
+  However, orders created while running P1 will have their delivery tasks queued in `delivery_jobs` rather than executed via P0's legacy synchronous path.
+  Therefore:
+  - In a catastrophic rollback to P0 while preserving new customer orders, run an operator script to inspect pending `delivery_jobs` and dispatch them manually.
+  - If reverting completely to the pre-upgrade snapshot, any orders placed during the failed P1 window must be exported before database restoration.
 
 ## Recovery model
 
