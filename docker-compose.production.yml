@@ -13,7 +13,9 @@
 services:
   backend:
     env_file:
-      - ./backend/.env
+      - ${PHOTODOC_ENV_FILE:-./backend/.env}
+    environment:
+      PHOTODOC_REQUIRE_DB_IDENTITY: "1"
     volumes:
       - photodoc_db:/data
       - ${PHOTODOC_UPLOADS_SOURCE:-/opt/photodoc/backend/uploads}:/app/uploads
@@ -24,4 +26,5 @@ services:
 
 volumes:
   photodoc_db:
+    external: true
     name: ${PHOTODOC_DB_VOLUME:-photodoc_backend-data}

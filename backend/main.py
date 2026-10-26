@@ -17,6 +17,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
+from db_contract import APPLICATION_ID, inspect_database, read_application_id
+
 # Загрузка переменных окружения
 load_dotenv()
 
@@ -42,9 +44,25 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 # --- Инициализация базы данных ---
 def init_db():
+    """Create only a genuinely fresh DB; never bless an existing unknown DB."""
+    db_size = DB_PATH.stat().st_size if DB_PATH.exists() else 0
+
+    if db_size > 0:
+        ready, _ = inspect_database(DB_PATH, require_complete_schema=True)
+        if not ready:
+            raise RuntimeError(
+                "Existing database does not satisfy the PhotoDoc identity/schema contract; "
+                "run the controlled reconciliation migration"
+            )
+        return
+
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute('''
+    try:
+        cursor = conn.cursor()
+        cursor.execute("BEGIN IMMEDIATE")
+        cursor.execute(f"PRAGMA application_id = {APPLICATION_ID}")
+        cursor.execute('''
         CREATE TABLE IF NOT EXISTS orders (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT,
@@ -65,16 +83,46 @@ def init_db():
             payment_email_sent_at TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
-    ''')
-    conn.commit()
-    conn.close()
+        ''')
+        if read_application_id(conn) != APPLICATION_ID:
+            raise RuntimeError("Failed to initialize PhotoDoc database identity")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+    ready, _ = inspect_database(DB_PATH, require_complete_schema=True)
+    if not ready:
+        raise RuntimeError("Fresh PhotoDoc database failed post-initialization verification")
 
 
-init_db()
+def database_readiness_ok() -> bool:
+    ready, _ = inspect_database(DB_PATH, require_complete_schema=True)
+    return ready
+
+
+def _require_existing_database_identity() -> bool:
+    return os.getenv("PHOTODOC_REQUIRE_DB_IDENTITY", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+if _require_existing_database_identity():
+    if not database_readiness_ok():
+        raise RuntimeError("Production database identity/readiness verification failed")
+else:
+    init_db()
 
 
 @app.get("/api/health")
 def health_check():
+    if not database_readiness_ok():
+        return JSONResponse({"status": "unavailable"}, status_code=503)
     return {"status": "ok"}
 
 
@@ -221,19 +269,51 @@ def get_authoritative_order_amount(order: dict) -> str:
     return format_robokassa_amount(price)
 
 
-def update_order_payment_pending(order_id: int, amount: str):
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute(
-        """
-        UPDATE orders
-        SET payment_amount = ?, payment_status = 'pending', status = 'awaiting_payment'
-        WHERE id = ?
-        """,
-        (amount, order_id),
-    )
-    conn.commit()
-    conn.close()
+class PaymentStateError(RuntimeError):
+    """The persisted payment state cannot safely perform the requested transition."""
+
+
+def update_order_payment_pending(order_id: int, amount: str) -> str:
+    """Atomically perform unpaid -> pending, or return an idempotent terminal state."""
+    conn = sqlite3.connect(DB_PATH, timeout=10.0)
+    conn.row_factory = sqlite3.Row
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            UPDATE orders
+            SET payment_amount = ?, payment_status = 'pending', status = 'awaiting_payment'
+            WHERE id = ? AND payment_status = 'unpaid'
+            """,
+            (amount, order_id),
+        )
+        if cursor.rowcount == 1:
+            conn.commit()
+            return "pending"
+
+        row = cursor.execute(
+            "SELECT payment_status, payment_amount FROM orders WHERE id = ?", (order_id,)
+        ).fetchone()
+        conn.commit()
+        if row is None:
+            return "not_found"
+        state = row["payment_status"]
+        if state == "paid":
+            return "paid"
+        if state == "pending":
+            try:
+                persisted_amount = format_robokassa_amount(row["payment_amount"])
+            except ValueError as exc:
+                raise PaymentStateError("Pending payment has an invalid amount") from exc
+            if persisted_amount != amount:
+                raise PaymentStateError("Pending payment amount does not match order amount")
+            return "pending"
+        raise PaymentStateError("Unknown payment state")
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def mark_order_paid(order_id: int, amount: str) -> bool:
@@ -242,21 +322,32 @@ def mark_order_paid(order_id: int, amount: str) -> bool:
     Returns True if THIS call performed the transition (rowcount == 1).
     Returns False if order was already paid by a concurrent request (idempotent, no side-effects).
     """
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    paid_timestamp = datetime.utcnow().isoformat()
-    cursor.execute(
-        """
-        UPDATE orders
-        SET payment_status = 'paid', status = 'paid', payment_amount = ?, paid_at = ?
-        WHERE id = ? AND payment_status != 'paid'
-        """,
-        (amount, paid_timestamp, order_id),
-    )
-    conn.commit()
-    was_transition_owner = cursor.rowcount == 1
-    conn.close()
-    return was_transition_owner
+    conn = sqlite3.connect(DB_PATH, timeout=10.0)
+    try:
+        cursor = conn.cursor()
+        paid_timestamp = datetime.utcnow().isoformat()
+        cursor.execute(
+            """
+            UPDATE orders
+            SET payment_status = 'paid', status = 'paid', payment_amount = ?, paid_at = ?
+            WHERE id = ? AND payment_status IN ('unpaid', 'pending')
+            """,
+            (amount, paid_timestamp, order_id),
+        )
+        conn.commit()
+        if cursor.rowcount == 1:
+            return True
+        row = cursor.execute(
+            "SELECT payment_status FROM orders WHERE id = ?", (order_id,)
+        ).fetchone()
+        if row and row[0] == "paid":
+            return False
+        raise PaymentStateError("Order cannot transition to paid from its current state")
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def sanitize_upload_filename(filename: str | None) -> str:
@@ -543,6 +634,10 @@ async def create_payment(payment: PaymentCreateRequest):
     order = get_order_by_id(order_id_int)
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
+    if order.get("payment_status") == "paid":
+        raise HTTPException(status_code=409, detail="Order is already paid")
+    if order.get("payment_status") not in {"unpaid", "pending"}:
+        raise HTTPException(status_code=409, detail="Order payment state is invalid")
 
     # 1. Авторитетное определение стоимости на стороне сервера
     authoritative_amount = get_authoritative_order_amount(order)
@@ -562,7 +657,14 @@ async def create_payment(payment: PaymentCreateRequest):
 
     # 3. Сумма к оплате всегда берется строго из авторитетного источника сервера
     amount_to_pay = authoritative_amount
-    update_order_payment_pending(order_id_int, amount_to_pay)
+    try:
+        transition_result = update_order_payment_pending(order_id_int, amount_to_pay)
+    except PaymentStateError:
+        raise HTTPException(status_code=409, detail="Order payment state is invalid")
+    if transition_result == "paid":
+        raise HTTPException(status_code=409, detail="Order is already paid")
+    if transition_result == "not_found":
+        raise HTTPException(status_code=404, detail="Order not found")
 
     order_id_str = str(order_id_int)
     customer_email = (payment.email or order.get("email") or "").strip()

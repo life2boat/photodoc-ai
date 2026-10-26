@@ -13,33 +13,16 @@ empty, or unreadable databases, or missing production credentials.
 """
 
 import argparse
-import os
-import sqlite3
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
-# Canonical list of expected columns on the orders table
-EXPECTED_COLUMNS: List[str] = [
-    "id",
-    "name",
-    "phone",
-    "email",
-    "format",
-    "paper",
-    "crop",
-    "comment",
-    "filename",
-    "status",
-    "payment_status",
-    "order_amount",
-    "payment_amount",
-    "payment_method",
-    "robokassa_inv_id",
-    "paid_at",
-    "payment_email_sent_at",
-    "created_at",
-]
+REPO_ROOT = Path(__file__).resolve().parent.parent
+BACKEND_DIR = REPO_ROOT / "backend"
+if str(BACKEND_DIR) not in sys.path:
+    sys.path.insert(0, str(BACKEND_DIR))
+
+from db_contract import APPLICATION_ID, inspect_database  # noqa: E402
 
 # Required backend environment variable names
 REQUIRED_ENV_VARS: List[str] = [
@@ -56,76 +39,18 @@ REQUIRED_ENV_VARS: List[str] = [
 ]
 
 
-def verify_database(db_path: Path) -> Tuple[bool, Dict[str, object]]:
+def verify_database(
+    db_path: Path, *, allow_legacy_unmarked: bool = False
+) -> Tuple[bool, Dict[str, object]]:
     """
     Performs strictly read-only validation of candidate database.
     Returns (success_bool, details_dict).
     """
-    details: Dict[str, object] = {
-        "db_exists": False,
-        "db_nonzero": False,
-        "orders_table_present": False,
-        "schema_readable": False,
-        "columns_found": [],
-        "missing_columns": [],
-        "ready_for_migration": False,
-    }
-
-    if not db_path.exists() or not db_path.is_file():
-        return False, details
-
-    details["db_exists"] = True
-
-    try:
-        size = db_path.stat().st_size
-    except OSError:
-        return False, details
-
-    if size <= 0:
-        return False, details
-
-    details["db_nonzero"] = True
-
-    # Read-only SQLite connection URI strictly — no writable fallback
-    uri = f"file:{db_path.resolve().as_posix()}?mode=ro"
-    try:
-        conn = sqlite3.connect(uri, uri=True, timeout=5.0)
-    except Exception:
-        # Strictly fail closed if read-only connection fails
-        return False, details
-
-    try:
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='orders';"
-        )
-        row = cursor.fetchone()
-        if not row:
-            return False, details
-
-        details["orders_table_present"] = True
-
-        cursor.execute("PRAGMA table_info(orders);")
-        pragma_rows = cursor.fetchall()
-        if not pragma_rows:
-            return False, details
-
-        existing_cols = [r[1].lower() for r in pragma_rows]
-        details["schema_readable"] = True
-        details["columns_found"] = existing_cols
-
-        missing = [col for col in EXPECTED_COLUMNS if col.lower() not in existing_cols]
-        details["missing_columns"] = missing
-        details["ready_for_migration"] = True
-
-        return True, details
-    except Exception:
-        return False, details
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
+    return inspect_database(
+        db_path,
+        allow_legacy_unmarked=allow_legacy_unmarked,
+        require_complete_schema=not allow_legacy_unmarked,
+    )
 
 
 def verify_env_file(env_path: Path) -> Tuple[bool, Dict[str, str]]:
@@ -193,6 +118,11 @@ def main() -> int:
         default=None,
         help="Path to backend environment file to verify variable names presence",
     )
+    parser.add_argument(
+        "--allow-legacy-unmarked",
+        action="store_true",
+        help="Explicit one-time pre-migration acceptance of application_id=0",
+    )
 
     args = parser.parse_args()
 
@@ -201,14 +131,23 @@ def main() -> int:
     # Database verification
     if args.db:
         db_path = Path(args.db)
-        db_success, db_details = verify_database(db_path)
+        db_success, db_details = verify_database(
+            db_path, allow_legacy_unmarked=args.allow_legacy_unmarked
+        )
         print(f"DB_EXISTS={'true' if db_details['db_exists'] else 'false'}")
         print(f"DB_NONZERO={'true' if db_details['db_nonzero'] else 'false'}")
+        print(f"DB_READABLE={'true' if db_details['db_readable'] else 'false'}")
         print(f"ORDERS_TABLE_PRESENT={'true' if db_details['orders_table_present'] else 'false'}")
         print(f"SCHEMA_READABLE={'true' if db_details['schema_readable'] else 'false'}")
+        application_id = db_details["application_id"]
+        print(f"DB_APPLICATION_ID={'' if application_id is None else application_id}")
+        print(f"EXPECTED_DB_APPLICATION_ID={APPLICATION_ID}")
+        print(f"DB_IDENTITY_VALID={'true' if db_details['identity_valid'] else 'false'}")
+        print(f"LEGACY_UNMARKED={'true' if db_details['legacy_unmarked'] else 'false'}")
         missing_str = ",".join(db_details["missing_columns"]) if db_details["missing_columns"] else ""
         print(f"MISSING_COLUMNS={missing_str}")
         print(f"READY_FOR_MIGRATION={'true' if db_details['ready_for_migration'] else 'false'}")
+        print(f"READY_FOR_STARTUP={'true' if db_details['ready_for_startup'] else 'false'}")
         if not db_success:
             overall_success = False
 

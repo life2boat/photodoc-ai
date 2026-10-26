@@ -13,11 +13,15 @@ Before applying any migration to production or staging SQLite database:
 For existing and production databases, use the idempotent reconciliation tool:
 ```bash
 # Check status (dry-run, default mode)
-python backend/migrations/reconcile_payment_schema.py --db /data/orders.db --check
+python backend/migrations/reconcile_payment_schema.py --db /data/orders.db --check --allow-legacy-unmarked
 
 # Apply missing columns safely
-python backend/migrations/reconcile_payment_schema.py --db /data/orders.db --apply
+python backend/migrations/reconcile_payment_schema.py --db /data/orders.db --apply --allow-legacy-unmarked
 ```
+
+`--allow-legacy-unmarked` is required only for the controlled one-time migration of an audited database whose `PRAGMA application_id` is `0`. It is not a normal startup or post-migration option. Any nonzero identity other than PhotoDoc's stable `1346650441` (`PDAI`) is always rejected.
+
+Reconciliation runs missing DDL, `application_id` assignment, schema verification, and integrity verification under `BEGIN IMMEDIATE`. Any failure rolls back both schema and identity changes.
 
 ### Why Reconciliation Over Migration 001?
 - `001_add_payment_fields.sql` is a **LEGACY_FULL_FORWARD_MIGRATION** that assumes only `(id, name, phone)` exist.
