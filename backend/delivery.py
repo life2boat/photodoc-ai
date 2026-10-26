@@ -57,6 +57,16 @@ def enqueue(conn: sqlite3.Connection, *, order_id: int, kind: str,
     return job_id
 
 
+def quarantine_expired(conn: sqlite3.Connection, now: str, max_attempts: int = DEFAULT_MAX_ATTEMPTS) -> int:
+    cursor = conn.execute(
+        "UPDATE delivery_jobs SET state = 'failed', lease_until = NULL, "
+        "last_error = COALESCE(last_error, 'LeaseExpired') "
+        "WHERE state = 'processing' AND lease_until <= ? AND attempts >= ?",
+        (now, max_attempts),
+    )
+    return cursor.rowcount
+
+
 def claim_due(db_path: Path, max_attempts: int = DEFAULT_MAX_ATTEMPTS) -> dict | None:
     now = utc_now()
     lease = (datetime.now(timezone.utc) + timedelta(minutes=3)).isoformat()
@@ -64,11 +74,12 @@ def claim_due(db_path: Path, max_attempts: int = DEFAULT_MAX_ATTEMPTS) -> dict |
     conn.row_factory = sqlite3.Row
     try:
         conn.execute("BEGIN IMMEDIATE")
+        quarantine_expired(conn, now, max_attempts)
         row = conn.execute(
             "SELECT * FROM delivery_jobs WHERE "
             "((state IN ('pending', 'failed') AND attempts < ? AND next_attempt_at <= ?) OR "
-            "(state = 'processing' AND lease_until <= ?)) "
-            "ORDER BY created_at, id LIMIT 1", (max_attempts, now, now),
+            "(state = 'processing' AND attempts < ? AND lease_until <= ?)) "
+            "ORDER BY created_at, id LIMIT 1", (max_attempts, now, max_attempts, now),
         ).fetchone()
         if row is None:
             conn.commit()

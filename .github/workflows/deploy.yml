@@ -1,9 +1,14 @@
 name: Build and Deploy PhotoDoc AI
 on:
-  push:
-    branches: ["main"]
+  workflow_dispatch:
+    inputs:
+      confirm_deploy:
+        description: 'Type "DEPLOY" to confirm manual release to GitHub Pages'
+        required: true
+        default: 'false'
 jobs:
   deploy:
+    if: ${{ github.event.inputs.confirm_deploy == 'DEPLOY' }}
     runs-on: ubuntu-latest
     permissions:
       pages: write

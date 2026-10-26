@@ -1,6 +1,7 @@
 """P1 queue concurrency, lease fencing, and retry bounds tests."""
 import sqlite3
 import sys
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -130,3 +131,90 @@ def test_max_attempts_stops_infinite_retry_of_poison_pill(test_db):
         assert quarantined["state"] == "failed"
         assert quarantined["attempts"] == max_limit
         assert quarantined["last_error"] == "RuntimeError"
+
+
+def test_expired_processing_task_at_max_attempts_quarantined_and_not_reclaimed(test_db):
+    """
+    Direct reproduction of defect:
+    A task reached max_attempts (10) during execution, but its lease expired while still in 'processing'.
+    claim_due() must NOT re-claim it for attempt 11.
+    Instead, it must transition the task to 'failed', clear lease_until, preserve/set last_error,
+    and make it discoverable for operators.
+    """
+    now = utc_now()
+    past_time = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+    with sqlite3.connect(test_db) as conn:
+        job_id = enqueue(conn, order_id=3, kind="file", local_path="/tmp/test.jpg")
+        # Simulate that it was claimed for attempt 10, had an error recorded, and its lease expired
+        conn.execute(
+            "UPDATE delivery_jobs SET state='processing', attempts=10, lease_until=?, last_error='ConnectionResetError' WHERE id=?",
+            (past_time, job_id),
+        )
+        conn.commit()
+
+    # Next claim cycle
+    claimed = claim_due(test_db, max_attempts=10)
+    assert claimed is None, "Expired task at max_attempts must NOT be re-claimed!"
+
+    # Verify database state
+    with sqlite3.connect(test_db) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT * FROM delivery_jobs WHERE id=?", (job_id,)).fetchone()
+        assert row["state"] == "failed", "Task must be cleanly transitioned to 'failed'"
+        assert row["attempts"] == 10, "Attempts count must not exceed max_attempts"
+        assert row["lease_until"] is None, "lease_until must be cleared"
+        assert row["last_error"] == "ConnectionResetError", "Prior error must not be lost"
+
+        # Operator query discoverability
+        operator_found = conn.execute(
+            "SELECT COUNT(*) FROM delivery_jobs WHERE state='failed' AND attempts >= 10"
+        ).fetchone()[0]
+        assert operator_found == 1
+
+
+def test_expired_processing_task_without_prior_error_sets_lease_expired(test_db):
+    """If an expired processing task reached max_attempts without prior error, last_error='LeaseExpired'."""
+    past_time = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+    with sqlite3.connect(test_db) as conn:
+        job_id = enqueue(conn, order_id=4, kind="info", local_path="/tmp/info.txt")
+        conn.execute(
+            "UPDATE delivery_jobs SET state='processing', attempts=10, lease_until=?, last_error=NULL WHERE id=?",
+            (past_time, job_id),
+        )
+        conn.commit()
+
+    claimed = claim_due(test_db, max_attempts=10)
+    assert claimed is None
+
+    with sqlite3.connect(test_db) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT * FROM delivery_jobs WHERE id=?", (job_id,)).fetchone()
+        assert row["state"] == "failed"
+        assert row["attempts"] == 10
+        assert row["last_error"] == "LeaseExpired"
+
+
+def test_concurrent_workers_claiming_jobs_no_double_claims(test_db):
+    """Multiple concurrent threads claiming jobs never claim the same job."""
+    import concurrent.futures
+
+    with sqlite3.connect(test_db) as conn:
+        for i in range(10):
+            enqueue(conn, order_id=100 + i, kind="admin_email")
+        conn.commit()
+
+    claimed_ids = []
+    lock = threading.Lock()
+
+    def worker_claim():
+        job = claim_due(test_db)
+        if job:
+            with lock:
+                claimed_ids.append(job["id"])
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        futures = [executor.submit(worker_claim) for _ in range(25)]
+        concurrent.futures.wait(futures)
+
+    assert len(claimed_ids) == 10, f"Expected 10 unique jobs claimed, got {len(claimed_ids)}"
+    assert len(set(claimed_ids)) == 10, "Double-claiming detected between concurrent workers!"
