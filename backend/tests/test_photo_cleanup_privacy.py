@@ -26,7 +26,9 @@ import hashlib
 import os
 import sqlite3
 import sys
+import threading
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -374,7 +376,7 @@ def test_repeated_processing_is_idempotent(isolated_env):
     # Mark ALL jobs for this order as delivered & cleaned
     with sqlite3.connect(db) as conn:
         conn.execute(
-            "UPDATE delivery_jobs SET state='delivered', cleanup_state='completed', local_deleted_at=? WHERE order_id=?",
+            "UPDATE delivery_jobs SET state='delivered', cleanup_state='completed', cleanup_phase='deleted', local_deleted_at=? WHERE order_id=?",
             (utc_now(), order_id),
         )
 
@@ -519,10 +521,12 @@ def test_backup_verifier_accepts_cleanly_delivered_and_cleaned_orders(isolated_e
 
     # Mark all file & info jobs as delivered and cleaned
     with sqlite3.connect(db) as conn:
+        deliv_ts = "2026-10-27T10:00:00+00:00"
+        deleted_ts = "2026-10-27T10:05:00+00:00"
         conn.execute(
-            "UPDATE delivery_jobs SET state='delivered', cleanup_state='completed', delivered_at=?, local_deleted_at=? "
-            "WHERE order_id=?",
-            (utc_now(), utc_now(), order_id),
+            "UPDATE delivery_jobs SET state='delivered', cleanup_state='completed', cleanup_phase='deleted', "
+            "delivered_at=?, local_deleted_at=? WHERE order_id=?",
+            (deliv_ts, deleted_ts, order_id),
         )
 
     # Delete all local files
@@ -591,10 +595,12 @@ def test_payments_and_emails_work_without_local_photos(isolated_env):
 
     # Deliver and clean all files from disk
     with sqlite3.connect(db) as conn:
+        deliv_ts = "2026-10-27T10:00:00+00:00"
+        deleted_ts = "2026-10-27T10:05:00+00:00"
         conn.execute(
-            "UPDATE delivery_jobs SET state='delivered', cleanup_state='completed', delivered_at=?, local_deleted_at=? "
-            "WHERE order_id=?",
-            (utc_now(), utc_now(), order_id),
+            "UPDATE delivery_jobs SET state='delivered', cleanup_state='completed', cleanup_phase='deleted', "
+            "delivered_at=?, local_deleted_at=? WHERE order_id=?",
+            (deliv_ts, deleted_ts, order_id),
         )
 
     for f in list(uploads.glob(f"{order_id}_*")):
@@ -746,35 +752,112 @@ def test_stale_worker_cannot_delete_or_overwrite_state_after_lease_loss(isolated
 
 def test_perform_job_cleanup_aborts_deletion_if_lease_stolen_concurrently(isolated_env):
     """
-    Proves that perform_job_cleanup checks lease ownership immediately before unlinking,
-    and aborts unlinking if another worker stole the lease while processing.
+    Deterministic concurrency regression test proving that:
+    1. Worker A obtains a valid lease and reaches the deletion boundary.
+    2. Worker A pauses before the filesystem mutation (via pre_unlink_hook).
+    3. Worker B attempts to acquire / acquires the lease concurrently.
+    4. The write transaction fencing prevents stale deletion: Worker A aborts without unlinking.
+    5. Worker B's lease/state is not overwritten by Worker A.
+    6. The source file remains intact on disk until Worker B legitimately performs cleanup.
     """
     client, db, uploads = isolated_env
     order_data = create_test_order(client, ("race_guard.jpg",))
     order_id = order_data["order_id"]
     photo_path = list(uploads.glob(f"{order_id}_*.jpg"))[0]
+    assert photo_path.is_file()
 
     with sqlite3.connect(db) as conn:
-        job_id = conn.execute("SELECT id FROM delivery_jobs WHERE order_id=? AND kind='file'", (order_id,)).fetchone()[0]
-        conn.execute("UPDATE delivery_jobs SET state='delivered', delivered_at=? WHERE id=?", (utc_now(), job_id))
+        job_id = conn.execute(
+            "SELECT id FROM delivery_jobs WHERE order_id=? AND kind='file'", (order_id,)
+        ).fetchone()[0]
+        conn.execute(
+            "UPDATE delivery_jobs SET state='delivered', delivered_at=? WHERE id=?",
+            (utc_now(), job_id),
+        )
 
-    # Hook into sqlite3 to steal the lease right before unlinking
-    original_unlink = Path.unlink
+    worker_a_paused = threading.Event()
+    worker_b_stole_lease = threading.Event()
+    worker_a_result = {}
+    unlink_called = []
 
-    def steal_lease_before_unlink(self):
-        # Worker B steals lease right as Worker A is about to unlink
-        with sqlite3.connect(db) as conn:
-            conn.execute(
-                "UPDATE delivery_jobs SET cleanup_lease_until='stolen#99#workerB' WHERE id=?",
-                (job_id,),
+    real_unlink = Path.unlink
+
+    def tracking_unlink(self):
+        unlink_called.append(str(self))
+        return real_unlink(self)
+
+    def hook_a(jid, token):
+        worker_a_paused.set()
+        assert worker_b_stole_lease.wait(timeout=5.0), "Worker B timed out stealing lease"
+
+    def run_worker_a():
+        with patch.object(Path, "unlink", tracking_unlink):
+            worker_a_result["success"] = perform_job_cleanup(
+                db, job_id, uploads_dir=uploads, pre_unlink_hook=hook_a
             )
-        # Attempt to unlink
-        return original_unlink(self)
 
-    # Worker A runs perform_job_cleanup
-    with patch.object(Path, "unlink", side_effect=steal_lease_before_unlink):
-        res = perform_job_cleanup(db, job_id, uploads_dir=uploads)
-        assert res is False
+    thread_a = threading.Thread(target=run_worker_a)
+    thread_a.start()
 
-    # The file must NOT have been unlinked!
-    assert photo_path.is_file(), "File must be preserved because lease was stolen before unlink!"
+    # 1 & 2. Wait for Worker A to reach deletion boundary and pause
+    assert worker_a_paused.wait(timeout=5.0), "Worker A should pause at deletion boundary"
+
+    # Verify Worker A currently holds the lease and durably recorded 'deleting' intent
+    with sqlite3.connect(db) as conn:
+        row = conn.execute(
+            "SELECT cleanup_state, cleanup_phase, cleanup_lease_until FROM delivery_jobs WHERE id=?",
+            (job_id,),
+        ).fetchone()
+        assert row[0] == "processing"
+        assert row[1] == "deleting"
+        token_a = row[2]
+        assert token_a is not None
+
+    # 3. Worker B acquires the lease concurrently (new token with valid future expiration)
+    token_b = f"{(datetime.now(timezone.utc) + timedelta(minutes=2)).isoformat()}#99#workerB_nonce"
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "UPDATE delivery_jobs SET cleanup_state='processing', cleanup_lease_until=? WHERE id=?",
+            (token_b, job_id),
+        )
+
+    # 4. Resume Worker A
+    worker_b_stole_lease.set()
+    thread_a.join(timeout=5.0)
+    assert not thread_a.is_alive(), "Worker A thread should terminate"
+
+    # Worker A must abort without mutation and return False
+    assert worker_a_result.get("success") is False, "Worker A must return False on stolen lease"
+    assert len(unlink_called) == 0, "Worker A must NOT call unlink() after lease theft!"
+
+    # 5. Worker B's lease token was NOT overwritten by Worker A
+    with sqlite3.connect(db) as conn:
+        row = conn.execute(
+            "SELECT cleanup_state, cleanup_lease_until FROM delivery_jobs WHERE id=?",
+            (job_id,),
+        ).fetchone()
+        assert row[0] == "processing"
+        assert row[1] == token_b, "Worker B's lease must remain intact without overwrite by Worker A"
+
+    # 6. Source file remains intact until Worker B legitimately performs cleanup
+    assert photo_path.is_file(), "File must remain intact until legitimate owner deletes it"
+
+    # Clear lease so Worker B can claim and process
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "UPDATE delivery_jobs SET cleanup_state='pending', cleanup_lease_until=NULL WHERE id=?",
+            (job_id,),
+        )
+
+    res_b = perform_job_cleanup(db, job_id, uploads_dir=uploads)
+    assert res_b is True, "Worker B must legitimately succeed"
+    assert not photo_path.exists(), "File should now be unlinked by legitimate Worker B"
+
+    with sqlite3.connect(db) as conn:
+        row = conn.execute(
+            "SELECT cleanup_state, cleanup_phase, local_deleted_at FROM delivery_jobs WHERE id=?",
+            (job_id,),
+        ).fetchone()
+        assert row[0] == "completed"
+        assert row[1] == "deleted"
+        assert row[2] is not None

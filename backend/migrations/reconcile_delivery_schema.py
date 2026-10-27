@@ -13,6 +13,7 @@ from delivery import DELIVERY_SCHEMA  # noqa: E402
 
 REQUIRED_CLEANUP_COLUMNS = {
     "cleanup_state",
+    "cleanup_phase",
     "local_deleted_at",
     "cleanup_error",
     "cleanup_attempts",
@@ -43,11 +44,26 @@ def reconcile(db_path: Path, apply: bool = False, uploads_dir: Path | None = Non
             "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='delivery_jobs'"
         )} if table else set()
 
+        unrepaired_count = 0
+        if table:
+            query_parts = []
+            if "cleanup_phase" in delivery_cols:
+                query_parts.append("(cleanup_phase = 'none' AND kind IN ('file', 'info') AND state = 'delivered')")
+            if "cleanup_state" in delivery_cols and "local_deleted_at" in delivery_cols:
+                query_parts.append(
+                    "(cleanup_state = 'completed' AND kind IN ('file', 'info') AND state = 'delivered' "
+                    "AND (local_deleted_at IS NULL OR local_deleted_at = delivered_at))"
+                )
+            if query_parts:
+                unrepaired_query = f"SELECT COUNT(*) FROM delivery_jobs WHERE {' OR '.join(query_parts)}"
+                unrepaired_count = conn.execute(unrepaired_query).fetchone()[0]
+
         needed = (
             "order_token_hash" not in columns
             or table is None
             or not REQUIRED_CLEANUP_COLUMNS <= delivery_cols
             or not {"idx_delivery_due", "idx_cleanup_due", "idx_paid_email_once", "idx_admin_email_once"} <= indexes
+            or unrepaired_count > 0
         )
 
         if apply and needed:
@@ -62,6 +78,8 @@ def reconcile(db_path: Path, apply: bool = False, uploads_dir: Path | None = Non
             else:
                 if "cleanup_state" not in delivery_cols:
                     conn.execute("ALTER TABLE delivery_jobs ADD COLUMN cleanup_state TEXT NOT NULL DEFAULT 'pending'")
+                if "cleanup_phase" not in delivery_cols:
+                    conn.execute("ALTER TABLE delivery_jobs ADD COLUMN cleanup_phase TEXT NOT NULL DEFAULT 'none'")
                 if "local_deleted_at" not in delivery_cols:
                     conn.execute("ALTER TABLE delivery_jobs ADD COLUMN local_deleted_at TEXT")
                 if "cleanup_error" not in delivery_cols:
@@ -72,15 +90,15 @@ def reconcile(db_path: Path, apply: bool = False, uploads_dir: Path | None = Non
                     conn.execute("ALTER TABLE delivery_jobs ADD COLUMN cleanup_lease_until TEXT")
 
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_cleanup_due ON delivery_jobs(state, cleanup_state, cleanup_lease_until)")
-                conn.execute("UPDATE delivery_jobs SET cleanup_state='not_applicable' WHERE kind NOT IN ('file', 'info')")
+                conn.execute("UPDATE delivery_jobs SET cleanup_state='not_applicable', cleanup_phase='none' WHERE kind NOT IN ('file', 'info')")
 
-                # Historical backfill: inspect physical filesystem for delivered file/info jobs
+                # Historical backfill and repair: inspect physical filesystem for delivered file/info jobs
                 # Never assume delivered implies cleaned or invent local_deleted_at
                 delivered_rows = conn.execute(
-                    "SELECT id, local_path FROM delivery_jobs "
-                    "WHERE state='delivered' AND kind IN ('file', 'info')"
+                    "SELECT id, local_path, cleanup_state, cleanup_phase, local_deleted_at, delivered_at "
+                    "FROM delivery_jobs WHERE state='delivered' AND kind IN ('file', 'info')"
                 ).fetchall()
-                for job_id, local_path in delivered_rows:
+                for job_id, local_path, cur_cstate, cur_cphase, cur_deleted_at, deliv_at in delivered_rows:
                     file_exists = False
                     if local_path:
                         p = Path(local_path)
@@ -90,18 +108,28 @@ def reconcile(db_path: Path, apply: bool = False, uploads_dir: Path | None = Non
                             file_exists = True
 
                     if file_exists:
-                        # File physically exists: keep cleanup_state='pending', local_deleted_at=NULL
-                        # Cleanup worker will safely verify sha256/size and perform verified cleanup
+                        # File physically exists: schedule for verified cleanup
                         conn.execute(
-                            "UPDATE delivery_jobs SET cleanup_state='pending', local_deleted_at=NULL, cleanup_error=NULL WHERE id=?",
+                            "UPDATE delivery_jobs SET cleanup_state='pending', cleanup_phase='pending', "
+                            "local_deleted_at=NULL, cleanup_error=NULL WHERE id=?",
                             (job_id,),
                         )
                     else:
-                        # File is physically absent: record cleanup_state='completed' without inventing deletion timestamp
-                        conn.execute(
-                            "UPDATE delivery_jobs SET cleanup_state='completed', local_deleted_at=NULL, cleanup_error=NULL WHERE id=?",
-                            (job_id,),
+                        # File is physically absent from disk:
+                        has_genuine_evidence = (
+                            cur_cstate == "completed"
+                            and cur_cphase == "deleted"
+                            and cur_deleted_at is not None
+                            and cur_deleted_at != deliv_at
                         )
+                        if not has_genuine_evidence:
+                            # Absent file without genuine application deletion evidence!
+                            # MUST be recorded as an explicit anomaly requiring investigation.
+                            conn.execute(
+                                "UPDATE delivery_jobs SET cleanup_state='failed', cleanup_phase='failed', "
+                                "cleanup_error='HistoricalMissingSource', local_deleted_at=NULL WHERE id=?",
+                                (job_id,),
+                            )
 
                 for statement in DELIVERY_SCHEMA.split(";"):
                     trimmed = statement.strip()

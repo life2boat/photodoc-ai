@@ -117,12 +117,13 @@ def test_migration_backfill_delivered_job_with_existing_file_schedules_cleanup(t
     # Check backfilled state
     with sqlite3.connect(db_path) as conn:
         row = conn.execute(
-            "SELECT state, cleanup_state, local_deleted_at, delivered_at FROM delivery_jobs WHERE id='job-legacy-1'"
+            "SELECT state, cleanup_state, cleanup_phase, local_deleted_at, delivered_at FROM delivery_jobs WHERE id='job-legacy-1'"
         ).fetchone()
         assert row[0] == "delivered"
         assert row[1] == "pending", "Must be pending so cleanup worker can safely delete the file"
-        assert row[2] is None, "Must NOT invent a deletion timestamp for existing file!"
-        assert row[3] == delivered_time, "Delivered_at must be preserved!"
+        assert row[2] == "pending", "Phase must be pending"
+        assert row[3] is None, "Must NOT invent a deletion timestamp for existing file!"
+        assert row[4] == delivered_time, "Delivered_at must be preserved!"
 
     assert photo_file.is_file(), "Migration itself must NEVER delete files!"
 
@@ -133,16 +134,18 @@ def test_migration_backfill_delivered_job_with_existing_file_schedules_cleanup(t
 
     with sqlite3.connect(db_path) as conn:
         row = conn.execute(
-            "SELECT cleanup_state, local_deleted_at FROM delivery_jobs WHERE id='job-legacy-1'"
+            "SELECT cleanup_state, cleanup_phase, local_deleted_at FROM delivery_jobs WHERE id='job-legacy-1'"
         ).fetchone()
         assert row[0] == "completed"
-        assert row[1] is not None, "Timestamp set upon actual deletion"
+        assert row[1] == "deleted"
+        assert row[2] is not None, "Timestamp set upon actual deletion"
 
 
-def test_migration_backfill_delivered_job_with_absent_file_reconciles_cleanly(tmp_path):
+def test_migration_backfill_delivered_job_with_absent_file_records_anomaly(tmp_path):
     """
     2. Historical delivered job whose local file is ABSENT from disk:
-    Migration reconciles cleanup_state='completed' WITHOUT inventing local_deleted_at=delivered_at.
+    Migration records it as an explicit anomaly (failed / HistoricalMissingSource)
+    requiring investigation, without inventing deletion timestamps or classifying as cleaned.
     """
     db_path = tmp_path / "orders.db"
     uploads_dir = tmp_path / "uploads"
@@ -174,12 +177,23 @@ def test_migration_backfill_delivered_job_with_absent_file_reconciles_cleanly(tm
 
     with sqlite3.connect(db_path) as conn:
         row = conn.execute(
-            "SELECT state, cleanup_state, local_deleted_at, delivered_at FROM delivery_jobs WHERE id='job-legacy-2'"
+            "SELECT state, cleanup_state, cleanup_phase, cleanup_error, local_deleted_at, delivered_at "
+            "FROM delivery_jobs WHERE id='job-legacy-2'"
         ).fetchone()
         assert row[0] == "delivered"
-        assert row[1] == "completed", "Reconciled to completed because file is already absent"
-        assert row[2] is None, "Must NOT invent delivered_at as local_deleted_at timestamp!"
-        assert row[3] == delivered_time
+        assert row[1] == "failed", "Recorded as explicit anomaly requiring investigation"
+        assert row[2] == "failed"
+        assert row[3] == "HistoricalMissingSource"
+        assert row[4] is None, "Must NOT invent delivered_at as local_deleted_at timestamp!"
+        assert row[5] == delivered_time
+
+    # Automatic cleanup worker MUST NOT retry HistoricalMissingSource or turn it into completed
+    cleaned = process_due_cleanups(db_path, uploads_dir=uploads_dir)
+    assert cleaned == 0
+    with sqlite3.connect(db_path) as conn:
+        row = conn.execute("SELECT cleanup_state, cleanup_error FROM delivery_jobs WHERE id='job-legacy-2'").fetchone()
+        assert row[0] == "failed"
+        assert row[1] == "HistoricalMissingSource"
 
 
 def test_migration_transaction_rollback_and_safe_retry(tmp_path):
@@ -282,3 +296,164 @@ def test_migration_preserves_orders_payments_and_delivery_history(tmp_path):
         assert job["state"] == "delivered"
         assert job["cleanup_state"] == "not_applicable", "Email jobs must be marked not_applicable"
         assert job["delivered_at"] == "2026-05-01T12:06:00"
+
+
+def test_migration_repairs_existing_database_with_flawed_r31_states(tmp_path):
+    """
+    Validates that if a database was already migrated by R3.1 where historical delivered jobs
+    with absent files were incorrectly marked cleanup_state='completed', local_deleted_at=NULL:
+    1. Reconcile detects the unrepaired rows (needed=True).
+    2. Reconcile repairs them to cleanup_state='failed', cleanup_phase='failed', cleanup_error='HistoricalMissingSource'.
+    3. Subsequent reconcile is idempotent (needed=False).
+    """
+    db_path = tmp_path / "orders.db"
+    uploads_dir = tmp_path / "uploads"
+    uploads_dir.mkdir()
+    set_uploads_dir(uploads_dir)
+
+    setup_legacy_p1_db(db_path)
+
+    delivered_time = "2026-08-01T10:00:00+00:00"
+    absent_path = uploads_dir / "flawed_missing.jpg"
+
+    # Simulate R3.1 state: columns exist, but flawed completed state with local_deleted_at=NULL
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("ALTER TABLE delivery_jobs ADD COLUMN cleanup_state TEXT NOT NULL DEFAULT 'pending'")
+        conn.execute("ALTER TABLE delivery_jobs ADD COLUMN local_deleted_at TEXT")
+        conn.execute("ALTER TABLE delivery_jobs ADD COLUMN cleanup_error TEXT")
+        conn.execute("ALTER TABLE delivery_jobs ADD COLUMN cleanup_attempts INTEGER NOT NULL DEFAULT 0")
+        conn.execute("ALTER TABLE delivery_jobs ADD COLUMN cleanup_lease_until TEXT")
+        conn.execute("CREATE INDEX idx_cleanup_due ON delivery_jobs(state, cleanup_state, cleanup_lease_until)")
+
+        conn.execute(
+            "INSERT INTO orders (id, name, phone, payment_status, payment_amount, order_token_hash) "
+            "VALUES (99, 'Legacy Client', '+79991112233', 'paid', 300.0, 'hash99')"
+        )
+        conn.execute(
+            "INSERT INTO delivery_jobs (id, order_id, kind, local_path, original_name, remote_path, "
+            "content_sha256, content_size, state, attempts, next_attempt_at, created_at, delivered_at, "
+            "cleanup_state, local_deleted_at) "
+            "VALUES ('job-flawed', 99, 'file', ?, 'flawed.jpg', 'Remote/99_flawed.jpg', "
+            "'fakehash', 100, 'delivered', 1, ?, ?, ?, 'completed', NULL)",
+            (str(absent_path), delivered_time, delivered_time, delivered_time),
+        )
+
+    # 1. Detection
+    dry_run = reconcile(db_path, apply=False, uploads_dir=uploads_dir)
+    assert dry_run["migration_required"] is True, "Must detect unrepaired rows in pre-R3.2 database"
+
+    # 2. Repair
+    res = reconcile(db_path, apply=True, uploads_dir=uploads_dir)
+    assert res["applied"] is True
+
+    with sqlite3.connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT cleanup_state, cleanup_phase, cleanup_error, local_deleted_at FROM delivery_jobs WHERE id='job-flawed'"
+        ).fetchone()
+        assert row[0] == "failed", "Flawed completed state must be repaired to failed"
+        assert row[1] == "failed"
+        assert row[2] == "HistoricalMissingSource"
+        assert row[3] is None
+
+    # 3. Subsequent check is idempotent
+    second_run = reconcile(db_path, apply=False, uploads_dir=uploads_dir)
+    assert second_run["migration_required"] is False, "Repaired database is clean and needs no further migration"
+
+
+def test_crash_recovery_with_deleting_phase_completes_cleanly(tmp_path):
+    """
+    Tests scenario where application began deletion (cleanup_phase='deleting'),
+    the file was deleted, but application crashed before recording completion.
+    Worker should recover durably and finalize cleanup_state='completed', cleanup_phase='deleted'.
+    """
+    db_path = tmp_path / "orders.db"
+    uploads_dir = tmp_path / "uploads"
+    uploads_dir.mkdir()
+    set_uploads_dir(uploads_dir)
+
+    setup_legacy_p1_db(db_path)
+    reconcile(db_path, apply=True, uploads_dir=uploads_dir)
+
+    delivered_time = "2026-10-01T12:00:00+00:00"
+    photo_file = uploads_dir / "50_crash.jpg"
+    # File is absent (unlinked before crash)
+
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "INSERT INTO orders (id, name, phone, payment_status, payment_amount, order_token_hash) "
+            "VALUES (50, 'Crash Recovery User', '+79991112233', 'paid', 300.0, 'hash50')"
+        )
+        conn.execute(
+            "INSERT INTO delivery_jobs (id, order_id, kind, local_path, original_name, remote_path, "
+            "content_sha256, content_size, state, attempts, next_attempt_at, created_at, delivered_at, "
+            "cleanup_state, cleanup_phase, cleanup_lease_until) "
+            "VALUES ('job-crash-rec', 50, 'file', ?, 'crash.jpg', 'Remote/50_crash.jpg', "
+            "'fakehash', 100, 'delivered', 1, ?, ?, ?, 'failed', 'deleting', NULL)",
+            (str(photo_file), delivered_time, delivered_time, delivered_time),
+        )
+
+    res = perform_job_cleanup(db_path, "job-crash-rec", uploads_dir=uploads_dir)
+    assert res is True, "Crash recovery must complete when durable intent 'deleting' is present"
+
+    with sqlite3.connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT cleanup_state, cleanup_phase, local_deleted_at, cleanup_error FROM delivery_jobs WHERE id='job-crash-rec'"
+        ).fetchone()
+        assert row[0] == "completed"
+        assert row[1] == "deleted"
+        assert row[2] is not None
+        assert row[3] is None
+
+
+def test_unexplained_missing_file_with_pending_phase_fails_and_never_auto_retries(tmp_path):
+    """
+    Tests scenario where file is missing BEFORE application began deletion (cleanup_phase='pending').
+    Worker must record MissingSourceBeforeCleanup and never convert to completed.
+    """
+    db_path = tmp_path / "orders.db"
+    uploads_dir = tmp_path / "uploads"
+    uploads_dir.mkdir()
+    set_uploads_dir(uploads_dir)
+
+    setup_legacy_p1_db(db_path)
+    reconcile(db_path, apply=True, uploads_dir=uploads_dir)
+
+    delivered_time = "2026-10-01T12:00:00+00:00"
+    photo_file = uploads_dir / "60_lost.jpg"
+    assert not photo_file.exists()
+
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "INSERT INTO orders (id, name, phone, payment_status, payment_amount, order_token_hash) "
+            "VALUES (60, 'Lost User', '+79991112233', 'paid', 300.0, 'hash60')"
+        )
+        conn.execute(
+            "INSERT INTO delivery_jobs (id, order_id, kind, local_path, original_name, remote_path, "
+            "content_sha256, content_size, state, attempts, next_attempt_at, created_at, delivered_at, "
+            "cleanup_state, cleanup_phase) "
+            "VALUES ('job-unexplained-loss', 60, 'file', ?, 'lost.jpg', 'Remote/60_lost.jpg', "
+            "'fakehash', 100, 'delivered', 1, ?, ?, ?, 'pending', 'pending')",
+            (str(photo_file), delivered_time, delivered_time, delivered_time),
+        )
+
+    res = perform_job_cleanup(db_path, "job-unexplained-loss", uploads_dir=uploads_dir)
+    assert res is False, "Must fail because source file was missing before cleanup"
+
+    with sqlite3.connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT cleanup_state, cleanup_phase, cleanup_error FROM delivery_jobs WHERE id='job-unexplained-loss'"
+        ).fetchone()
+        assert row[0] == "failed"
+        assert row[1] == "failed"
+        assert row[2] == "MissingSourceBeforeCleanup"
+
+    # Sweep must not retry or complete it
+    cleaned = process_due_cleanups(db_path, uploads_dir=uploads_dir)
+    assert cleaned == 0
+
+    with sqlite3.connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT cleanup_state, cleanup_error FROM delivery_jobs WHERE id='job-unexplained-loss'"
+        ).fetchone()
+        assert row[0] == "failed"
+        assert row[1] == "MissingSourceBeforeCleanup"

@@ -201,6 +201,7 @@ ensure_database_state()
 
 REQUIRED_CLEANUP_COLUMNS = {
     "cleanup_state",
+    "cleanup_phase",
     "local_deleted_at",
     "cleanup_error",
     "cleanup_attempts",
