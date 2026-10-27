@@ -292,6 +292,11 @@ def perform_job_cleanup(
         _mark_cleanup_failed(db_path, job_id, "PathTraversalDetected")
         return False
 
+    # Symlink protection on input path
+    if path_obj.is_symlink():
+        _mark_cleanup_failed(db_path, job_id, "SymlinkDetected")
+        return False
+
     try:
         target_resolved = path_obj.resolve()
     except Exception as exc:
@@ -303,8 +308,8 @@ def perform_job_cleanup(
         _mark_cleanup_failed(db_path, job_id, "PathOutsideUploads")
         return False
 
-    # Symlink protection
-    if path_obj.is_symlink() or target_resolved.is_symlink():
+    # Symlink protection on resolved target
+    if target_resolved.is_symlink():
         _mark_cleanup_failed(db_path, job_id, "SymlinkDetected")
         return False
 
@@ -470,10 +475,10 @@ def cleanup_orphaned_temporary_files(
             continue
 
         try:
+            if entry.is_symlink():
+                continue
             resolved = entry.resolve()
             if uploads_resolved not in resolved.parents and resolved.parent != uploads_resolved:
-                continue
-            if entry.is_symlink():
                 continue
             if not entry.is_file():
                 continue

@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [ main, master, fix/p1-order-delivery-hardening ]
+    branches: [ main, master, fix/p1-order-delivery-hardening, feat/p1-auto-photo-cleanup ]
   pull_request:
-    branches: [ main, master, fix/p0-production-readiness ]
+    branches: [ main, master, fix/p0-production-readiness, infra/r2-public-https-preflight ]
   workflow_dispatch:
 
 jobs:
