@@ -861,3 +861,236 @@ def test_perform_job_cleanup_aborts_deletion_if_lease_stolen_concurrently(isolat
         assert row[0] == "completed"
         assert row[1] == "deleted"
         assert row[2] is not None
+
+
+def test_real_second_worker_lease_acquisition_and_fencing(isolated_env):
+    """
+    R3.3 Integration Concurrency Test:
+    Demonstrates that Worker B acquires an expired job via real production lease-claim logic,
+    and Worker A aborts without deleting the source or overwriting Worker B's state.
+
+    1. Worker A acquires lease and commits durable intent 'deleting' at t=0.
+    2. Worker A pauses before filesystem mutation.
+    3. Simulate lease expiry deterministically using injectable clock seam (t=15s > lease_duration=10s).
+    4. Worker B invokes perform_job_cleanup() through normal lease-claim logic and acquires the job.
+    5. Worker A resumes and aborts without unlinking or overwriting Worker B's lease.
+    6. Worker B resumes and completes cleanup using its own valid lease.
+    7. File is legitimately deleted and final database state is 'completed'.
+    """
+    client, db, uploads = isolated_env
+    order_data = create_test_order(client, ("real_race.jpg",))
+    order_id = order_data["order_id"]
+    photo_path = list(uploads.glob(f"{order_id}_*.jpg"))[0]
+    assert photo_path.is_file()
+
+    with sqlite3.connect(db) as conn:
+        job_id = conn.execute(
+            "SELECT id FROM delivery_jobs WHERE order_id=? AND kind='file'", (order_id,)
+        ).fetchone()[0]
+        conn.execute(
+            "UPDATE delivery_jobs SET state='delivered', delivered_at='2026-10-27T12:00:00+00:00' WHERE id=?",
+            (job_id,),
+        )
+
+    t0_str = "2026-10-27T12:00:00+00:00"
+    t1_str = "2026-10-27T12:00:15+00:00"  # 15s later -> 10s lease is expired
+
+    worker_a_paused = threading.Event()
+    worker_b_claimed = threading.Event()
+    worker_b_can_delete = threading.Event()
+
+    worker_a_result = {}
+    worker_b_result = {}
+    unlink_calls = []
+
+    real_unlink = Path.unlink
+
+    def tracking_unlink(self):
+        unlink_calls.append(str(self))
+        return real_unlink(self)
+
+    def hook_a(jid, token):
+        worker_a_paused.set()
+        assert worker_b_claimed.wait(timeout=5.0), "Worker B timed out claiming lease"
+
+    def hook_b(jid, token):
+        worker_b_claimed.set()
+        assert worker_b_can_delete.wait(timeout=5.0), "Worker B timed out waiting to delete"
+
+    def run_worker_a():
+        worker_a_result["success"] = perform_job_cleanup(
+            db,
+            job_id,
+            uploads_dir=uploads,
+            pre_unlink_hook=hook_a,
+            clock=lambda: t0_str,
+            lease_duration_seconds=10,
+        )
+
+    def run_worker_b():
+        worker_b_result["success"] = perform_job_cleanup(
+            db,
+            job_id,
+            uploads_dir=uploads,
+            pre_unlink_hook=hook_b,
+            clock=lambda: t1_str,
+            lease_duration_seconds=120,
+        )
+
+    with patch.object(Path, "unlink", tracking_unlink):
+        thread_a = threading.Thread(target=run_worker_a)
+        thread_b = threading.Thread(target=run_worker_b)
+
+        # 1 & 2: Start Worker A and wait for it to pause at deletion boundary
+        thread_a.start()
+        assert worker_a_paused.wait(timeout=5.0), "Worker A should pause at hook"
+
+        with sqlite3.connect(db) as conn:
+            row = conn.execute(
+                "SELECT cleanup_state, cleanup_phase, cleanup_lease_until, cleanup_attempts FROM delivery_jobs WHERE id=?",
+                (job_id,),
+            ).fetchone()
+            assert row[0] == "processing"
+            assert row[1] == "deleting"
+            assert row[3] == 1
+            token_a = row[2]
+
+        # 3 & 4: Start Worker B. Worker B sees t1_str > lease_ts of Worker A, claims lease via real code!
+        thread_b.start()
+        assert worker_b_claimed.wait(timeout=5.0), "Worker B should legitimately claim expired lease and pause"
+
+        with sqlite3.connect(db) as conn:
+            row = conn.execute(
+                "SELECT cleanup_state, cleanup_phase, cleanup_lease_until, cleanup_attempts FROM delivery_jobs WHERE id=?",
+                (job_id,),
+            ).fetchone()
+            assert row[0] == "processing"
+            assert row[1] == "deleting"
+            assert row[3] == 2, "Worker B incremented attempt counter via legitimate lease claim"
+            token_b = row[2]
+            assert token_b != token_a, "Worker B must have acquired its own unique lease token"
+
+        # 5: Worker A resumes and aborts
+        thread_a.join(timeout=5.0)
+        assert not thread_a.is_alive(), "Worker A should finish"
+        assert worker_a_result.get("success") is False, "Worker A must return False on lost lease"
+        assert len(unlink_calls) == 0, "Worker A must NOT have unlinked the file!"
+
+        # Worker B's lease was NOT overwritten by Worker A
+        with sqlite3.connect(db) as conn:
+            row = conn.execute(
+                "SELECT cleanup_state, cleanup_lease_until FROM delivery_jobs WHERE id=?",
+                (job_id,),
+            ).fetchone()
+            assert row[0] == "processing"
+            assert row[1] == token_b, "Worker B's lease token was untouched"
+
+        assert photo_path.is_file(), "File must still be on disk before Worker B unlinks it"
+
+        # 6: Signal Worker B to proceed with legitimate cleanup
+        worker_b_can_delete.set()
+        thread_b.join(timeout=5.0)
+        assert not thread_b.is_alive(), "Worker B should finish"
+        assert worker_b_result.get("success") is True, "Worker B must return True on successful cleanup"
+
+        # 7: File was unlinked exactly once and database state is completed
+        assert not photo_path.exists(), "File should now be unlinked by Worker B"
+        assert len(unlink_calls) == 1, "unlink() must have been called exactly once (by Worker B)"
+
+    with sqlite3.connect(db) as conn:
+        row = conn.execute(
+            "SELECT cleanup_state, cleanup_phase, local_deleted_at, cleanup_lease_until FROM delivery_jobs WHERE id=?",
+            (job_id,),
+        ).fetchone()
+        assert row[0] == "completed"
+        assert row[1] == "deleted"
+        assert row[2] == t1_str
+        assert row[3] is None
+
+
+def test_perform_job_cleanup_missing_local_path_fails_closed(isolated_env):
+    """
+    R3.3 Defect 1: A missing local_path on a delivered file job must NOT become completed.
+    Must record an explicit anomaly MissingLocalPath without fabricated local_deleted_at.
+    """
+    client, db, uploads = isolated_env
+    order_data = create_test_order(client, ("missing_path.jpg",))
+    order_id = order_data["order_id"]
+
+    with sqlite3.connect(db) as conn:
+        job_id = conn.execute(
+            "SELECT id FROM delivery_jobs WHERE order_id=? AND kind='file'", (order_id,)
+        ).fetchone()[0]
+        # Simulate corrupted or missing local_path
+        conn.execute(
+            "UPDATE delivery_jobs SET state='delivered', local_path=NULL, delivered_at=? WHERE id=?",
+            (utc_now(), job_id),
+        )
+
+    res = perform_job_cleanup(db, job_id, uploads_dir=uploads)
+    assert res is False, "Must fail when local_path is missing"
+
+    with sqlite3.connect(db) as conn:
+        row = conn.execute(
+            "SELECT cleanup_state, cleanup_phase, cleanup_error, local_deleted_at FROM delivery_jobs WHERE id=?",
+            (job_id,),
+        ).fetchone()
+        assert row[0] == "failed", "Must be marked failed"
+        assert row[1] == "failed"
+        assert row[2] == "MissingLocalPath", "Explicit anomaly recorded"
+        assert row[3] is None, "Must NOT fabricate local_deleted_at"
+
+    # Must NOT be retried or converted to completed by process_due_cleanups
+    cleaned = process_due_cleanups(db, uploads_dir=uploads)
+    assert cleaned == 0
+
+    with sqlite3.connect(db) as conn:
+        row = conn.execute("SELECT cleanup_state FROM delivery_jobs WHERE id=?", (job_id,)).fetchone()
+        assert row[0] == "failed"
+
+
+def test_perform_job_cleanup_crash_recovery_stolen_lease_returns_false(isolated_env):
+    """
+    R3.3 Defect 2: When recovery finalizes an already absent source (cleanup_phase=='deleting'),
+    return success ONLY if conditional database finalization succeeds. If lease was stolen, return False.
+    """
+    client, db, uploads = isolated_env
+    order_data = create_test_order(client, ("stolen_rec.jpg",))
+    order_id = order_data["order_id"]
+    photo_path = list(uploads.glob(f"{order_id}_*.jpg"))[0]
+    photo_path.unlink()  # File is absent
+
+    with sqlite3.connect(db) as conn:
+        job_id = conn.execute(
+            "SELECT id FROM delivery_jobs WHERE order_id=? AND kind='file'", (order_id,)
+        ).fetchone()[0]
+        conn.execute(
+            "UPDATE delivery_jobs SET state='delivered', cleanup_state='failed', cleanup_phase='deleting', "
+            "delivered_at=? WHERE id=?",
+            (utc_now(), job_id),
+        )
+
+    # Intercept _mark_cleanup_completed to simulate lease theft right before finalization
+    from delivery import _mark_cleanup_completed as real_mark_completed
+
+    def stolen_lease_mark_completed(db_path, jid, token=None):
+        # Worker B stole lease
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                "UPDATE delivery_jobs SET cleanup_lease_until='stolen#99#workerB' WHERE id=?",
+                (jid,),
+            )
+        # Attempt real conditional update with Worker A's token
+        return real_mark_completed(db_path, jid, token)
+
+    with patch("delivery._mark_cleanup_completed", side_effect=stolen_lease_mark_completed):
+        res = perform_job_cleanup(db, job_id, uploads_dir=uploads)
+        assert res is False, "Must return False when conditional finalization update returns False!"
+
+    with sqlite3.connect(db) as conn:
+        row = conn.execute(
+            "SELECT cleanup_state, cleanup_lease_until FROM delivery_jobs WHERE id=?",
+            (job_id,),
+        ).fetchone()
+        assert row[0] == "processing"
+        assert row[1] == "stolen#99#workerB", "Worker B's lease was not overwritten"

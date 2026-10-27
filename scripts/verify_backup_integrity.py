@@ -316,6 +316,15 @@ def verify_backup(
 
                 if not local_path_raw:
                     report["errors"].append(f"Order #{order_id} job #{job_id} ({kind}) has empty local_path")
+                    report["p1_unexplained_missing_sources"].append(
+                        {
+                            "order_id": order_id,
+                            "job_id": job_id,
+                            "kind": kind,
+                            "filename": "",
+                            "error": "MissingLocalPath",
+                        }
+                    )
                     continue
 
                 # Path traversal check: reject any traversal in path components or filename
@@ -336,7 +345,7 @@ def verify_backup(
                 file_exists = candidate_file.is_file()
 
                 # Flag explicit missing source anomalies:
-                if cleanup_error in ("HistoricalMissingSource", "MissingSourceBeforeCleanup"):
+                if cleanup_error in ("HistoricalMissingSource", "MissingSourceBeforeCleanup", "MissingLocalPath"):
                     report["p1_unexplained_missing_sources"].append(
                         {
                             "order_id": order_id,

@@ -257,6 +257,8 @@ def perform_job_cleanup(
     job_id: str,
     uploads_dir: Path | None = None,
     pre_unlink_hook: Any = None,
+    clock: Any = None,
+    lease_duration_seconds: int = 120,
 ) -> bool:
     """
     Safely and idempotently removes a delivered photo or info.txt file from local disk.
@@ -271,15 +273,17 @@ def perform_job_cleanup(
     7. Durable Intent: commits cleanup_phase='deleting' before unlinking to enable crash recovery.
     8. Pre-unlink fencing: verifies active lease ownership in write transaction before unlinking.
     9. Idempotency & Crash recovery: if file is already deleted and cleanup_phase=='deleting',
-       records completed cleanly. If deleted without intent, flags as MissingSourceBeforeCleanup anomaly.
+       records completed cleanly only if conditional finalization succeeds.
+       If deleted without intent, flags as MissingSourceBeforeCleanup anomaly.
     10. Failure resilience: cleanup error never marks delivery state back to pending; applies bounded backoff.
     """
     if uploads_dir is None:
         uploads_dir = get_uploads_dir()
     uploads_resolved = uploads_dir.resolve()
 
-    now = utc_now()
-    lease_ts = (datetime.now(timezone.utc) + timedelta(minutes=2)).isoformat()
+    now = clock() if clock is not None else utc_now()
+    now_dt = datetime.fromisoformat(now) if clock is not None else datetime.now(timezone.utc)
+    lease_ts = (now_dt + timedelta(seconds=lease_duration_seconds)).isoformat()
     nonce = uuid.uuid4().hex[:8]
 
     conn = sqlite3.connect(db_path, timeout=10)
@@ -317,7 +321,7 @@ def perform_job_cleanup(
             return True
 
         # Non-retryable anomalies: never auto-retry unexplained missing sources
-        if job["cleanup_error"] in ("HistoricalMissingSource", "MissingSourceBeforeCleanup"):
+        if job["cleanup_error"] in ("HistoricalMissingSource", "MissingSourceBeforeCleanup", "MissingLocalPath"):
             conn.commit()
             return False
 
@@ -359,8 +363,8 @@ def perform_job_cleanup(
 
     raw_local_path = job["local_path"]
     if not raw_local_path:
-        _mark_cleanup_completed(db_path, job_id, token)
-        return True
+        _mark_cleanup_failed(db_path, job_id, token, "MissingLocalPath")
+        return False
 
     path_obj = Path(raw_local_path)
 
@@ -396,12 +400,18 @@ def perform_job_cleanup(
         return False
 
     # Check if file is already absent:
-    # Distinguish crash recovery (intent was committed to 'deleting') from missing source before deletion!
+    # Ambiguity note:
+    # When cleanup_phase == 'deleting' and path_obj does not exist, the application
+    # has durable proof that deletion intent was committed by a valid lease-holding worker.
+    # We conclude crash recovery took place around the unlink syscall.
+    # However, if an external process or storage fault removed the file between intent
+    # commitment and recovery, this cannot be distinguished at the SQLite layer from
+    # the application's own unlinking. The contract guarantees durable worker intent,
+    # not cryptographic proof of OS unlink provenance.
     if not path_obj.exists():
         if job["cleanup_phase"] == "deleting":
             # Durable crash recovery: app started deletion and crashed around unlink/completion
-            _mark_cleanup_completed(db_path, job_id, token)
-            return True
+            return _mark_cleanup_completed(db_path, job_id, token)
         else:
             # File missing before application deletion intent was ever established
             _mark_cleanup_failed(db_path, job_id, token, "MissingSourceBeforeCleanup")
@@ -489,10 +499,7 @@ def perform_job_cleanup(
 
     # Pre-unlink hook for deterministic testing
     if pre_unlink_hook is not None:
-        try:
-            pre_unlink_hook(job_id, token)
-        except Exception:
-            pass
+        pre_unlink_hook(job_id, token)
 
     # SYNCHRONIZED DELETION & FENCING CRITICAL SECTION:
     # A short SQLite write transaction that serializes lease verification,
@@ -515,7 +522,8 @@ def perform_job_cleanup(
             return False
 
         lease_ts_check = token.split("#")[0]
-        if lease_ts_check <= utc_now():
+        now_check = clock() if clock is not None else utc_now()
+        if lease_ts_check <= now_check:
             # Lease expired; abort without unlinking
             conn.rollback()
             return False
@@ -536,14 +544,14 @@ def perform_job_cleanup(
             conn.commit()
             return False
 
-        now_completed = utc_now()
-        conn.execute(
+        now_completed = clock() if clock is not None else utc_now()
+        cursor = conn.execute(
             "UPDATE delivery_jobs SET cleanup_state='completed', cleanup_phase='deleted', local_deleted_at=?, "
             "cleanup_lease_until=NULL, cleanup_error=NULL WHERE id=? AND cleanup_lease_until=?",
             (now_completed, job_id, token),
         )
         conn.commit()
-        return True
+        return cursor.rowcount > 0
     except Exception:
         conn.rollback()
         raise
@@ -551,12 +559,17 @@ def perform_job_cleanup(
         conn.close()
 
 
-def process_due_cleanups(db_path: Path, uploads_dir: Path | None = None, limit: int = 20) -> int:
+def process_due_cleanups(
+    db_path: Path,
+    uploads_dir: Path | None = None,
+    limit: int = 20,
+    clock: Any = None,
+) -> int:
     """
     Sweeps delivery_jobs for delivered tasks that still need local file cleanup.
     Recovers from crashes and retries failed cleanups with bounded backoff.
     """
-    now = utc_now()
+    now = clock() if clock is not None else utc_now()
     conn = sqlite3.connect(db_path, timeout=10)
     candidate_ids = []
     try:
@@ -575,7 +588,7 @@ def process_due_cleanups(db_path: Path, uploads_dir: Path | None = None, limit: 
             "  cleanup_state = 'pending' "
             "  OR (cleanup_state = 'failed' AND cleanup_attempts < 10 "
             "      AND (cleanup_lease_until IS NULL OR cleanup_lease_until <= ?) "
-            "      AND (cleanup_error IS NULL OR cleanup_error NOT IN ('MissingSourceBeforeCleanup', 'HistoricalMissingSource'))"
+            "      AND (cleanup_error IS NULL OR cleanup_error NOT IN ('MissingSourceBeforeCleanup', 'HistoricalMissingSource', 'MissingLocalPath'))"
             "  ) "
             "  OR (cleanup_state = 'processing' AND cleanup_lease_until <= ?)"
             ") "
@@ -588,7 +601,7 @@ def process_due_cleanups(db_path: Path, uploads_dir: Path | None = None, limit: 
 
     cleaned = 0
     for jid in candidate_ids:
-        if perform_job_cleanup(db_path, jid, uploads_dir=uploads_dir):
+        if perform_job_cleanup(db_path, jid, uploads_dir=uploads_dir, clock=clock):
             cleaned += 1
     return cleaned
 
