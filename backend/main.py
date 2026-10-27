@@ -48,11 +48,70 @@ load_dotenv()
 # Настройка базового логирования
 logging.basicConfig(level=logging.INFO)
 
+KNOWN_STAGING_PLACEHOLDERS = {
+    "y0_test_staging_token_mock",
+    "y0_example_staging_token...",
+    "mock",
+    "placeholder",
+    "test",
+    "test-oauth-token",
+    "changeme",
+}
+
+
+def get_yandex_disk_root() -> str:
+    root = (os.getenv("YANDEX_DISK_ROOT_DIR") or "PhotoDoc_Orders").strip()
+    clean = root.strip("/")
+    return clean or "PhotoDoc_Orders"
+
+
+def is_staging_environment() -> bool:
+    return (
+        os.getenv("PHOTODOC_STAGING", "0").strip().lower() in ("1", "true")
+        or os.getenv("PHOTODOC_ALLOW_FRESH_DB", "0").strip().lower() in ("1", "true")
+        or (os.getenv("YANDEX_DISK_ROOT_DIR") or "").strip().lower().startswith("photodoc_staging")
+    )
+
+
+def validate_staging_delivery_safety():
+    """
+    Enforces fail-closed safety for delivery in staging environments:
+    1. Staging delivery must never target the production root 'PhotoDoc_Orders'.
+    2. Staging delivery requires an explicit, genuine token and rejects known placeholders.
+    """
+    if not is_staging_environment():
+        return
+
+    root = get_yandex_disk_root()
+    if root == "PhotoDoc_Orders" or root.startswith("PhotoDoc_Orders/"):
+        raise RuntimeError(
+            f"Staging delivery configuration forbidden to target production root '{root}'"
+        )
+
+    token = (os.getenv("YANDEX_DISK_TOKEN") or os.getenv("YANDEX_DISK_STAGING_TOKEN") or "").strip()
+    if not token:
+        raise RuntimeError(
+            "Staging delivery worker requires explicit non-empty YANDEX_DISK_STAGING_TOKEN"
+        )
+    token_lower = token.lower()
+    if (
+        token_lower in KNOWN_STAGING_PLACEHOLDERS
+        or "placeholder" in token_lower
+        or "example" in token_lower
+        or token_lower.endswith("_mock")
+    ):
+        if os.getenv("PHOTODOC_TEST_MOCK_TOKEN_ALLOWED", "0") != "1":
+            raise RuntimeError(
+                "Staging delivery worker cannot use placeholder or example token"
+            )
+
+
 @asynccontextmanager
 async def lifespan(_app):
     stop = threading.Event()
     thread = None
     if os.getenv("DELIVERY_WORKER_ENABLED", "1") != "0":
+        validate_staging_delivery_safety()
         thread = threading.Thread(target=worker_loop, args=(DB_PATH, deliver_job, stop), kwargs={"uploads_dir": UPLOAD_DIR}, daemon=True)
         thread.start()
     try:
@@ -79,12 +138,6 @@ DB_PATH = Path(os.getenv("DATABASE_PATH", BASE_DIR / "orders.db"))
 UPLOAD_DIR = BASE_DIR / "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 set_uploads_dir(UPLOAD_DIR)
-
-
-def get_yandex_disk_root() -> str:
-    root = (os.getenv("YANDEX_DISK_ROOT_DIR") or "PhotoDoc_Orders").strip()
-    clean = root.strip("/")
-    return clean or "PhotoDoc_Orders"
 
 
 # --- Инициализация базы данных ---
@@ -691,6 +744,24 @@ def upload_to_yandex_disk(
     token = os.getenv("YANDEX_DISK_TOKEN")
     if not token:
         raise RuntimeError("Yandex Disk OAuth token is unavailable")
+
+    if is_staging_environment():
+        clean_remote = remote_folder_path.strip("/")
+        if clean_remote == "PhotoDoc_Orders" or clean_remote.startswith("PhotoDoc_Orders/"):
+            raise RuntimeError(
+                f"Staging delivery cannot upload to production destination: {remote_folder_path}"
+            )
+        token_lower = token.lower()
+        if (
+            token_lower in KNOWN_STAGING_PLACEHOLDERS
+            or "placeholder" in token_lower
+            or "example" in token_lower
+            or token_lower.endswith("_mock")
+        ):
+            if os.getenv("PHOTODOC_TEST_MOCK_TOKEN_ALLOWED", "0") != "1":
+                raise RuntimeError(
+                    "Staging delivery requires explicit genuine staging token (placeholder rejected)"
+                )
 
     raw_path = str(local_file_path)
     if ".." in raw_path or any(part == ".." for part in Path(raw_path).parts):
