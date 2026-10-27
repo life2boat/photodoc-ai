@@ -175,28 +175,72 @@ def finish(db_path: Path, job_id: str, error: Exception | None = None, lease_unt
         conn.close()
 
 
-def _mark_cleanup_completed(db_path: Path, job_id: str) -> None:
+def _is_cleanup_lease_valid(conn: sqlite3.Connection, job_id: str, token: str) -> bool:
+    """
+    Verifies that this worker still holds the active lease token before any filesystem mutation.
+    Returns False if the lease expired or was acquired by another worker.
+    """
+    row = conn.execute(
+        "SELECT cleanup_lease_until FROM delivery_jobs "
+        "WHERE id=? AND cleanup_state='processing'",
+        (job_id,),
+    ).fetchone()
+    if not row or row[0] != token:
+        return False
+    # Verify expiration timestamp part of token has not passed
+    lease_ts = token.split("#")[0]
+    return lease_ts > utc_now()
+
+
+def _mark_cleanup_completed(db_path: Path, job_id: str, token: str | None = None) -> bool:
+    """
+    Atomically records cleanup completion if the worker still holds the lease.
+    """
     conn = sqlite3.connect(db_path, timeout=10)
     try:
-        conn.execute(
-            "UPDATE delivery_jobs SET cleanup_state='completed', local_deleted_at=?, "
-            "cleanup_lease_until=NULL, cleanup_error=NULL WHERE id=?",
-            (utc_now(), job_id),
-        )
+        if token is not None:
+            cursor = conn.execute(
+                "UPDATE delivery_jobs SET cleanup_state='completed', local_deleted_at=?, "
+                "cleanup_lease_until=NULL, cleanup_error=NULL "
+                "WHERE id=? AND cleanup_state='processing' AND cleanup_lease_until=?",
+                (utc_now(), job_id, token),
+            )
+        else:
+            cursor = conn.execute(
+                "UPDATE delivery_jobs SET cleanup_state='completed', local_deleted_at=?, "
+                "cleanup_lease_until=NULL, cleanup_error=NULL WHERE id=?",
+                (utc_now(), job_id),
+            )
         conn.commit()
+        return cursor.rowcount > 0
     finally:
         conn.close()
 
 
-def _mark_cleanup_failed(db_path: Path, job_id: str, error: str) -> None:
+def _mark_cleanup_failed(db_path: Path, job_id: str, token: str | None = None, error: str = "") -> bool:
+    """
+    Atomically records cleanup failure with bounded exponential backoff if the worker still holds the lease.
+    """
     conn = sqlite3.connect(db_path, timeout=10)
     try:
-        conn.execute(
-            "UPDATE delivery_jobs SET cleanup_state='failed', cleanup_lease_until=NULL, "
-            "cleanup_error=? WHERE id=?",
-            (error, job_id),
-        )
+        row = conn.execute("SELECT cleanup_attempts FROM delivery_jobs WHERE id=?", (job_id,)).fetchone()
+        attempts = row[0] if row else 1
+        delay = min(3600, 5 * (2 ** min(max(0, attempts - 2), 8))) if attempts > 1 else 0
+        backoff_until = (datetime.now(timezone.utc) + timedelta(seconds=delay)).isoformat()
+        if token is not None:
+            cursor = conn.execute(
+                "UPDATE delivery_jobs SET cleanup_state='failed', cleanup_lease_until=?, "
+                "cleanup_error=? WHERE id=? AND cleanup_state='processing' AND cleanup_lease_until=?",
+                (backoff_until, error, job_id, token),
+            )
+        else:
+            cursor = conn.execute(
+                "UPDATE delivery_jobs SET cleanup_state='failed', cleanup_lease_until=?, "
+                "cleanup_error=? WHERE id=?",
+                (backoff_until, error, job_id),
+            )
         conn.commit()
+        return cursor.rowcount > 0
     finally:
         conn.close()
 
@@ -211,26 +255,31 @@ def perform_job_cleanup(
 
     Strict Safety Guards:
     1. Preconditions: state == 'delivered' and kind in ('file', 'info').
-    2. Lease & Concurrency: atomically acquires a cleanup lease to prevent worker collisions.
+    2. Lease & Concurrency: atomically acquires a unique fencing lease token to prevent worker collisions.
     3. Confinement: path MUST be strictly inside uploads_dir without '..' or symlinks.
-    4. Identity check: checks size and sha256 against delivery_jobs metadata before unlinking.
-    5. Dependency check: checks that NO other unfinished delivery job references this local_path.
-    6. Idempotency & Crash recovery: if file is already deleted, records completed cleanly.
-    7. Failure resilience: cleanup error never marks delivery state back to pending.
+    4. Isolation: local file MUST match the order_id prefix to prevent cross-order file manipulation.
+    5. Identity check: checks size and sha256 against delivery_jobs metadata before unlinking.
+    6. Dependency check: checks that NO other unfinished delivery job references this local_path.
+    7. Pre-unlink fencing: verifies active lease ownership immediately before unlinking file.
+    8. Idempotency & Crash recovery: if file is already deleted, records completed cleanly.
+    9. Failure resilience: cleanup error never marks delivery state back to pending; applies bounded backoff.
     """
     if uploads_dir is None:
         uploads_dir = get_uploads_dir()
     uploads_resolved = uploads_dir.resolve()
 
     now = utc_now()
-    cleanup_lease = (datetime.now(timezone.utc) + timedelta(minutes=2)).isoformat()
+    lease_ts = (datetime.now(timezone.utc) + timedelta(minutes=2)).isoformat()
+    nonce = uuid.uuid4().hex[:8]
+
     conn = sqlite3.connect(db_path, timeout=10)
     conn.row_factory = sqlite3.Row
+    token = None
     try:
         conn.execute("BEGIN IMMEDIATE")
         job = conn.execute(
             "SELECT id, order_id, kind, local_path, content_sha256, content_size, state, "
-            "cleanup_state, cleanup_lease_until FROM delivery_jobs WHERE id=?",
+            "cleanup_state, cleanup_attempts, cleanup_lease_until FROM delivery_jobs WHERE id=?",
             (job_id,),
         ).fetchone()
 
@@ -257,19 +306,31 @@ def perform_job_cleanup(
             return True
 
         # Check if another active worker holds a valid cleanup lease
-        if (
-            job["cleanup_state"] == "processing"
-            and job["cleanup_lease_until"]
-            and job["cleanup_lease_until"] > now
-        ):
-            conn.commit()
-            return False
+        if job["cleanup_state"] == "processing" and job["cleanup_lease_until"]:
+            active_ts = job["cleanup_lease_until"].split("#")[0]
+            if active_ts > now:
+                conn.commit()
+                return False
 
-        # Atomically claim cleanup processing
+        # Check if failed job is still in backoff or exceeded max attempts
+        if job["cleanup_state"] == "failed":
+            if job["cleanup_attempts"] >= 10:
+                conn.commit()
+                return False
+            if job["cleanup_lease_until"]:
+                backoff_ts = job["cleanup_lease_until"].split("#")[0]
+                if backoff_ts > now:
+                    conn.commit()
+                    return False
+
+        next_attempt = job["cleanup_attempts"] + 1
+        token = f"{lease_ts}#{next_attempt}#{nonce}"
+
+        # Atomically claim cleanup processing with fencing token
         cursor = conn.execute(
             "UPDATE delivery_jobs SET cleanup_state='processing', cleanup_lease_until=?, "
-            "cleanup_attempts=cleanup_attempts+1 WHERE id=?",
-            (cleanup_lease, job_id),
+            "cleanup_attempts=? WHERE id=?",
+            (token, next_attempt, job_id),
         )
         conn.commit()
         if cursor.rowcount == 0:
@@ -282,45 +343,50 @@ def perform_job_cleanup(
 
     raw_local_path = job["local_path"]
     if not raw_local_path:
-        _mark_cleanup_completed(db_path, job_id)
+        _mark_cleanup_completed(db_path, job_id, token)
         return True
 
     path_obj = Path(raw_local_path)
 
     # Path traversal check
     if ".." in raw_local_path or any(part == ".." for part in path_obj.parts):
-        _mark_cleanup_failed(db_path, job_id, "PathTraversalDetected")
+        _mark_cleanup_failed(db_path, job_id, token, "PathTraversalDetected")
         return False
 
     # Symlink protection on input path
     if path_obj.is_symlink():
-        _mark_cleanup_failed(db_path, job_id, "SymlinkDetected")
+        _mark_cleanup_failed(db_path, job_id, token, "SymlinkDetected")
         return False
 
     try:
         target_resolved = path_obj.resolve()
     except Exception as exc:
-        _mark_cleanup_failed(db_path, job_id, f"PathResolveError: {exc}")
+        _mark_cleanup_failed(db_path, job_id, token, f"PathResolveError: {exc}")
         return False
 
     # Uploads confinement check
     if uploads_resolved not in target_resolved.parents and target_resolved.parent != uploads_resolved:
-        _mark_cleanup_failed(db_path, job_id, "PathOutsideUploads")
+        _mark_cleanup_failed(db_path, job_id, token, "PathOutsideUploads")
         return False
 
     # Symlink protection on resolved target
     if target_resolved.is_symlink():
-        _mark_cleanup_failed(db_path, job_id, "SymlinkDetected")
+        _mark_cleanup_failed(db_path, job_id, token, "SymlinkDetected")
+        return False
+
+    # Isolation check: file must belong to this order
+    if not path_obj.name.startswith(f"{job['order_id']}_"):
+        _mark_cleanup_failed(db_path, job_id, token, "OrderIdMismatchInFilename")
         return False
 
     # Idempotent check: if file is already deleted, mark completed
     if not path_obj.exists():
-        _mark_cleanup_completed(db_path, job_id)
+        _mark_cleanup_completed(db_path, job_id, token)
         return True
 
     # Must be a regular file
     if not path_obj.is_file():
-        _mark_cleanup_failed(db_path, job_id, "NotARegularFile")
+        _mark_cleanup_failed(db_path, job_id, token, "NotARegularFile")
         return False
 
     # Pre-delete identity verification: size
@@ -328,12 +394,12 @@ def perform_job_cleanup(
     try:
         actual_size = path_obj.stat().st_size
     except Exception as exc:
-        _mark_cleanup_failed(db_path, job_id, f"StatError: {exc}")
+        _mark_cleanup_failed(db_path, job_id, token, f"StatError: {exc}")
         return False
 
     if expected_size is not None and actual_size != expected_size:
         _mark_cleanup_failed(
-            db_path, job_id, f"SizeMismatchBeforeDelete: actual={actual_size} expected={expected_size}"
+            db_path, job_id, token, f"SizeMismatchBeforeDelete: actual={actual_size} expected={expected_size}"
         )
         return False
 
@@ -343,12 +409,12 @@ def perform_job_cleanup(
         try:
             actual_sha256 = sha256_file(path_obj).lower()
         except Exception as exc:
-            _mark_cleanup_failed(db_path, job_id, f"ChecksumError: {exc}")
+            _mark_cleanup_failed(db_path, job_id, token, f"ChecksumError: {exc}")
             return False
 
         if actual_sha256 != expected_sha256.lower():
             _mark_cleanup_failed(
-                db_path, job_id, f"Sha256MismatchBeforeDelete: actual={actual_sha256} expected={expected_sha256}"
+                db_path, job_id, token, f"Sha256MismatchBeforeDelete: actual={actual_sha256} expected={expected_sha256}"
             )
             return False
 
@@ -369,29 +435,39 @@ def perform_job_cleanup(
         try:
             conn.execute(
                 "UPDATE delivery_jobs SET cleanup_state='pending', cleanup_lease_until=NULL, "
-                "cleanup_error='FileStillReferencedByUnfinishedJob' WHERE id=?",
-                (job_id,),
+                "cleanup_error='FileStillReferencedByUnfinishedJob' WHERE id=? AND cleanup_lease_until=?",
+                (job_id, token),
             )
             conn.commit()
         finally:
             conn.close()
         return False
 
+    # FENCING CHECK IMMEDIATELY BEFORE UNLINK:
+    # Must verify that this worker STILL owns the active lease.
+    conn = sqlite3.connect(db_path, timeout=10)
+    try:
+        if not _is_cleanup_lease_valid(conn, job_id, token):
+            # Lease expired or stolen by another worker! Abort without deleting!
+            return False
+    finally:
+        conn.close()
+
     # Delete local source file
     try:
         path_obj.unlink()
     except Exception as exc:
-        _mark_cleanup_failed(db_path, job_id, f"UnlinkError: {type(exc).__name__}: {exc}")
+        _mark_cleanup_failed(db_path, job_id, token, f"UnlinkError: {type(exc).__name__}: {exc}")
         return False
 
-    _mark_cleanup_completed(db_path, job_id)
+    _mark_cleanup_completed(db_path, job_id, token)
     return True
 
 
 def process_due_cleanups(db_path: Path, uploads_dir: Path | None = None, limit: int = 20) -> int:
     """
     Sweeps delivery_jobs for delivered tasks that still need local file cleanup.
-    Recovers from crashes and retries failed cleanups.
+    Recovers from crashes and retries failed cleanups with bounded backoff.
     """
     now = utc_now()
     conn = sqlite3.connect(db_path, timeout=10)
@@ -410,11 +486,11 @@ def process_due_cleanups(db_path: Path, uploads_dir: Path | None = None, limit: 
             "WHERE state='delivered' AND kind IN ('file', 'info') "
             "AND ("
             "  cleanup_state = 'pending' "
-            "  OR (cleanup_state = 'failed' AND cleanup_attempts < 10) "
+            "  OR (cleanup_state = 'failed' AND cleanup_attempts < 10 AND (cleanup_lease_until IS NULL OR cleanup_lease_until <= ?)) "
             "  OR (cleanup_state = 'processing' AND cleanup_lease_until <= ?)"
             ") "
             "ORDER BY created_at, id LIMIT ?",
-            (now, limit),
+            (now, now, limit),
         ).fetchall()
         candidate_ids = [r[0] for r in rows]
     finally:

@@ -671,3 +671,110 @@ def test_temporary_files_cleanup_preserves_orders_and_prunes_stale_incoming(isol
 
     # Real order file was strictly PRESERVED (never deleted by age alone!)
     assert real_file.is_file()
+
+
+# -----------------------------------------------------------------------------
+# Scenario 17: Worker lease fencing concurrency
+# Worker A loses lease, Worker B acquires it -> Worker A cannot delete source or overwrite state
+# -----------------------------------------------------------------------------
+def test_stale_worker_cannot_delete_or_overwrite_state_after_lease_loss(isolated_env):
+    """
+    Proves that a stale worker whose lease expired and was acquired by a newer worker
+    CANNOT unlink the file and CANNOT overwrite the newer worker's state.
+    """
+    client, db, uploads = isolated_env
+    order_data = create_test_order(client, ("fencing_guard.jpg",))
+    order_id = order_data["order_id"]
+    photo_path = list(uploads.glob(f"{order_id}_*.jpg"))[0]
+
+    with sqlite3.connect(db) as conn:
+        job_id = conn.execute("SELECT id FROM delivery_jobs WHERE order_id=? AND kind='file'", (order_id,)).fetchone()[0]
+        conn.execute("UPDATE delivery_jobs SET state='delivered', delivered_at=? WHERE id=?", (utc_now(), job_id))
+
+    # Worker A claims lease
+    past_time = "2026-01-01T00:00:00+00:00"
+    token_A = f"{past_time}#1#workerA123"
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "UPDATE delivery_jobs SET cleanup_state='processing', cleanup_lease_until=?, cleanup_attempts=1 WHERE id=?",
+            (token_A, job_id),
+        )
+
+    from datetime import datetime, timedelta, timezone
+    # Worker B arrives after Worker A's lease expired and acquires the lease
+    future_time = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
+    token_B = f"{future_time}#2#workerB456"
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "UPDATE delivery_jobs SET cleanup_state='processing', cleanup_lease_until=?, cleanup_attempts=2 WHERE id=?",
+            (token_B, job_id),
+        )
+
+    from delivery import _is_cleanup_lease_valid, _mark_cleanup_completed, _mark_cleanup_failed
+
+    # 1. Stale Worker A verifies its lease: MUST FAIL
+    with sqlite3.connect(db) as conn:
+        assert _is_cleanup_lease_valid(conn, job_id, token_A) is False
+
+    # 2. Stale Worker A tries to mark completed: MUST BE REJECTED (rowcount == 0)
+    res_completed_a = _mark_cleanup_completed(db, job_id, token_A)
+    assert res_completed_a is False
+
+    # 3. Stale Worker A tries to mark failed: MUST BE REJECTED (rowcount == 0)
+    res_failed_a = _mark_cleanup_failed(db, job_id, token_A, error="StaleWorkerError")
+    assert res_failed_a is False
+
+    # Photo file must still exist unharmed
+    assert photo_path.is_file()
+
+    # 4. Active Worker B verifies its lease: MUST SUCCEED
+    with sqlite3.connect(db) as conn:
+        assert _is_cleanup_lease_valid(conn, job_id, token_B) is True
+
+    # 5. Active Worker B unlinks and completes
+    photo_path.unlink()
+    res_completed_b = _mark_cleanup_completed(db, job_id, token_B)
+    assert res_completed_b is True
+
+    # 6. Verify final DB state is cleanly completed by Worker B, no pollution from Worker A
+    with sqlite3.connect(db) as conn:
+        row = conn.execute("SELECT cleanup_state, cleanup_error, cleanup_attempts FROM delivery_jobs WHERE id=?", (job_id,)).fetchone()
+        assert row[0] == "completed"
+        assert row[1] is None, "Worker A's stale error was not written"
+        assert row[2] == 2, "Reflects Worker B's generation"
+
+
+def test_perform_job_cleanup_aborts_deletion_if_lease_stolen_concurrently(isolated_env):
+    """
+    Proves that perform_job_cleanup checks lease ownership immediately before unlinking,
+    and aborts unlinking if another worker stole the lease while processing.
+    """
+    client, db, uploads = isolated_env
+    order_data = create_test_order(client, ("race_guard.jpg",))
+    order_id = order_data["order_id"]
+    photo_path = list(uploads.glob(f"{order_id}_*.jpg"))[0]
+
+    with sqlite3.connect(db) as conn:
+        job_id = conn.execute("SELECT id FROM delivery_jobs WHERE order_id=? AND kind='file'", (order_id,)).fetchone()[0]
+        conn.execute("UPDATE delivery_jobs SET state='delivered', delivered_at=? WHERE id=?", (utc_now(), job_id))
+
+    # Hook into sqlite3 to steal the lease right before unlinking
+    original_unlink = Path.unlink
+
+    def steal_lease_before_unlink(self):
+        # Worker B steals lease right as Worker A is about to unlink
+        with sqlite3.connect(db) as conn:
+            conn.execute(
+                "UPDATE delivery_jobs SET cleanup_lease_until='stolen#99#workerB' WHERE id=?",
+                (job_id,),
+            )
+        # Attempt to unlink
+        return original_unlink(self)
+
+    # Worker A runs perform_job_cleanup
+    with patch.object(Path, "unlink", side_effect=steal_lease_before_unlink):
+        res = perform_job_cleanup(db, job_id, uploads_dir=uploads)
+        assert res is False
+
+    # The file must NOT have been unlinked!
+    assert photo_path.is_file(), "File must be preserved because lease was stolen before unlink!"

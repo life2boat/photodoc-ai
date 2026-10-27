@@ -90,6 +90,7 @@ def verify_backup(
         "p1_verified_info": 0,
         "p1_cleaned_files": 0,
         "p1_cleaned_info": 0,
+        "p1_residual_uncleaned_files": [],
         "p1_delivered_uncleaned_anomalies": [],
         "p1_missing_files": [],
         "p1_size_mismatches": [],
@@ -339,6 +340,19 @@ def verify_backup(
                             elif kind == "info":
                                 report["p1_cleaned_info"] += 1
                             continue
+                        else:
+                            report["p1_residual_uncleaned_files"].append(
+                                {
+                                    "order_id": order_id,
+                                    "job_id": job_id,
+                                    "kind": kind,
+                                    "filename": filename,
+                                }
+                            )
+                            report["errors"].append(
+                                f"Order #{order_id} job #{job_id} ({kind}) marked cleanup completed but residual file still exists on disk"
+                            )
+                            continue
                     else:
                         if not file_exists:
                             report["p1_delivered_uncleaned_anomalies"].append(
@@ -433,6 +447,7 @@ def verify_backup(
         report["sqlite_integrity"] == "ok"
         and report["application_id_valid"]
         and len(report["p1_missing_files"]) == 0
+        and len(report["p1_residual_uncleaned_files"]) == 0
         and len(report["p1_size_mismatches"]) == 0
         and len(report["p1_checksum_mismatches"]) == 0
         and len(report["path_traversal_violations"]) == 0
@@ -462,6 +477,10 @@ def print_report(is_valid: bool, report: Dict[str, Any], *, as_json: bool = Fals
     print(f"P1 Orders:                {report['p1_orders_count']}")
     print(f"P1 Verified Photos:       {report['p1_verified_files']}")
     print(f"P1 Verified Info Files:   {report['p1_verified_info']}")
+    print(f"P1 Cleaned Photos:        {report['p1_cleaned_files']}")
+    print(f"P1 Cleaned Info Files:    {report['p1_cleaned_info']}")
+    print(f"P1 Residual Uncleaned:    {len(report['p1_residual_uncleaned_files'])}")
+    print(f"P1 Delivered Missing:     {len(report['p1_delivered_uncleaned_anomalies'])}")
     print(f"P1 Completeness Errors:   {len(report['p1_completeness_errors'])}")
     print(f"P1 Metadata Errors:       {len(report['p1_metadata_errors'])}")
     print(f"P1 Missing Files:         {len(report['p1_missing_files'])}")
@@ -492,6 +511,11 @@ def print_report(is_valid: bool, report: Dict[str, Any], *, as_json: bool = Fals
         print("\nOrphan Delivery Jobs:")
         for item in report["orphan_delivery_jobs"][:10]:
             print(f"  - Job #{item['job_id']} references non-existent order #{item['order_id']} ({item['kind']})")
+
+    if report["p1_residual_uncleaned_files"]:
+        print("\nP1 Residual Uncleaned Files (Privacy Violation):")
+        for item in report["p1_residual_uncleaned_files"][:10]:
+            print(f"  - Order #{item['order_id']} job #{item['job_id']}: {item['filename']} ({item['kind']})")
 
     if report["p1_missing_files"]:
         print("\nMissing P1 Files:")

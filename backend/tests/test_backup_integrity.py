@@ -640,3 +640,93 @@ def test_intact_mixed_p0_p1_database_passes(tmp_path, monkeypatch):
     assert len(report["p1_metadata_errors"]) == 0
     assert len(report["orphan_delivery_jobs"]) == 0
     assert len(report["errors"]) == 0
+
+
+def test_backup_verifier_delivered_cleaned_file_absent_passes(test_env):
+    """Delivered job with cleanup_state='completed' and absent local file passes."""
+    client, db_path, uploads_dir = test_env
+    resp = client.post(
+        "/api/order",
+        data={"name": "Cleaned User", "phone": "+79991112233", "format": "10x15"},
+        files=[("files", ("photo.jpg", JPEG, "image/jpeg"))],
+    )
+    assert resp.status_code == 200
+    order_id = resp.json()["order_id"]
+
+    # Delete local photo file
+    photos = list(uploads_dir.glob(f"{order_id}_*.jpg"))
+    assert len(photos) == 1
+    photos[0].unlink()
+
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "UPDATE delivery_jobs SET state='delivered', cleanup_state='completed', "
+            "local_deleted_at='2026-10-27T12:00:00+00:00' WHERE order_id=? AND kind='file'",
+            (order_id,),
+        )
+
+    is_valid, report = verify_backup(db_path, uploads_dir)
+    assert is_valid is True
+    assert report["p1_cleaned_files"] == 1
+    assert len(report["p1_residual_uncleaned_files"]) == 0
+    assert len(report["errors"]) == 0
+
+
+def test_backup_verifier_flags_residual_uncleaned_file_as_violation(test_env):
+    """Delivered job with cleanup_state='completed' whose local file STILL exists must fail."""
+    client, db_path, uploads_dir = test_env
+    resp = client.post(
+        "/api/order",
+        data={"name": "Residual File User", "phone": "+79991112233", "format": "10x15"},
+        files=[("files", ("photo.jpg", JPEG, "image/jpeg"))],
+    )
+    assert resp.status_code == 200
+    order_id = resp.json()["order_id"]
+
+    photos = list(uploads_dir.glob(f"{order_id}_*.jpg"))
+    assert len(photos) == 1
+    assert photos[0].is_file()
+
+    # Mark as delivered and cleanup completed, BUT leave the file on disk!
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "UPDATE delivery_jobs SET state='delivered', cleanup_state='completed', "
+            "local_deleted_at='2026-10-27T12:00:00+00:00' WHERE order_id=? AND kind='file'",
+            (order_id,),
+        )
+
+    is_valid, report = verify_backup(db_path, uploads_dir)
+    assert is_valid is False
+    assert len(report["p1_residual_uncleaned_files"]) == 1
+    residual = report["p1_residual_uncleaned_files"][0]
+    assert residual["order_id"] == order_id
+    assert residual["kind"] == "file"
+    assert any("residual file still exists on disk" in err for err in report["errors"])
+
+
+def test_backup_verifier_delivered_uncleaned_job_missing_file_fails(test_env):
+    """Delivered job whose cleanup is pending but local file is missing fails verification."""
+    client, db_path, uploads_dir = test_env
+    resp = client.post(
+        "/api/order",
+        data={"name": "Uncleaned Missing", "phone": "+79991112233", "format": "10x15"},
+        files=[("files", ("photo.jpg", JPEG, "image/jpeg"))],
+    )
+    assert resp.status_code == 200
+    order_id = resp.json()["order_id"]
+
+    photos = list(uploads_dir.glob(f"{order_id}_*.jpg"))
+    assert len(photos) == 1
+    photos[0].unlink()
+
+    # Delivered but cleanup_state is still pending (uncleaned)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "UPDATE delivery_jobs SET state='delivered', cleanup_state='pending' WHERE order_id=? AND kind='file'",
+            (order_id,),
+        )
+
+    is_valid, report = verify_backup(db_path, uploads_dir)
+    assert is_valid is False
+    assert len(report["p1_delivered_uncleaned_anomalies"]) == 1
+    assert any("yet local file is missing" in err for err in report["errors"])
