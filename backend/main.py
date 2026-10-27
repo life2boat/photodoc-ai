@@ -25,7 +25,16 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 
 from db_contract import APPLICATION_ID, inspect_database, read_application_id
-from delivery import DELIVERY_SCHEMA, enqueue, process_due, worker_loop
+from delivery import (
+    DELIVERY_SCHEMA,
+    cleanup_orphaned_temporary_files,
+    enqueue,
+    perform_job_cleanup,
+    process_due,
+    process_due_cleanups,
+    set_uploads_dir,
+    worker_loop,
+)
 
 # Загрузка переменных окружения
 load_dotenv()
@@ -38,7 +47,7 @@ async def lifespan(_app):
     stop = threading.Event()
     thread = None
     if os.getenv("DELIVERY_WORKER_ENABLED", "1") != "0":
-        thread = threading.Thread(target=worker_loop, args=(DB_PATH, deliver_job, stop), daemon=True)
+        thread = threading.Thread(target=worker_loop, args=(DB_PATH, deliver_job, stop), kwargs={"uploads_dir": UPLOAD_DIR}, daemon=True)
         thread.start()
     try:
         yield
@@ -63,6 +72,7 @@ BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = Path(os.getenv("DATABASE_PATH", BASE_DIR / "orders.db"))
 UPLOAD_DIR = BASE_DIR / "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+set_uploads_dir(UPLOAD_DIR)
 
 
 def get_yandex_disk_root() -> str:
@@ -188,11 +198,16 @@ def delivery_schema_ready() -> bool:
     try:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(orders)")}
         table = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='delivery_jobs'").fetchone()
+        delivery_cols = {row[1] for row in conn.execute("PRAGMA table_info(delivery_jobs)")} if table else set()
         indexes = {row[0] for row in conn.execute(
             "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='delivery_jobs'"
-        )}
-        return ("order_token_hash" in columns and table is not None and
-                {"idx_delivery_due", "idx_paid_email_once", "idx_admin_email_once"} <= indexes)
+        )} if table else set()
+        return (
+            "order_token_hash" in columns
+            and table is not None
+            and {"cleanup_state", "local_deleted_at"} <= delivery_cols
+            and {"idx_delivery_due", "idx_cleanup_due", "idx_paid_email_once", "idx_admin_email_once"} <= indexes
+        )
     finally:
         conn.close()
 
@@ -627,42 +642,78 @@ def _remote_verified(token: str, remote_path: str, expected_sha256: str, expecte
     return True
 
 
-def upload_to_yandex_disk(local_file_path: str, remote_folder_path: str, remote_file_name: str):
+def upload_to_yandex_disk(
+    local_file_path: str,
+    remote_folder_path: str,
+    remote_file_name: str,
+    expected_sha256: str | None = None,
+    expected_size: int | None = None,
+):
     token = os.getenv("YANDEX_DISK_TOKEN")
     if not token:
         raise RuntimeError("Yandex Disk OAuth token is unavailable")
 
+    remote_path = f"{remote_folder_path}/{remote_file_name}"
+
+    # If authoritative expected checksum and size are known, check if already verified remotely
+    if expected_sha256 and expected_size is not None:
+        if _remote_verified(token, remote_path, expected_sha256, expected_size):
+            return True
+
     local = Path(local_file_path)
+    if not local.is_file():
+        raise RuntimeError(f"Local delivery source is missing: {local_file_path}")
+
+    # Validate local file identity against expected before initiating upload
     digest = hashlib.sha256()
     size = 0
     with local.open("rb") as source:
         for chunk in iter(lambda: source.read(65536), b""):
             digest.update(chunk)
             size += len(chunk)
+
+    local_sha256 = digest.hexdigest().lower()
+    if expected_sha256 and local_sha256 != expected_sha256.lower():
+        raise RuntimeError("Local delivery source checksum does not match delivery_jobs record")
+    if expected_size is not None and size != expected_size:
+        raise RuntimeError("Local delivery source size does not match delivery_jobs record")
+
+    target_sha256 = (expected_sha256 or local_sha256).lower()
+    target_size = expected_size if expected_size is not None else size
+
     ensure_yandex_folder(token, remote_folder_path)
     headers = {"Authorization": f"OAuth {token}"}
-    remote_path = f"{remote_folder_path}/{remote_file_name}"
-    if _remote_verified(token, remote_path, digest.hexdigest(), size):
+
+    if _remote_verified(token, remote_path, target_sha256, target_size):
         return True
+
     upload_url_response = httpx.get(
         "https://cloud-api.yandex.net/v1/disk/resources/upload",
         headers=headers,
         params={"path": remote_path, "overwrite": "false"},
         timeout=30,
     )
-    if upload_url_response.status_code == 409 and _remote_verified(token, remote_path, digest.hexdigest(), size):
+    if upload_url_response.status_code == 409 and _remote_verified(token, remote_path, target_sha256, target_size):
         return True
     upload_url_response.raise_for_status()
     href = upload_url_response.json().get("href")
     if not href or not href.startswith("https://"):
         raise RuntimeError("Yandex upload URL is missing or invalid")
+
     with local.open("rb") as source:
         def chunks():
             for chunk in iter(lambda: source.read(65536), b""):
                 yield chunk
-        put_response = httpx.put(href, content=chunks(), headers={"Content-Length": str(size)}, timeout=httpx.Timeout(120.0, connect=30.0))
+        put_response = httpx.put(
+            href,
+            content=chunks(),
+            headers={"Content-Length": str(target_size)},
+            timeout=httpx.Timeout(120.0, connect=30.0),
+        )
         put_response.raise_for_status()
-    if not _remote_verified(token, remote_path, digest.hexdigest(), size):
+
+    # Step 4 & 5: Verify remote metadata matches delivery_jobs authoritative sha256 and size
+    if not _remote_verified(token, remote_path, target_sha256, target_size):
         raise RuntimeError("Yandex upload was not confirmed by resource metadata")
     return True
 
@@ -675,15 +726,38 @@ def order_info_bytes(order_id: int, name: str, phone: str, format: str, paper: s
     return order_info_text.encode("utf-8")
 
 
-def upload_info_to_yandex_disk(order_id: int, name: str, phone: str, format: str, paper: str,
-                               crop: str, comment: str, remote_folder_path: str,
-                               source_path: str | None = None):
+def upload_info_to_yandex_disk(
+    order_id: int,
+    name: str,
+    phone: str,
+    format: str,
+    paper: str,
+    crop: str,
+    comment: str,
+    remote_folder_path: str,
+    source_path: str | None = None,
+    expected_sha256: str | None = None,
+    expected_size: int | None = None,
+):
     if source_path:
-        return upload_to_yandex_disk(source_path, remote_folder_path, "info.txt")
+        return upload_to_yandex_disk(
+            source_path,
+            remote_folder_path,
+            "info.txt",
+            expected_sha256=expected_sha256,
+            expected_size=expected_size,
+        )
     with tempfile.TemporaryDirectory() as directory:
         source = Path(directory) / "info.txt"
-        source.write_bytes(order_info_bytes(order_id, name, phone, format, paper, crop, comment))
-        return upload_to_yandex_disk(str(source), remote_folder_path, "info.txt")
+        info_bytes = order_info_bytes(order_id, name, phone, format, paper, crop, comment)
+        source.write_bytes(info_bytes)
+        return upload_to_yandex_disk(
+            str(source),
+            remote_folder_path,
+            "info.txt",
+            expected_sha256=expected_sha256 or hashlib.sha256(info_bytes).hexdigest(),
+            expected_size=expected_size or len(info_bytes),
+        )
 
 
 def deliver_job(job: dict) -> None:
@@ -692,17 +766,27 @@ def deliver_job(job: dict) -> None:
         raise RuntimeError("Order for delivery job is missing")
     if job["kind"] in ("file", "info"):
         path = Path(job["local_path"])
-        if not path.is_file() or UPLOAD_DIR.resolve() not in path.resolve().parents:
-            raise RuntimeError("Local delivery source is missing or outside uploads")
+        if UPLOAD_DIR.resolve() not in path.resolve().parents and path.resolve().parent != UPLOAD_DIR.resolve():
+            raise RuntimeError("Local delivery source is outside uploads")
         remote_folder, remote_name = job["remote_path"].rsplit("/", 1)
+        expected_sha256 = job.get("content_sha256")
+        expected_size = job.get("content_size")
         if job["kind"] == "info":
             ok = upload_info_to_yandex_disk(
                 order["id"], order["name"], order["phone"], order["format"],
                 order["paper"], order["crop"], order["comment"], remote_folder,
                 source_path=str(path),
+                expected_sha256=expected_sha256,
+                expected_size=expected_size,
             )
         else:
-            ok = upload_to_yandex_disk(str(path), remote_folder, remote_name)
+            ok = upload_to_yandex_disk(
+                str(path),
+                remote_folder,
+                remote_name,
+                expected_sha256=expected_sha256,
+                expected_size=expected_size,
+            )
     elif job["kind"] == "admin_email":
         ok = send_order_email(order["id"], order["name"], order["phone"], order["comment"],
                               order["format"], order["paper"], order["crop"])

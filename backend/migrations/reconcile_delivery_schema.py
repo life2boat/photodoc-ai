@@ -19,18 +19,51 @@ def reconcile(db_path: Path, apply: bool = False) -> dict:
     try:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(orders)")}
         table = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='delivery_jobs'").fetchone()
+        delivery_cols = {row[1] for row in conn.execute("PRAGMA table_info(delivery_jobs)")} if table else set()
         indexes = {row[0] for row in conn.execute(
             "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='delivery_jobs'"
-        )}
-        needed = ("order_token_hash" not in columns or table is None or
-                  not {"idx_delivery_due", "idx_paid_email_once", "idx_admin_email_once"} <= indexes)
+        )} if table else set()
+
+        needed = (
+            "order_token_hash" not in columns
+            or table is None
+            or not {"cleanup_state", "local_deleted_at"} <= delivery_cols
+            or not {"idx_delivery_due", "idx_cleanup_due", "idx_paid_email_once", "idx_admin_email_once"} <= indexes
+        )
+
         if apply and needed:
             conn.execute("BEGIN IMMEDIATE")
             if "order_token_hash" not in columns:
                 conn.execute("ALTER TABLE orders ADD COLUMN order_token_hash TEXT")
-            for statement in DELIVERY_SCHEMA.split(";"):
-                if statement.strip():
-                    conn.execute(statement)
+
+            if table is None:
+                for statement in DELIVERY_SCHEMA.split(";"):
+                    if statement.strip():
+                        conn.execute(statement)
+            else:
+                if "cleanup_state" not in delivery_cols:
+                    conn.execute("ALTER TABLE delivery_jobs ADD COLUMN cleanup_state TEXT NOT NULL DEFAULT 'pending'")
+                if "local_deleted_at" not in delivery_cols:
+                    conn.execute("ALTER TABLE delivery_jobs ADD COLUMN local_deleted_at TEXT")
+                if "cleanup_error" not in delivery_cols:
+                    conn.execute("ALTER TABLE delivery_jobs ADD COLUMN cleanup_error TEXT")
+                if "cleanup_attempts" not in delivery_cols:
+                    conn.execute("ALTER TABLE delivery_jobs ADD COLUMN cleanup_attempts INTEGER NOT NULL DEFAULT 0")
+                if "cleanup_lease_until" not in delivery_cols:
+                    conn.execute("ALTER TABLE delivery_jobs ADD COLUMN cleanup_lease_until TEXT")
+
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_cleanup_due ON delivery_jobs(state, cleanup_state, cleanup_lease_until)")
+                conn.execute("UPDATE delivery_jobs SET cleanup_state='not_applicable' WHERE kind NOT IN ('file', 'info')")
+                conn.execute(
+                    "UPDATE delivery_jobs SET cleanup_state='completed', local_deleted_at=delivered_at "
+                    "WHERE state='delivered' AND kind IN ('file', 'info') AND cleanup_state='pending'"
+                )
+
+                for statement in DELIVERY_SCHEMA.split(";"):
+                    trimmed = statement.strip()
+                    if trimmed.startswith("CREATE INDEX") or trimmed.startswith("CREATE UNIQUE INDEX"):
+                        conn.execute(trimmed)
+
             integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
             if integrity != "ok":
                 raise RuntimeError("SQLite integrity check failed")

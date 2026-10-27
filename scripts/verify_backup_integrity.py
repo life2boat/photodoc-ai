@@ -88,6 +88,9 @@ def verify_backup(
         "p1_orders_count": 0,
         "p1_verified_files": 0,
         "p1_verified_info": 0,
+        "p1_cleaned_files": 0,
+        "p1_cleaned_info": 0,
+        "p1_delivered_uncleaned_anomalies": [],
         "p1_missing_files": [],
         "p1_size_mismatches": [],
         "p1_checksum_mismatches": [],
@@ -244,10 +247,17 @@ def verify_backup(
                         )
 
             # 4.3 Mandatory Integrity Metadata and file presence for all file/info delivery jobs
-            file_and_info_jobs = conn.execute(
-                "SELECT id, order_id, kind, local_path, original_name, content_sha256, content_size "
-                "FROM delivery_jobs WHERE kind IN ('file', 'info') ORDER BY order_id, id;"
-            ).fetchall()
+            dj_cols = {row[1] for row in conn.execute("PRAGMA table_info(delivery_jobs);").fetchall()}
+            has_cleanup_state = "cleanup_state" in dj_cols
+            has_state = "state" in dj_cols
+
+            query = (
+                "SELECT id, order_id, kind, local_path, original_name, content_sha256, content_size"
+                + (", state" if has_state else ", 'pending' AS state")
+                + (", cleanup_state" if has_cleanup_state else ", 'pending' AS cleanup_state")
+                + " FROM delivery_jobs WHERE kind IN ('file', 'info') ORDER BY order_id, id;"
+            )
+            file_and_info_jobs = conn.execute(query).fetchall()
 
             for job in file_and_info_jobs:
                 job_id = job["id"]
@@ -256,6 +266,8 @@ def verify_backup(
                 local_path_raw = job["local_path"] or ""
                 raw_sha256 = job["content_sha256"]
                 raw_size = job["content_size"]
+                job_state = job["state"]
+                cleanup_state = job["cleanup_state"]
 
                 # Mandatory SHA-256 validation
                 if not is_valid_sha256(raw_sha256):
@@ -307,11 +319,47 @@ def verify_backup(
                     )
                     continue
 
-                if not candidate_file.is_file():
-                    report["p1_missing_files"].append(
-                        {"order_id": order_id, "job_id": job_id, "kind": kind, "filename": filename}
-                    )
-                    continue
+                file_exists = candidate_file.is_file()
+
+                # Privacy-by-design & cleanup contract:
+                # 1. pending, processing, failed -> local source file is strictly required
+                # 2. delivered, cleanup completed -> absence of local file is expected & legitimate
+                # 3. delivered, cleanup pending/failed/processing -> missing file is an anomaly
+                if job_state in ("pending", "processing", "failed"):
+                    if not file_exists:
+                        report["p1_missing_files"].append(
+                            {"order_id": order_id, "job_id": job_id, "kind": kind, "filename": filename, "state": job_state}
+                        )
+                        continue
+                elif job_state == "delivered":
+                    if cleanup_state == "completed":
+                        if not file_exists:
+                            if kind == "file":
+                                report["p1_cleaned_files"] += 1
+                            elif kind == "info":
+                                report["p1_cleaned_info"] += 1
+                            continue
+                    else:
+                        if not file_exists:
+                            report["p1_delivered_uncleaned_anomalies"].append(
+                                {
+                                    "order_id": order_id,
+                                    "job_id": job_id,
+                                    "kind": kind,
+                                    "filename": filename,
+                                    "cleanup_state": cleanup_state,
+                                }
+                            )
+                            report["errors"].append(
+                                f"Order #{order_id} job #{job_id} ({kind}) is delivered but cleanup is '{cleanup_state}', yet local file is missing"
+                            )
+                            continue
+                else:
+                    if not file_exists:
+                        report["p1_missing_files"].append(
+                            {"order_id": order_id, "job_id": job_id, "kind": kind, "filename": filename, "state": job_state}
+                        )
+                        continue
 
                 actual_size = candidate_file.stat().st_size
                 if actual_size != expected_size:
@@ -391,6 +439,7 @@ def verify_backup(
         and len(report["orphan_delivery_jobs"]) == 0
         and len(report["p1_metadata_errors"]) == 0
         and len(report["p1_completeness_errors"]) == 0
+        and len(report["p1_delivered_uncleaned_anomalies"]) == 0
         and len(report["errors"]) == 0
     )
 
