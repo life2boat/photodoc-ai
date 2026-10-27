@@ -252,6 +252,34 @@ def create_acceptance_order(
     return resp.json()
 
 
+def claim_file_job(db_path: Path, order_id: int) -> Dict[str, Any]:
+    """Atomically claims the specific file delivery job for testing."""
+    now = utc_now()
+    lease = (datetime.now(timezone.utc) + timedelta(minutes=3)).isoformat()
+    conn = sqlite3.connect(db_path, timeout=10)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT * FROM delivery_jobs WHERE order_id=? AND kind='file' AND state='pending'",
+            (order_id,),
+        ).fetchone()
+        if not row:
+            raise RuntimeError(f"No pending file job found for order {order_id}")
+        conn.execute(
+            "UPDATE delivery_jobs SET state='processing', attempts=attempts+1, lease_until=? WHERE id=?",
+            (lease, row["id"]),
+        )
+        conn.commit()
+        claimed = dict(row)
+        claimed["lease_until"] = lease
+        claimed["attempts"] = row["attempts"] + 1
+        claimed["state"] = "processing"
+        return claimed
+    finally:
+        conn.close()
+
+
 # =============================================================================
 # SCENARIO A: Full Successful Delivery and Cleanup Lifecycle
 # =============================================================================
@@ -406,10 +434,9 @@ def test_scenario_c_cleanup_failure_after_delivery_leaves_delivered_and_marks_fa
     mock_transport = MockYandexDiskTransport(SYNTHETIC_JPEG_SHA256, SYNTHETIC_JPEG_SIZE)
 
     # Deliver job manually
+    claimed = claim_file_job(db_path, order_id=order_id)
     with patch.object(main.httpx, "get", side_effect=mock_transport.get), \
          patch.object(main.httpx, "put", side_effect=mock_transport.put):
-        claimed = claim_due(db_path)
-        assert claimed is not None
         main.deliver_job(claimed)
         finish(db_path, claimed["id"])
 
@@ -439,9 +466,9 @@ def test_scenario_c_retry_after_transient_failure_succeeds(staging_env):
     photo_path = list(uploads_dir.glob(f"{order_id}_*.jpg"))[0]
 
     mock_transport = MockYandexDiskTransport(SYNTHETIC_JPEG_SHA256, SYNTHETIC_JPEG_SIZE)
+    claimed = claim_file_job(db_path, order_id=order_id)
     with patch.object(main.httpx, "get", side_effect=mock_transport.get), \
          patch.object(main.httpx, "put", side_effect=mock_transport.put):
-        claimed = claim_due(db_path)
         main.deliver_job(claimed)
         finish(db_path, claimed["id"])
 
@@ -471,9 +498,9 @@ def test_scenario_c_restart_recovery_with_deleting_phase(staging_env):
     photo_path = list(uploads_dir.glob(f"{order_id}_*.jpg"))[0]
 
     mock_transport = MockYandexDiskTransport(SYNTHETIC_JPEG_SHA256, SYNTHETIC_JPEG_SIZE)
+    claimed = claim_file_job(db_path, order_id=order_id)
     with patch.object(main.httpx, "get", side_effect=mock_transport.get), \
          patch.object(main.httpx, "put", side_effect=mock_transport.put):
-        claimed = claim_due(db_path)
         main.deliver_job(claimed)
         finish(db_path, claimed["id"])
 
@@ -507,9 +534,9 @@ def test_scenario_c_missing_source_without_intent_is_non_retryable_anomaly(stagi
     photo_path = list(uploads_dir.glob(f"{order_id}_*.jpg"))[0]
 
     mock_transport = MockYandexDiskTransport(SYNTHETIC_JPEG_SHA256, SYNTHETIC_JPEG_SIZE)
+    claimed = claim_file_job(db_path, order_id=order_id)
     with patch.object(main.httpx, "get", side_effect=mock_transport.get), \
          patch.object(main.httpx, "put", side_effect=mock_transport.put):
-        claimed = claim_due(db_path)
         main.deliver_job(claimed)
         finish(db_path, claimed["id"])
 
@@ -539,9 +566,9 @@ def test_scenario_c_stale_worker_losing_lease_aborts_without_unlink(staging_env)
     photo_path = list(uploads_dir.glob(f"{order_id}_*.jpg"))[0]
 
     mock_transport = MockYandexDiskTransport(SYNTHETIC_JPEG_SHA256, SYNTHETIC_JPEG_SIZE)
+    claimed = claim_file_job(db_path, order_id=order_id)
     with patch.object(main.httpx, "get", side_effect=mock_transport.get), \
          patch.object(main.httpx, "put", side_effect=mock_transport.put):
-        claimed = claim_due(db_path)
         main.deliver_job(claimed)
         finish(db_path, claimed["id"])
 
@@ -694,6 +721,8 @@ def test_scenario_d_temporary_files_hygiene(staging_env):
     # Create stale incoming files
     stale_file = uploads_dir / ".incoming-stale-upload.tmp"
     stale_file.write_bytes(b"stale chunk")
+    past_ts = time.time() - 10
+    os.utime(stale_file, (past_ts, past_ts))
 
     cleaned = cleanup_orphaned_temporary_files(uploads_dir, db_path, max_age_seconds=0)
     assert cleaned >= 1
