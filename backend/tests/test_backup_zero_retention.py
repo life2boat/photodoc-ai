@@ -2187,16 +2187,13 @@ def test_purge_runbook_post_replacement_failure_triggers_atomic_rollback(tmp_pat
 
     cand_sha = json.loads((archive_dir / ".purge_staging" / "candidate_metadata.json").read_text())["candidate_sha"]
 
-    # Inject failure into post-replacement integrity check by mutating orders.db in active archive
-    # to corrupt expected checksum of pending job:
-    with sqlite3.connect(archive_dir / "orders.db") as conn:
-        conn.execute("UPDATE delivery_jobs SET content_sha256='0000000000000000000000000000000000000000000000000000000000000000' WHERE state='pending'")
-        conn.commit()
+    # Trigger post-replacement verification failure via test hook
+    env = {**os.environ, "RUNBOOK_TEST_FAIL_POST_VERIFY": "1"}
 
     # Run Phase 2 confirmation
-    proc_repl = subprocess.run([bash_bin, str(script_path), "--confirm", cand_sha], cwd=str(foreign_dir), capture_output=True, text=True)
+    proc_repl = subprocess.run([bash_bin, str(script_path), "--confirm", cand_sha], cwd=str(foreign_dir), capture_output=True, text=True, env=env)
     assert proc_repl.returncode != 0
-    assert "CRITICAL: Post-replacement verification failed! Initiating safe atomic rollback..." in proc_repl.stderr
+    assert "CRITICAL: Post-replacement verification or mutation failed! Initiating safe atomic rollback..." in proc_repl.stderr
     assert "ROLLBACK_SUCCESS: Historical archive and manifest safely restored to original baseline" in proc_repl.stderr
 
     # PROVE: Active archive restored byte-for-byte to original!
@@ -2215,21 +2212,14 @@ def test_purge_runbook_post_replacement_failure_triggers_atomic_rollback(tmp_pat
 
 def test_purge_runbook_rollback_failure_reports_recovery_required(tmp_path):
     """
-    R4.4.5 Scenario 15:
-    If rollback cannot be completed safely (e.g. baseline was corrupted during rollback),
-    emits RECOVERY_REQUIRED and preserves all artifacts.
+    R4.4.5 Scenario 15 & R4.4.6:
+    If rollback cannot be completed safely (e.g. restored archive is corrupted),
+    emits RECOVERY_REQUIRED and preserves all artifacts and lock.
     """
     bash_bin = get_bash_executable()
     archive_dir, del_targets = create_synthetic_archive_fixture(tmp_path)
 
     script_content = generate_purge_runbook_script(archive_dir, REPO_DIR, del_targets)
-
-    # In the generated script, simulate corruption during rollback copy
-    target_pattern = 'shutil.copyfile(sys.argv[2], p)'
-    replacement_pattern = 'shutil.copyfile(sys.argv[2], p)\nopen(p, "wb").write(b"CORRUPTED_DURING_ROLLBACK")'
-    assert target_pattern in script_content
-    script_content = script_content.replace(target_pattern, replacement_pattern, 1)
-
     script_path = tmp_path / "runbook_rec_req.sh"
     script_path.write_text(script_content, encoding="utf-8")
 
@@ -2241,12 +2231,583 @@ def test_purge_runbook_rollback_failure_reports_recovery_required(tmp_path):
 
     cand_sha = json.loads((archive_dir / ".purge_staging" / "candidate_metadata.json").read_text())["candidate_sha"]
 
-    # Mutate active orders.db so post-replacement verification fails
-    with sqlite3.connect(archive_dir / "orders.db") as conn:
-        conn.execute("UPDATE delivery_jobs SET content_sha256='0000000000000000000000000000000000000000000000000000000000000000' WHERE state='pending'")
-        conn.commit()
+    # Trigger post-replacement failure AND rollback corruption
+    env = {**os.environ, "RUNBOOK_TEST_FAIL_POST_VERIFY": "1", "RUNBOOK_TEST_CORRUPT_ROLLBACK": "1"}
 
-    proc_repl = subprocess.run([bash_bin, str(script_path), "--confirm", cand_sha], cwd=str(foreign_dir), capture_output=True, text=True)
+    proc_repl = subprocess.run([bash_bin, str(script_path), "--confirm", cand_sha], cwd=str(foreign_dir), capture_output=True, text=True, env=env)
     assert proc_repl.returncode != 0
     assert "RECOVERY_REQUIRED: Manual intervention required" in proc_repl.stderr
     assert (archive_dir / ".purge_staging").is_dir()
+    # Lock is preserved in FAILED state!
+    assert (archive_dir / ".remediation.lock").is_dir()
+
+
+def test_purge_runbook_archive_rename_succeeds_manifest_rename_fails_triggers_rollback(tmp_path):
+    """
+    R4.4.6 Scenario 1 & 2:
+    Archive rename succeeds, but manifest rename fails.
+    Script must trigger recovery rollback, restoring active archive and manifest byte-for-byte.
+    """
+    bash_bin = get_bash_executable()
+    archive_dir, del_targets = create_synthetic_archive_fixture(tmp_path)
+    tar_path = archive_dir / "uploads.tar.gz"
+    db_path = archive_dir / "orders.db"
+    man_path = archive_dir / "manifest.sha256"
+
+    # Pre-create valid manifest
+    subprocess.run([bash_bin, "-c", "sha256sum orders.db uploads.tar.gz > manifest.sha256"], cwd=str(archive_dir), check=True)
+
+    orig_arch_bytes = tar_path.read_bytes()
+    orig_arch_sha = hashlib.sha256(orig_arch_bytes).hexdigest()
+    orig_db_bytes = db_path.read_bytes()
+    orig_db_sha = hashlib.sha256(orig_db_bytes).hexdigest()
+    orig_man_bytes = man_path.read_bytes()
+    orig_man_sha = hashlib.sha256(orig_man_bytes).hexdigest()
+
+    script_content = generate_purge_runbook_script(archive_dir, REPO_DIR, del_targets)
+    script_path = tmp_path / "runbook_man_fail.sh"
+    script_path.write_text(script_content, encoding="utf-8")
+
+    foreign_dir = tmp_path / "foreign_workdir_man_fail"
+    foreign_dir.mkdir()
+
+    proc_prep = subprocess.run([bash_bin, str(script_path), "--prepare"], cwd=str(foreign_dir), capture_output=True, text=True)
+    assert proc_prep.returncode == 0
+
+    cand_sha = json.loads((archive_dir / ".purge_staging" / "candidate_metadata.json").read_text())["candidate_sha"]
+
+    # Inject failure on manifest rename
+    env = {**os.environ, "RUNBOOK_TEST_FAIL_MANIFEST_RENAME": "1"}
+    proc_repl = subprocess.run([bash_bin, str(script_path), "--confirm", cand_sha], cwd=str(foreign_dir), capture_output=True, text=True, env=env)
+    assert proc_repl.returncode != 0
+    assert "Manifest replacement rename failed after archive replacement" in proc_repl.stderr
+    assert "ROLLBACK_SUCCESS: Historical archive and manifest safely restored to original baseline" in proc_repl.stderr
+
+    # PROVE: Active files restored byte-for-byte!
+    assert tar_path.read_bytes() == orig_arch_bytes
+    assert hashlib.sha256(tar_path.read_bytes()).hexdigest() == orig_arch_sha
+    assert man_path.read_bytes() == orig_man_bytes
+    assert hashlib.sha256(man_path.read_bytes()).hexdigest() == orig_man_sha
+    assert db_path.read_bytes() == orig_db_bytes
+    assert hashlib.sha256(db_path.read_bytes()).hexdigest() == orig_db_sha
+
+    # Recovery artifacts preserved
+    assert (archive_dir / ".purge_staging").is_dir()
+
+
+def test_purge_runbook_rollback_when_manifest_absent_restores_absent_state(tmp_path):
+    """
+    R4.4.6 Scenario 3:
+    When original archive has no manifest, rollback after post-mutation failure
+    must remove any newly introduced manifest and verify absence.
+    """
+    bash_bin = get_bash_executable()
+    archive_dir, del_targets = create_synthetic_archive_fixture(tmp_path)
+    tar_path = archive_dir / "uploads.tar.gz"
+    db_path = archive_dir / "orders.db"
+    man_path = archive_dir / "manifest.sha256"
+
+    # Ensure NO manifest exists initially
+    if man_path.exists():
+        man_path.unlink()
+
+    orig_arch_bytes = tar_path.read_bytes()
+    orig_arch_sha = hashlib.sha256(orig_arch_bytes).hexdigest()
+    orig_db_bytes = db_path.read_bytes()
+
+    script_content = generate_purge_runbook_script(archive_dir, REPO_DIR, del_targets)
+    script_path = tmp_path / "runbook_no_man.sh"
+    script_path.write_text(script_content, encoding="utf-8")
+
+    foreign_dir = tmp_path / "foreign_workdir_no_man"
+    foreign_dir.mkdir()
+
+    proc_prep = subprocess.run([bash_bin, str(script_path), "--prepare"], cwd=str(foreign_dir), capture_output=True, text=True)
+    assert proc_prep.returncode == 0
+
+    cand_sha = json.loads((archive_dir / ".purge_staging" / "candidate_metadata.json").read_text())["candidate_sha"]
+
+    # Inject post-replacement verification failure
+    env = {**os.environ, "RUNBOOK_TEST_FAIL_POST_VERIFY": "1"}
+    proc_repl = subprocess.run([bash_bin, str(script_path), "--confirm", cand_sha], cwd=str(foreign_dir), capture_output=True, text=True, env=env)
+    assert proc_repl.returncode != 0
+    assert "ROLLBACK_SUCCESS" in proc_repl.stderr
+
+    # PROVE: Active archive restored byte-for-byte
+    assert tar_path.read_bytes() == orig_arch_bytes
+    assert hashlib.sha256(tar_path.read_bytes()).hexdigest() == orig_arch_sha
+    assert db_path.read_bytes() == orig_db_bytes
+
+    # PROVE: Manifest is completely absent!
+    assert not man_path.exists()
+    assert (archive_dir / ".purge_staging").is_dir()
+
+
+def test_purge_runbook_rollback_when_manifest_existed_restores_exact_bytes_and_sha(tmp_path):
+    """
+    R4.4.6 Scenario 4:
+    When original archive has a manifest, rollback must restore its exact bytes and SHA-256.
+    """
+    bash_bin = get_bash_executable()
+    archive_dir, del_targets = create_synthetic_archive_fixture(tmp_path)
+    tar_path = archive_dir / "uploads.tar.gz"
+    man_path = archive_dir / "manifest.sha256"
+
+    subprocess.run([bash_bin, "-c", "sha256sum orders.db uploads.tar.gz > manifest.sha256"], cwd=str(archive_dir), check=True)
+    orig_man_bytes = man_path.read_bytes()
+    orig_man_sha = hashlib.sha256(orig_man_bytes).hexdigest()
+    orig_arch_bytes = tar_path.read_bytes()
+
+    script_content = generate_purge_runbook_script(archive_dir, REPO_DIR, del_targets)
+    script_path = tmp_path / "runbook_exist_man.sh"
+    script_path.write_text(script_content, encoding="utf-8")
+
+    foreign_dir = tmp_path / "foreign_workdir_exist_man"
+    foreign_dir.mkdir()
+
+    proc_prep = subprocess.run([bash_bin, str(script_path), "--prepare"], cwd=str(foreign_dir), capture_output=True, text=True)
+    assert proc_prep.returncode == 0
+
+    cand_sha = json.loads((archive_dir / ".purge_staging" / "candidate_metadata.json").read_text())["candidate_sha"]
+
+    env = {**os.environ, "RUNBOOK_TEST_FAIL_POST_VERIFY": "1"}
+    proc_repl = subprocess.run([bash_bin, str(script_path), "--confirm", cand_sha], cwd=str(foreign_dir), capture_output=True, text=True, env=env)
+    assert proc_repl.returncode != 0
+    assert "ROLLBACK_SUCCESS" in proc_repl.stderr
+
+    # PROVE: Manifest restored to exact original bytes and checksum
+    assert man_path.exists()
+    assert man_path.read_bytes() == orig_man_bytes
+    assert hashlib.sha256(man_path.read_bytes()).hexdigest() == orig_man_sha
+    assert tar_path.read_bytes() == orig_arch_bytes
+
+
+def test_purge_runbook_active_db_changed_after_prepare_aborts_before_mutation(tmp_path):
+    """
+    R4.4.6 Scenario 5:
+    Active orders.db changes after Phase 1; Phase 2 refuses before mutation.
+    """
+    bash_bin = get_bash_executable()
+    archive_dir, del_targets = create_synthetic_archive_fixture(tmp_path)
+    tar_path = archive_dir / "uploads.tar.gz"
+    orig_bytes = tar_path.read_bytes()
+
+    script_content = generate_purge_runbook_script(archive_dir, REPO_DIR, del_targets)
+    script_path = tmp_path / "runbook_db_guard.sh"
+    script_path.write_text(script_content, encoding="utf-8")
+
+    foreign_dir = tmp_path / "foreign_workdir_db_guard"
+    foreign_dir.mkdir()
+
+    proc_prep = subprocess.run([bash_bin, str(script_path), "--prepare"], cwd=str(foreign_dir), capture_output=True, text=True)
+    assert proc_prep.returncode == 0
+
+    cand_sha = json.loads((archive_dir / ".purge_staging" / "candidate_metadata.json").read_text())["candidate_sha"]
+
+    # Mutate active orders.db
+    with open(archive_dir / "orders.db", "ab") as f:
+        f.write(b"EXTRANEOUS_DATA")
+
+    proc_repl = subprocess.run([bash_bin, str(script_path), "--confirm", cand_sha], cwd=str(foreign_dir), capture_output=True, text=True)
+    assert proc_repl.returncode != 0
+    assert "Original database was modified after preparation; aborting replacement" in proc_repl.stderr
+
+    # Active archive untouched
+    assert tar_path.read_bytes() == orig_bytes
+
+
+def test_purge_runbook_active_manifest_changed_after_prepare_aborts_before_mutation(tmp_path):
+    """
+    R4.4.6 Scenario 6:
+    Active manifest.sha256 changes or is deleted/created after Phase 1; Phase 2 refuses before mutation.
+    """
+    bash_bin = get_bash_executable()
+    archive_dir, del_targets = create_synthetic_archive_fixture(tmp_path)
+    tar_path = archive_dir / "uploads.tar.gz"
+    orig_bytes = tar_path.read_bytes()
+
+    # Pre-create manifest
+    subprocess.run([bash_bin, "-c", "sha256sum orders.db uploads.tar.gz > manifest.sha256"], cwd=str(archive_dir), check=True)
+
+    script_content = generate_purge_runbook_script(archive_dir, REPO_DIR, del_targets)
+    script_path = tmp_path / "runbook_man_guard.sh"
+    script_path.write_text(script_content, encoding="utf-8")
+
+    foreign_dir = tmp_path / "foreign_workdir_man_guard"
+    foreign_dir.mkdir()
+
+    proc_prep = subprocess.run([bash_bin, str(script_path), "--prepare"], cwd=str(foreign_dir), capture_output=True, text=True)
+    assert proc_prep.returncode == 0
+
+    cand_sha = json.loads((archive_dir / ".purge_staging" / "candidate_metadata.json").read_text())["candidate_sha"]
+
+    # Mutate active manifest
+    (archive_dir / "manifest.sha256").write_text("corrupted_manifest_content", encoding="utf-8")
+
+    proc_repl = subprocess.run([bash_bin, str(script_path), "--confirm", cand_sha], cwd=str(foreign_dir), capture_output=True, text=True)
+    assert proc_repl.returncode != 0
+    assert "Active manifest.sha256 was modified after preparation; aborting replacement" in proc_repl.stderr
+
+    # Active archive untouched
+    assert tar_path.read_bytes() == orig_bytes
+
+
+def test_purge_runbook_candidate_database_changes_after_prepare_aborts(tmp_path):
+    """
+    R4.4.6 Scenario 7:
+    Candidate database changes after Phase 1; Phase 2 refuses before mutation.
+    """
+    bash_bin = get_bash_executable()
+    archive_dir, del_targets = create_synthetic_archive_fixture(tmp_path)
+    tar_path = archive_dir / "uploads.tar.gz"
+    orig_bytes = tar_path.read_bytes()
+
+    script_content = generate_purge_runbook_script(archive_dir, REPO_DIR, del_targets)
+    script_path = tmp_path / "runbook_cand_db.sh"
+    script_path.write_text(script_content, encoding="utf-8")
+
+    foreign_dir = tmp_path / "foreign_workdir_cand_db"
+    foreign_dir.mkdir()
+
+    proc_prep = subprocess.run([bash_bin, str(script_path), "--prepare"], cwd=str(foreign_dir), capture_output=True, text=True)
+    assert proc_prep.returncode == 0
+
+    cand_sha = json.loads((archive_dir / ".purge_staging" / "candidate_metadata.json").read_text())["candidate_sha"]
+
+    # Mutate candidate orders.db in staging
+    with open(archive_dir / ".purge_staging" / "candidate" / "orders.db", "ab") as f:
+        f.write(b"CORRUPTED_CANDIDATE_DB")
+
+    proc_repl = subprocess.run([bash_bin, str(script_path), "--confirm", cand_sha], cwd=str(foreign_dir), capture_output=True, text=True)
+    assert proc_repl.returncode != 0
+    assert "Candidate database was modified after preparation; aborting replacement" in proc_repl.stderr
+
+    # Active archive untouched
+    assert tar_path.read_bytes() == orig_bytes
+
+
+def test_purge_runbook_candidate_manifest_changes_after_prepare_aborts(tmp_path):
+    """
+    R4.4.6 Scenario 8:
+    Candidate manifest changes after Phase 1; Phase 2 refuses before mutation.
+    """
+    bash_bin = get_bash_executable()
+    archive_dir, del_targets = create_synthetic_archive_fixture(tmp_path)
+    tar_path = archive_dir / "uploads.tar.gz"
+    orig_bytes = tar_path.read_bytes()
+
+    script_content = generate_purge_runbook_script(archive_dir, REPO_DIR, del_targets)
+    script_path = tmp_path / "runbook_cand_man.sh"
+    script_path.write_text(script_content, encoding="utf-8")
+
+    foreign_dir = tmp_path / "foreign_workdir_cand_man"
+    foreign_dir.mkdir()
+
+    proc_prep = subprocess.run([bash_bin, str(script_path), "--prepare"], cwd=str(foreign_dir), capture_output=True, text=True)
+    assert proc_prep.returncode == 0
+
+    cand_sha = json.loads((archive_dir / ".purge_staging" / "candidate_metadata.json").read_text())["candidate_sha"]
+
+    # Mutate candidate manifest in staging
+    (archive_dir / ".purge_staging" / "candidate" / "manifest.sha256").write_text("corrupted_candidate_manifest", encoding="utf-8")
+
+    proc_repl = subprocess.run([bash_bin, str(script_path), "--confirm", cand_sha], cwd=str(foreign_dir), capture_output=True, text=True)
+    assert proc_repl.returncode != 0
+    assert ("Candidate manifest was modified after preparation; aborting replacement" in proc_repl.stderr or
+            "Candidate manifest verification failed; aborting replacement" in proc_repl.stderr)
+
+    # Active archive untouched
+    assert tar_path.read_bytes() == orig_bytes
+
+
+def test_purge_runbook_sigint_before_commit_preserves_active_files_and_releases_lock(tmp_path):
+    """
+    R4.4.6 Scenario 9:
+    SIGINT before commit point preserves active files and releases lock cleanly.
+    """
+    bash_bin = get_bash_executable()
+    archive_dir, del_targets = create_synthetic_archive_fixture(tmp_path)
+    tar_path = archive_dir / "uploads.tar.gz"
+    orig_bytes = tar_path.read_bytes()
+
+    script_content = generate_purge_runbook_script(archive_dir, REPO_DIR, del_targets)
+    script_path = tmp_path / "runbook_sigint.sh"
+    script_path.write_text(script_content, encoding="utf-8")
+
+    foreign_dir = tmp_path / "foreign_workdir_sigint"
+    foreign_dir.mkdir()
+
+    proc_prep = subprocess.run([bash_bin, str(script_path), "--prepare"], cwd=str(foreign_dir), capture_output=True, text=True)
+    assert proc_prep.returncode == 0
+
+    cand_sha = json.loads((archive_dir / ".purge_staging" / "candidate_metadata.json").read_text())["candidate_sha"]
+
+    sync_file = tmp_path / "sync_sigint.tmp"
+    env = {**os.environ, "RUNBOOK_TEST_SYNC_FILE": str(sync_file.as_posix())}
+
+    log_path = tmp_path / "sigint_proc.log"
+    with open(log_path, "w", encoding="utf-8") as log_f:
+        proc = subprocess.Popen([bash_bin, str(script_path), "--confirm", cand_sha], cwd=str(foreign_dir), env=env, stdout=log_f, stderr=log_f)
+
+        # Wait for sync file
+        import time
+        for _ in range(150):
+            if sync_file.exists() or proc.poll() is not None:
+                break
+            time.sleep(0.1)
+        assert sync_file.exists(), f"Process exited early or timed out: rc={proc.returncode}, log={log_path.read_text() if log_path.exists() else ''}"
+
+        # Read bash PID from lock file
+        pid_file = archive_dir / ".remediation.lock" / "pid"
+        assert pid_file.exists()
+        bash_pid = pid_file.read_text(encoding="utf-8").strip()
+
+        # Send INT signal to bash process
+        subprocess.run([bash_bin, "-c", f"kill -INT {bash_pid}"])
+        if sync_file.exists():
+            try:
+                sync_file.unlink()
+            except Exception:
+                pass
+
+        proc.wait(timeout=10)
+
+    log_content = log_path.read_text(encoding="utf-8", errors="replace")
+    assert proc.returncode != 0
+    assert "Received signal INT" in log_content
+
+    # Active files untouched!
+    assert tar_path.read_bytes() == orig_bytes
+    # Lock cleanly released!
+    assert not (archive_dir / ".remediation.lock").exists()
+
+
+def test_purge_runbook_sigterm_before_commit_preserves_active_files_and_releases_lock(tmp_path):
+    """
+    R4.4.6 Scenario 10:
+    SIGTERM before commit point preserves active files and releases lock cleanly.
+    """
+    bash_bin = get_bash_executable()
+    archive_dir, del_targets = create_synthetic_archive_fixture(tmp_path)
+    tar_path = archive_dir / "uploads.tar.gz"
+    orig_bytes = tar_path.read_bytes()
+
+    script_content = generate_purge_runbook_script(archive_dir, REPO_DIR, del_targets)
+    script_path = tmp_path / "runbook_sigterm.sh"
+    script_path.write_text(script_content, encoding="utf-8")
+
+    foreign_dir = tmp_path / "foreign_workdir_sigterm"
+    foreign_dir.mkdir()
+
+    proc_prep = subprocess.run([bash_bin, str(script_path), "--prepare"], cwd=str(foreign_dir), capture_output=True, text=True)
+    assert proc_prep.returncode == 0
+
+    cand_sha = json.loads((archive_dir / ".purge_staging" / "candidate_metadata.json").read_text())["candidate_sha"]
+
+    sync_file = tmp_path / "sync_sigterm.tmp"
+    env = {**os.environ, "RUNBOOK_TEST_SYNC_FILE": str(sync_file.as_posix())}
+
+    log_path = tmp_path / "sigterm_proc.log"
+    with open(log_path, "w", encoding="utf-8") as log_f:
+        proc = subprocess.Popen([bash_bin, str(script_path), "--confirm", cand_sha], cwd=str(foreign_dir), env=env, stdout=log_f, stderr=log_f)
+
+        # Wait for sync file
+        import time
+        for _ in range(150):
+            if sync_file.exists() or proc.poll() is not None:
+                break
+            time.sleep(0.1)
+        assert sync_file.exists(), f"Process exited early or timed out: rc={proc.returncode}, log={log_path.read_text() if log_path.exists() else ''}"
+
+        # Read bash PID from lock file
+        pid_file = archive_dir / ".remediation.lock" / "pid"
+        assert pid_file.exists()
+        bash_pid = pid_file.read_text(encoding="utf-8").strip()
+
+        # Send TERM signal to bash process
+        subprocess.run([bash_bin, "-c", f"kill -TERM {bash_pid}"])
+        if sync_file.exists():
+            try:
+                sync_file.unlink()
+            except Exception:
+                pass
+
+        proc.wait(timeout=10)
+
+    log_content = log_path.read_text(encoding="utf-8", errors="replace")
+    assert proc.returncode != 0
+    assert "Received signal TERM" in log_content
+
+    # Active files untouched!
+    assert tar_path.read_bytes() == orig_bytes
+    # Lock cleanly released!
+    assert not (archive_dir / ".remediation.lock").exists()
+
+
+def test_purge_runbook_simulated_failure_after_first_commit_invokes_recovery(tmp_path):
+    """
+    R4.4.6 Scenario 11:
+    A failure after the first commit mutation invokes recovery rather than bypassing it.
+    """
+    bash_bin = get_bash_executable()
+    archive_dir, del_targets = create_synthetic_archive_fixture(tmp_path)
+    tar_path = archive_dir / "uploads.tar.gz"
+    orig_bytes = tar_path.read_bytes()
+
+    script_content = generate_purge_runbook_script(archive_dir, REPO_DIR, del_targets)
+    script_path = tmp_path / "runbook_first_commit.sh"
+    script_path.write_text(script_content, encoding="utf-8")
+
+    foreign_dir = tmp_path / "foreign_workdir_first_commit"
+    foreign_dir.mkdir()
+
+    proc_prep = subprocess.run([bash_bin, str(script_path), "--prepare"], cwd=str(foreign_dir), capture_output=True, text=True)
+    assert proc_prep.returncode == 0
+
+    cand_sha = json.loads((archive_dir / ".purge_staging" / "candidate_metadata.json").read_text())["candidate_sha"]
+
+    # Fails immediately after archive replacement
+    env = {**os.environ, "RUNBOOK_TEST_FAIL_MANIFEST_RENAME": "1"}
+    proc_repl = subprocess.run([bash_bin, str(script_path), "--confirm", cand_sha], cwd=str(foreign_dir), capture_output=True, text=True, env=env)
+    assert proc_repl.returncode != 0
+    assert "CRITICAL: Post-replacement verification or mutation failed! Initiating safe atomic rollback..." in proc_repl.stderr
+    assert "ROLLBACK_SUCCESS" in proc_repl.stderr
+    assert tar_path.read_bytes() == orig_bytes
+
+
+def test_purge_runbook_successful_transaction_verifies_final_state(tmp_path):
+    """
+    R4.4.6 Scenario 13:
+    A successful transaction verifies final archive, manifest, and database state,
+    and cleans up staging, journal, and lock.
+    """
+    bash_bin = get_bash_executable()
+    archive_dir, del_targets = create_synthetic_archive_fixture(tmp_path)
+    tar_path = archive_dir / "uploads.tar.gz"
+    orig_bytes = tar_path.read_bytes()
+
+    # Pre-create manifest
+    subprocess.run([bash_bin, "-c", "sha256sum orders.db uploads.tar.gz > manifest.sha256"], cwd=str(archive_dir), check=True)
+
+    script_content = generate_purge_runbook_script(archive_dir, REPO_DIR, del_targets)
+    script_path = tmp_path / "runbook_success.sh"
+    script_path.write_text(script_content, encoding="utf-8")
+
+    foreign_dir = tmp_path / "foreign_workdir_success"
+    foreign_dir.mkdir()
+
+    # Phase 1
+    proc_prep = subprocess.run([bash_bin, str(script_path), "--prepare"], cwd=str(foreign_dir), capture_output=True, text=True)
+    assert proc_prep.returncode == 0
+
+    cand_sha = json.loads((archive_dir / ".purge_staging" / "candidate_metadata.json").read_text())["candidate_sha"]
+
+    # Phase 2
+    proc_repl = subprocess.run([bash_bin, str(script_path), "--confirm", cand_sha], cwd=str(foreign_dir), capture_output=True, text=True)
+    assert proc_repl.returncode == 0
+    assert "OWNER-AUTHORIZED REPLACEMENT COMPLETED SUCCESSFULLY" in proc_repl.stdout
+
+    # Verify active files
+    assert tar_path.read_bytes() != orig_bytes
+    assert hashlib.sha256(tar_path.read_bytes()).hexdigest() == cand_sha
+
+    # Verify active manifest verifies against active files
+    proc_chk = subprocess.run([bash_bin, "-c", "sha256sum -c manifest.sha256"], cwd=str(archive_dir), capture_output=True, text=True)
+    assert proc_chk.returncode == 0
+
+    # Cleaned up
+    assert not (archive_dir / ".purge_staging").exists()
+    assert not (archive_dir / ".remediation.lock").exists()
+    assert not (archive_dir / ".transaction_journal.json").exists()
+
+
+def test_purge_runbook_no_manifest_and_existing_manifest_full_lifecycle(tmp_path):
+    """
+    R4.4.6 Scenario 14:
+    Verifies full success lifecycle for both no-manifest and existing-manifest cases.
+    """
+    bash_bin = get_bash_executable()
+
+    # Case A: No manifest initially
+    dir_a = tmp_path / "case_a"
+    dir_a.mkdir()
+    arch_a, targets_a = create_synthetic_archive_fixture(dir_a)
+    script_a = generate_purge_runbook_script(arch_a, REPO_DIR, targets_a)
+    path_a = dir_a / "runbook_a.sh"
+    path_a.write_text(script_a, encoding="utf-8")
+
+    subprocess.run([bash_bin, str(path_a), "--prepare"], cwd=str(dir_a), check=True)
+    cand_a_sha = json.loads((arch_a / ".purge_staging" / "candidate_metadata.json").read_text())["candidate_sha"]
+    subprocess.run([bash_bin, str(path_a), "--confirm", cand_a_sha], cwd=str(dir_a), check=True)
+    # Manifest now exists and is valid
+    assert (arch_a / "manifest.sha256").is_file()
+    assert subprocess.run([bash_bin, "-c", "sha256sum -c manifest.sha256"], cwd=str(arch_a)).returncode == 0
+
+    # Case B: Manifest exists initially
+    dir_b = tmp_path / "case_b"
+    dir_b.mkdir()
+    arch_b, targets_b = create_synthetic_archive_fixture(dir_b)
+    subprocess.run([bash_bin, "-c", "sha256sum orders.db uploads.tar.gz > manifest.sha256"], cwd=str(arch_b), check=True)
+    script_b = generate_purge_runbook_script(arch_b, REPO_DIR, targets_b)
+    path_b = dir_b / "runbook_b.sh"
+    path_b.write_text(script_b, encoding="utf-8")
+
+    subprocess.run([bash_bin, str(path_b), "--prepare"], cwd=str(dir_b), check=True)
+    cand_b_sha = json.loads((arch_b / ".purge_staging" / "candidate_metadata.json").read_text())["candidate_sha"]
+    subprocess.run([bash_bin, str(path_b), "--confirm", cand_b_sha], cwd=str(dir_b), check=True)
+    assert (arch_b / "manifest.sha256").is_file()
+    assert subprocess.run([bash_bin, "-c", "sha256sum -c manifest.sha256"], cwd=str(arch_b)).returncode == 0
+
+
+def test_purge_runbook_injected_mv_wrapper_manifest_rename_failure(tmp_path):
+    """
+    R4.4.6:
+    Uses an injected wrapper executable for MV_BIN that fails specifically
+    when renaming to manifest.sha256, proving real subprocess executable injection!
+    """
+    bash_bin = get_bash_executable()
+    archive_dir, del_targets = create_synthetic_archive_fixture(tmp_path)
+    tar_path = archive_dir / "uploads.tar.gz"
+    orig_bytes = tar_path.read_bytes()
+
+    # Pre-create manifest
+    subprocess.run([bash_bin, "-c", "sha256sum orders.db uploads.tar.gz > manifest.sha256"], cwd=str(archive_dir), check=True)
+
+    script_content = generate_purge_runbook_script(archive_dir, REPO_DIR, del_targets)
+    script_path = tmp_path / "runbook_wrapper.sh"
+    script_path.write_text(script_content, encoding="utf-8")
+
+    foreign_dir = tmp_path / "foreign_workdir_wrapper"
+    foreign_dir.mkdir()
+
+    # Create injected mv wrapper script
+    # It fails only once when second argument ends with manifest.sha256 and trigger file exists
+    trigger_file = tmp_path / "FAIL_TRIGGER"
+    trigger_file.touch()
+
+    wrapper_path = tmp_path / "injected_mv.sh"
+    wrapper_content = f"""#!/usr/bin/env bash
+TARGET="$2"
+if echo "${{TARGET}}" | grep -q "manifest.sha256" && [ -f "{trigger_file.as_posix()}" ]; then
+    rm -f "{trigger_file.as_posix()}"
+    echo "INJECTED_MV: Simulating manifest rename failure" >&2
+    exit 1
+fi
+exec mv "$@"
+"""
+    wrapper_path.write_text(wrapper_content, encoding="utf-8")
+
+    proc_prep = subprocess.run([bash_bin, str(script_path), "--prepare"], cwd=str(foreign_dir), capture_output=True, text=True)
+    assert proc_prep.returncode == 0
+
+    cand_sha = json.loads((archive_dir / ".purge_staging" / "candidate_metadata.json").read_text())["candidate_sha"]
+
+    # Run with MV_BIN set to our wrapper
+    env = {**os.environ, "MV_BIN": f"bash {wrapper_path.as_posix()}"}
+    proc_repl = subprocess.run([bash_bin, str(script_path), "--confirm", cand_sha], cwd=str(foreign_dir), capture_output=True, text=True, env=env)
+    assert proc_repl.returncode != 0
+    assert "INJECTED_MV: Simulating manifest rename failure" in proc_repl.stderr
+    assert "ROLLBACK_SUCCESS" in proc_repl.stderr
+
+    # Archive and manifest safely restored!
+    assert tar_path.read_bytes() == orig_bytes

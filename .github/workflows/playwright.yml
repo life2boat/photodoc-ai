@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [ main, master, fix/p1-order-delivery-hardening, feat/p1-auto-photo-cleanup, infra/r4-prebuilt-staging-images, infra/r4-safe-staging-bootstrap, audit/r4-integrated-privacy-retention, fix/r4-backup-privacy-audit, fix/r4-archive-audit-hardening, fix/r4-audit-boundary-hardening, fix/r4-owner-authorized-archive-replacement, fix/r4-transaction-safe-archive-replacement ]
+    branches: [ main, master, fix/p1-order-delivery-hardening, feat/p1-auto-photo-cleanup, infra/r4-prebuilt-staging-images, infra/r4-safe-staging-bootstrap, audit/r4-integrated-privacy-retention, fix/r4-backup-privacy-audit, fix/r4-archive-audit-hardening, fix/r4-audit-boundary-hardening, fix/r4-owner-authorized-archive-replacement, fix/r4-transaction-safe-archive-replacement, fix/r4-commit-failure-recovery ]
   pull_request:
-    branches: [ main, master, fix/p0-production-readiness, infra/r2-public-https-preflight, feat/p1-auto-photo-cleanup, infra/r4-prebuilt-staging-images, infra/r4-safe-staging-bootstrap, audit/r4-integrated-privacy-retention, fix/r4-backup-privacy-audit, fix/r4-archive-audit-hardening, fix/r4-audit-boundary-hardening, fix/r4-owner-authorized-archive-replacement, fix/r4-transaction-safe-archive-replacement ]
+    branches: [ main, master, fix/p0-production-readiness, infra/r2-public-https-preflight, feat/p1-auto-photo-cleanup, infra/r4-prebuilt-staging-images, infra/r4-safe-staging-bootstrap, audit/r4-integrated-privacy-retention, fix/r4-backup-privacy-audit, fix/r4-archive-audit-hardening, fix/r4-audit-boundary-hardening, fix/r4-owner-authorized-archive-replacement, fix/r4-transaction-safe-archive-replacement, fix/r4-commit-failure-recovery ]
   workflow_dispatch:
 
 jobs:

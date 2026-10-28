@@ -759,11 +759,11 @@ def generate_purge_runbook_script(
     """
     Authoritative generator of the transaction-safe two-phase owner-controlled remediation runbook script.
     - Phase 1 (--prepare): Prepares and validates candidate; verifies original archive immutability;
-      preserves race-safe pre-purge baseline. Never modifies historical archives. Fails closed if staging exists.
+      preserves race-safe pre-purge baseline and metadata. Never modifies historical archives. Fails closed if staging exists.
     - Phase 2 (--confirm <CANDIDATE_SHA> | --replace-authorized <CANDIDATE_SHA>):
       Exclusive transaction-locked, atomic replacement of archive and manifest. Fails closed if confirmation
       is missing/mismatched or verification fails. Automatically rolls back to pre-purge baseline if post-replacement
-      verification fails, preserving all recovery artifacts.
+      verification fails or manifest rename fails, preserving all recovery artifacts.
     """
     p_arch = Path(archive_dir)
     if p_arch.is_symlink() or os.path.islink(str(p_arch)):
@@ -802,7 +802,13 @@ STAGING_DIR="${{ARCHIVE_DIR}}/.purge_staging"
 REBUILD_DIR="${{STAGING_DIR}}/rebuild"
 CANDIDATE_DIR="${{STAGING_DIR}}/candidate"
 META_FILE="${{STAGING_DIR}}/candidate_metadata.json"
+JOURNAL_FILE="${{ARCHIVE_DIR}}/.transaction_journal.json"
 LOCK_DIR="${{ARCHIVE_DIR}}/.remediation.lock"
+MV_BIN="${{MV_BIN:-mv}}"
+TRANSACTION_PHASE="INITIALIZING"
+INTERRUPTED=0
+TMP_ARCHIVE=""
+TMP_MANIFEST=""
 
 # Detect Python interpreter
 if command -v python3 >/dev/null 2>&1 && python3 -c 'import sys' 2>/dev/null; then
@@ -814,6 +820,8 @@ else
     exit 1
 fi
 
+LOCK_ACQUIRED=0
+
 acquire_lock() {{
     if [ -L "${{LOCK_DIR}}" ]; then
         echo "ERROR: Lock path is a symbolic link: ${{LOCK_DIR}}" >&2
@@ -824,12 +832,248 @@ acquire_lock() {{
         exit 1
     fi
     echo "$$" > "${{LOCK_DIR}}/pid"
-    trap release_lock EXIT INT TERM
+    LOCK_ACQUIRED=1
 }}
 
 release_lock() {{
-    rm -rf "${{LOCK_DIR}}" 2>/dev/null || true
+    if [ "${{LOCK_ACQUIRED:-0}}" = "1" ]; then
+        rm -rf "${{LOCK_DIR}}" 2>/dev/null || true
+        LOCK_ACQUIRED=0
+    fi
 }}
+
+update_journal() {{
+    local phase="$1"
+    local err_msg="${{2:-}}"
+    "${{PYTHON_BIN}}" -c '
+import json, sys, os
+from datetime import datetime, timezone
+
+journal_path = sys.argv[1]
+phase = sys.argv[2]
+err_msg = sys.argv[3] if len(sys.argv) > 3 and sys.argv[3] else None
+
+data = {{}}
+if os.path.exists(journal_path):
+    try:
+        with open(journal_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        pass
+
+data["phase"] = phase
+data["updated_at"] = datetime.now(timezone.utc).isoformat()
+data["pid"] = os.getpid()
+if err_msg:
+    data["last_error"] = err_msg
+
+tmp_path = journal_path + ".tmp"
+with open(tmp_path, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2)
+os.replace(tmp_path, journal_path)
+' "${{JOURNAL_FILE}}" "${{phase}}" "${{err_msg}}" 2>/dev/null || true
+}}
+
+init_journal() {{
+    "${{PYTHON_BIN}}" -c '
+import json, sys, os
+from datetime import datetime, timezone
+
+journal_path = sys.argv[1]
+data = {{
+    "archive_dir": sys.argv[2],
+    "phase": "PRE_COMMIT",
+    "started_at": datetime.now(timezone.utc).isoformat(),
+    "pid": int(sys.argv[3]),
+    "orig_archive_sha": sys.argv[4],
+    "orig_db_sha": sys.argv[5],
+    "had_manifest": sys.argv[6] == "true",
+    "orig_manifest_sha": sys.argv[7] if sys.argv[7] != "" else None,
+    "candidate_archive_sha": sys.argv[8],
+    "candidate_db_sha": sys.argv[9],
+    "candidate_manifest_sha": sys.argv[10],
+    "last_error": None
+}}
+tmp_path = journal_path + ".tmp"
+with open(tmp_path, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2)
+os.replace(tmp_path, journal_path)
+' "${{JOURNAL_FILE}}" "${{ARCHIVE_DIR}}" "$$" \
+  "${{EXPECTED_ORIG_ARCH_SHA}}" "${{EXPECTED_ORIG_DB_SHA}}" \
+  "${{HAD_MANIFEST}}" "${{EXPECTED_ORIG_MAN_SHA}}" \
+  "${{ACTUAL_CAND_SHA}}" "${{EXPECTED_CAND_DB_SHA}}" "${{EXPECTED_CAND_MAN_SHA}}"
+}}
+
+execute_rollback() {{
+    TRANSACTION_PHASE="ROLLING_BACK"
+    update_journal "ROLLING_BACK"
+    echo "CRITICAL: Post-replacement verification or mutation failed! Initiating safe atomic rollback..." >&2
+
+    # 1. Check if baseline exists
+    if [ ! -f "${{ARCHIVE_DIR}}/uploads.tar.gz.pre-purge" ]; then
+        TRANSACTION_PHASE="FAILED"
+        update_journal "FAILED" "Preserved baseline uploads.tar.gz.pre-purge is missing"
+        echo "RECOVERY_REQUIRED: Manual intervention required! uploads.tar.gz.pre-purge missing" >&2
+        return 1
+    fi
+
+    # 2. Restore archive from pre-purge baseline using exclusive open fd & fsync
+    local rollback_arch
+    rollback_arch=$("${{PYTHON_BIN}}" -c '
+import sys, tempfile, shutil, os, pathlib
+
+arch_dir = sys.argv[1]
+pre_purge = sys.argv[2]
+
+with tempfile.NamedTemporaryFile(dir=arch_dir, prefix=".uploads.rollback_", delete=False) as tf:
+    p = tf.name
+    try:
+        os.chmod(tf.fileno(), 0o600)
+    except Exception:
+        pass
+    with open(pre_purge, "rb") as src:
+        shutil.copyfileobj(src, tf)
+    tf.flush()
+    os.fsync(tf.fileno())
+
+if os.path.islink(p):
+    os.unlink(p)
+    sys.exit(1)
+
+print(pathlib.Path(p).as_posix())
+' "${{ARCHIVE_DIR}}" "${{ARCHIVE_DIR}}/uploads.tar.gz.pre-purge")
+
+    $MV_BIN "${{rollback_arch}}" "${{ARCHIVE_DIR}}/uploads.tar.gz"
+
+    # 3. Restore or remove manifest based on HAD_MANIFEST
+    if [ "${{HAD_MANIFEST}}" = "true" ]; then
+        if [ ! -f "${{ARCHIVE_DIR}}/manifest.sha256.pre-purge" ]; then
+            TRANSACTION_PHASE="FAILED"
+            update_journal "FAILED" "manifest.sha256.pre-purge missing during rollback"
+            echo "RECOVERY_REQUIRED: Manual intervention required! manifest.sha256.pre-purge missing" >&2
+            return 1
+        fi
+
+        local rollback_man
+        rollback_man=$("${{PYTHON_BIN}}" -c '
+import sys, tempfile, shutil, os, pathlib
+
+arch_dir = sys.argv[1]
+pre_purge = sys.argv[2]
+
+with tempfile.NamedTemporaryFile(dir=arch_dir, prefix=".manifest.rollback_", delete=False) as tf:
+    p = tf.name
+    try:
+        os.chmod(tf.fileno(), 0o600)
+    except Exception:
+        pass
+    with open(pre_purge, "rb") as src:
+        shutil.copyfileobj(src, tf)
+    tf.flush()
+    os.fsync(tf.fileno())
+
+if os.path.islink(p):
+    os.unlink(p)
+    sys.exit(1)
+
+print(pathlib.Path(p).as_posix())
+' "${{ARCHIVE_DIR}}" "${{ARCHIVE_DIR}}/manifest.sha256.pre-purge")
+
+        $MV_BIN "${{rollback_man}}" "${{ARCHIVE_DIR}}/manifest.sha256"
+    else
+        # Manifest was absent originally: ensure any newly created manifest is removed
+        rm -f "${{ARCHIVE_DIR}}/manifest.sha256"
+    fi
+
+    # Simulated rollback corruption hook for tests
+    if [ "${{RUNBOOK_TEST_CORRUPT_ROLLBACK:-0}}" = "1" ]; then
+        echo "CORRUPTED_DURING_TEST" > "${{ARCHIVE_DIR}}/uploads.tar.gz"
+    fi
+
+    # 4. Verify restored archive checksum against expected original
+    local rollback_check_arch_sha
+    rollback_check_arch_sha=$(sha256sum "${{ARCHIVE_DIR}}/uploads.tar.gz" | awk '{{print $1}}')
+    if [ "${{rollback_check_arch_sha}}" != "${{EXPECTED_ORIG_ARCH_SHA}}" ]; then
+        TRANSACTION_PHASE="FAILED"
+        update_journal "FAILED" "Restored archive checksum mismatch"
+        echo "RECOVERY_REQUIRED: Manual intervention required! Restored archive checksum (${{rollback_check_arch_sha}}) does not match expected (${{EXPECTED_ORIG_ARCH_SHA}})" >&2
+        echo "Pre-purge baseline remains preserved at ${{ARCHIVE_DIR}}/uploads.tar.gz.pre-purge" >&2
+        return 1
+    fi
+
+    # 5. Verify restored manifest state
+    if [ "${{HAD_MANIFEST}}" = "true" ]; then
+        local rollback_check_man_sha
+        rollback_check_man_sha=$(sha256sum "${{ARCHIVE_DIR}}/manifest.sha256" | awk '{{print $1}}')
+        if [ "${{rollback_check_man_sha}}" != "${{EXPECTED_ORIG_MAN_SHA}}" ]; then
+            TRANSACTION_PHASE="FAILED"
+            update_journal "FAILED" "Restored manifest checksum mismatch"
+            echo "RECOVERY_REQUIRED: Manual intervention required! Restored manifest checksum (${{rollback_check_man_sha}}) does not match expected (${{EXPECTED_ORIG_MAN_SHA}})" >&2
+            echo "Pre-purge baseline remains preserved at ${{ARCHIVE_DIR}}/manifest.sha256.pre-purge" >&2
+            return 1
+        fi
+    else
+        if [ -e "${{ARCHIVE_DIR}}/manifest.sha256" ]; then
+            TRANSACTION_PHASE="FAILED"
+            update_journal "FAILED" "Manifest file still present after rollback when originally absent"
+            echo "RECOVERY_REQUIRED: Manual intervention required! Manifest file still present after rollback although originally absent" >&2
+            return 1
+        fi
+    fi
+
+    # Rollback verified successfully!
+    TRANSACTION_PHASE="ROLLED_BACK"
+    update_journal "ROLLED_BACK"
+    echo "ROLLBACK_SUCCESS: Historical archive and manifest safely restored to original baseline (${{EXPECTED_ORIG_ARCH_SHA}})" >&2
+    echo "Recovery artifacts and candidate files preserved in ${{STAGING_DIR}} for diagnostics" >&2
+    return 0
+}}
+
+on_signal() {{
+    local sig="$1"
+    INTERRUPTED=1
+    echo "ERROR: Received signal ${{sig}}; transaction interrupted" >&2
+    if [ "${{sig}}" = "INT" ]; then
+        exit 130
+    elif [ "${{sig}}" = "TERM" ]; then
+        exit 143
+    else
+        exit 1
+    fi
+}}
+
+on_exit() {{
+    local exit_code=$?
+    trap - EXIT INT TERM
+
+    # If failure/interrupt occurred after any mutation started
+    if [ "${{TRANSACTION_PHASE}}" = "ARCHIVE_MUTATED" ] || [ "${{TRANSACTION_PHASE}}" = "MANIFEST_MUTATING" ] || [ "${{TRANSACTION_PHASE}}" = "MANIFEST_MUTATED" ] || [ "${{TRANSACTION_PHASE}}" = "VERIFYING" ]; then
+        echo "CRITICAL: Transaction aborted or failed during/after mutation (phase: ${{TRANSACTION_PHASE}}, exit: ${{exit_code}}). Invoking recovery..." >&2
+        execute_rollback || true
+    fi
+
+    # Clean up temporary replacement files if left over
+    if [ -n "${{TMP_ARCHIVE:-}}" ] && [ -f "${{TMP_ARCHIVE}}" ]; then
+        rm -f "${{TMP_ARCHIVE}}" 2>/dev/null || true
+    fi
+    if [ -n "${{TMP_MANIFEST:-}}" ] && [ -f "${{TMP_MANIFEST}}" ]; then
+        rm -f "${{TMP_MANIFEST}}" 2>/dev/null || true
+    fi
+
+    # If transaction is in FAILED state (RECOVERY_REQUIRED), preserve lock!
+    if [ "${{TRANSACTION_PHASE}}" = "FAILED" ]; then
+        echo "CRITICAL: Transaction in FAILED state. Lock ${{LOCK_DIR}} and recovery artifacts preserved for manual recovery." >&2
+        exit "${{exit_code:-1}}"
+    fi
+
+    # For PRE_COMMIT, ROLLED_BACK, or COMMITTED, release lock
+    release_lock
+    exit "${{exit_code}}"
+}}
+
+trap 'on_signal INT' INT
+trap 'on_signal TERM' TERM
+trap on_exit EXIT
 
 validate_paths() {{
     if [ -L "${{ARCHIVE_DIR}}" ]; then
@@ -882,8 +1126,9 @@ case "${{ACTION}}" in
             exit 1
         fi
 
-        # Calculate original archive checksum
-        ORIG_SHA=$(sha256sum "${{ARCHIVE_DIR}}/uploads.tar.gz" | awk '{{print $1}}')
+        # Calculate original archive & database checksums
+        ORIG_ARCH_SHA=$(sha256sum "${{ARCHIVE_DIR}}/uploads.tar.gz" | awk '{{print $1}}')
+        ORIG_DB_SHA=$(sha256sum "${{ARCHIVE_DIR}}/orders.db" | awk '{{print $1}}')
 
         # Race-safe atomic exclusive creation of uploads.tar.gz.pre-purge baseline
         "${{PYTHON_BIN}}" -c '
@@ -900,13 +1145,14 @@ except FileExistsError:
 
         # Verify preserved archive baseline matches recorded original checksum
         PRE_PURGE_SHA=$(sha256sum "${{ARCHIVE_DIR}}/uploads.tar.gz.pre-purge" | awk '{{print $1}}')
-        if [ "${{PRE_PURGE_SHA}}" != "${{ORIG_SHA}}" ]; then
-            echo "ERROR: Preserved baseline SHA-256 (${{PRE_PURGE_SHA}}) does not match original (${{ORIG_SHA}})" >&2
+        if [ "${{PRE_PURGE_SHA}}" != "${{ORIG_ARCH_SHA}}" ]; then
+            echo "ERROR: Preserved baseline SHA-256 (${{PRE_PURGE_SHA}}) does not match original (${{ORIG_ARCH_SHA}})" >&2
             exit 1
         fi
 
         # Preserve and verify original manifest if present
         HAS_MANIFEST="false"
+        ORIG_MAN_SHA=""
         if [ -f "${{ARCHIVE_DIR}}/manifest.sha256" ]; then
             if ! (cd "${{ARCHIVE_DIR}}" && sha256sum -c manifest.sha256 >/dev/null 2>&1); then
                 echo "ERROR: Existing manifest.sha256 failed checksum verification; aborting" >&2
@@ -927,6 +1173,12 @@ except FileExistsError:
     print("ERROR: manifest.sha256.pre-purge already exists", file=sys.stderr)
     sys.exit(1)
 ' "${{ARCHIVE_DIR}}/manifest.sha256" "${{ARCHIVE_DIR}}/manifest.sha256.pre-purge"
+            ORIG_MAN_SHA=$(sha256sum "${{ARCHIVE_DIR}}/manifest.sha256" | awk '{{print $1}}')
+            PRE_PURGE_MAN_SHA=$(sha256sum "${{ARCHIVE_DIR}}/manifest.sha256.pre-purge" | awk '{{print $1}}')
+            if [ "${{PRE_PURGE_MAN_SHA}}" != "${{ORIG_MAN_SHA}}" ]; then
+                echo "ERROR: Preserved manifest baseline does not match original; aborting" >&2
+                exit 1
+            fi
             HAS_MANIFEST="true"
         fi
 
@@ -945,10 +1197,12 @@ except FileExistsError:
         tar --force-local --numeric-owner -czf "${{CANDIDATE_DIR}}/uploads.tar.gz" -C "${{REBUILD_DIR}}" uploads
         tar --force-local -ztvf "${{CANDIDATE_DIR}}/uploads.tar.gz" >/dev/null
 
-        # Candidate manifest & checksum
+        # Candidate manifest & checksums
         (cd "${{CANDIDATE_DIR}}" && sha256sum orders.db uploads.tar.gz > manifest.sha256)
         (cd "${{CANDIDATE_DIR}}" && sha256sum -c manifest.sha256 >/dev/null)
-        CANDIDATE_SHA=$(sha256sum "${{CANDIDATE_DIR}}/uploads.tar.gz" | awk '{{print $1}}')
+        CANDIDATE_ARCH_SHA=$(sha256sum "${{CANDIDATE_DIR}}/uploads.tar.gz" | awk '{{print $1}}')
+        CANDIDATE_DB_SHA=$(sha256sum "${{CANDIDATE_DIR}}/orders.db" | awk '{{print $1}}')
+        CANDIDATE_MAN_SHA=$(sha256sum "${{CANDIDATE_DIR}}/manifest.sha256" | awk '{{print $1}}')
 
         # Run verification CLIs
         echo "Running backup integrity verifier on candidate..."
@@ -956,14 +1210,27 @@ except FileExistsError:
         echo "Running privacy risk auditor on candidate..."
         "${{PYTHON_BIN}}" "${{REPO_ROOT}}/scripts/audit_backup_archives.py" --archive-dir "${{CANDIDATE_DIR}}"
 
-        # Guard original archive immutability during preparation
-        CHECK_ORIG_SHA=$(sha256sum "${{ARCHIVE_DIR}}/uploads.tar.gz" | awk '{{print $1}}')
-        if [ "${{CHECK_ORIG_SHA}}" != "${{ORIG_SHA}}" ]; then
+        # Guard original archive & database immutability during preparation
+        CHECK_ORIG_ARCH_SHA=$(sha256sum "${{ARCHIVE_DIR}}/uploads.tar.gz" | awk '{{print $1}}')
+        if [ "${{CHECK_ORIG_ARCH_SHA}}" != "${{ORIG_ARCH_SHA}}" ]; then
             echo "ERROR: Original archive was modified during preparation; aborting" >&2
             exit 1
         fi
+        CHECK_ORIG_DB_SHA=$(sha256sum "${{ARCHIVE_DIR}}/orders.db" | awk '{{print $1}}')
+        if [ "${{CHECK_ORIG_DB_SHA}}" != "${{ORIG_DB_SHA}}" ]; then
+            echo "ERROR: Original database was modified during preparation; aborting" >&2
+            exit 1
+        fi
+        if [ "${{HAS_MANIFEST}}" = "true" ]; then
+            CHECK_ORIG_MAN_SHA=$(sha256sum "${{ARCHIVE_DIR}}/manifest.sha256" | awk '{{print $1}}')
+            if [ "${{CHECK_ORIG_MAN_SHA}}" != "${{ORIG_MAN_SHA}}" ]; then
+                echo "ERROR: Original manifest was modified during preparation; aborting" >&2
+                exit 1
+            fi
+        fi
+
         CHECK_PRE_PURGE_SHA=$(sha256sum "${{ARCHIVE_DIR}}/uploads.tar.gz.pre-purge" | awk '{{print $1}}')
-        if [ "${{CHECK_PRE_PURGE_SHA}}" != "${{ORIG_SHA}}" ]; then
+        if [ "${{CHECK_PRE_PURGE_SHA}}" != "${{ORIG_ARCH_SHA}}" ]; then
             echo "ERROR: Preserved baseline was modified during preparation; aborting" >&2
             exit 1
         fi
@@ -974,22 +1241,26 @@ import json, sys
 data = {{
     "archive_dir": sys.argv[1],
     "orig_sha": sys.argv[2],
-    "candidate_sha": sys.argv[3],
+    "orig_db_sha": sys.argv[3],
     "has_manifest": sys.argv[4] == "true",
+    "orig_manifest_sha": sys.argv[5],
+    "candidate_sha": sys.argv[6],
+    "candidate_db_sha": sys.argv[7],
+    "candidate_manifest_sha": sys.argv[8],
     "prepared": True
 }}
-with open(sys.argv[5], "w") as f:
-    json.dump(data, f)
-' "${{ARCHIVE_DIR}}" "${{ORIG_SHA}}" "${{CANDIDATE_SHA}}" "${{HAS_MANIFEST}}" "${{META_FILE}}"
+with open(sys.argv[9], "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2)
+' "${{ARCHIVE_DIR}}" "${{ORIG_ARCH_SHA}}" "${{ORIG_DB_SHA}}" "${{HAS_MANIFEST}}" "${{ORIG_MAN_SHA}}" "${{CANDIDATE_ARCH_SHA}}" "${{CANDIDATE_DB_SHA}}" "${{CANDIDATE_MAN_SHA}}" "${{META_FILE}}"
 
         echo ""
         echo "================================================================================"
         echo "CANDIDATE PREPARATION & VERIFICATION COMPLETE (PHASE 1)"
         echo "Target Archive:            ${{ARCHIVE_DIR}}"
-        echo "Original SHA-256:          ${{ORIG_SHA}}"
+        echo "Original Archive SHA-256:  ${{ORIG_ARCH_SHA}}"
+        echo "Original DB SHA-256:       ${{ORIG_DB_SHA}}"
         echo "Preserved Baseline:        ${{ARCHIVE_DIR}}/uploads.tar.gz.pre-purge"
-        echo "Preserved Baseline SHA:    ${{ORIG_SHA}}"
-        echo "Candidate SHA-256:         ${{CANDIDATE_SHA}}"
+        echo "Candidate Archive SHA-256: ${{CANDIDATE_ARCH_SHA}}"
         echo "Integrity Verification:    PASS"
         echo "Privacy Audit Verdict:     ZERO (residual privacy risk eliminated)"
         echo "Historical Archive State:  UNCHANGED / IMMUTABLE"
@@ -997,7 +1268,7 @@ with open(sys.argv[5], "w") as f:
         echo "[OPERATOR ACTION REQUIRED FOR REPLACEMENT]"
         echo "Phase 1 has NOT modified or deleted the historical archive."
         echo "To confirm replacement, run Phase 2 with explicit confirmation:"
-        echo "  $0 --confirm ${{CANDIDATE_SHA}}"
+        echo "  $0 --confirm ${{CANDIDATE_ARCH_SHA}}"
         echo "================================================================================"
         ;;
 
@@ -1015,33 +1286,75 @@ with open(sys.argv[5], "w") as f:
 
         acquire_lock
         validate_paths
+        TRANSACTION_PHASE="PRE_COMMIT"
 
         echo "=== [Phase 2: Operator-Confirmed Replacement] ==="
 
-        if [ ! -f "${{META_FILE}}" ] || [ ! -f "${{CANDIDATE_DIR}}/uploads.tar.gz" ] || [ ! -f "${{CANDIDATE_DIR}}/orders.db" ]; then
+        if [ ! -f "${{META_FILE}}" ] || [ ! -f "${{CANDIDATE_DIR}}/uploads.tar.gz" ] || [ ! -f "${{CANDIDATE_DIR}}/orders.db" ] || [ ! -f "${{CANDIDATE_DIR}}/manifest.sha256" ]; then
             echo "ERROR: Candidate workspace or metadata missing; run preparation phase first" >&2
             exit 1
         fi
 
-        # Check candidate SHA-256
+        # Read metadata
+        META_DATA=$("${{PYTHON_BIN}}" -c '
+import json, sys
+m = json.load(open(sys.argv[1], encoding="utf-8"))
+had_m = "true" if m.get("has_manifest") else "false"
+fields = [m.get("orig_sha", ""), m.get("orig_db_sha", ""), had_m, m.get("orig_manifest_sha", ""), m.get("candidate_sha", ""), m.get("candidate_db_sha", ""), m.get("candidate_manifest_sha", "")]
+print("|".join(str(x) for x in fields))
+' "${{META_FILE}}")
+
+        EXPECTED_ORIG_ARCH_SHA=$(echo "${{META_DATA}}" | cut -d'|' -f1)
+        EXPECTED_ORIG_DB_SHA=$(echo "${{META_DATA}}" | cut -d'|' -f2)
+        HAD_MANIFEST=$(echo "${{META_DATA}}" | cut -d'|' -f3)
+        EXPECTED_ORIG_MAN_SHA=$(echo "${{META_DATA}}" | cut -d'|' -f4)
+        EXPECTED_CAND_ARCH_SHA=$(echo "${{META_DATA}}" | cut -d'|' -f5)
+        EXPECTED_CAND_DB_SHA=$(echo "${{META_DATA}}" | cut -d'|' -f6)
+        EXPECTED_CAND_MAN_SHA=$(echo "${{META_DATA}}" | cut -d'|' -f7)
+
+        # Check candidate SHA-256 against confirmation argument
         ACTUAL_CAND_SHA=$(sha256sum "${{CANDIDATE_DIR}}/uploads.tar.gz" | awk '{{print $1}}')
         if [ "${{CONFIRM_SHA}}" != "${{ACTUAL_CAND_SHA}}" ]; then
             echo "ERROR: Confirmation / Authorization SHA-256 mismatch (provided: ${{CONFIRM_SHA}}, candidate: ${{ACTUAL_CAND_SHA}}); aborting replacement" >&2
             exit 1
         fi
 
+        # Verify candidate database and manifest have not changed after preparation
+        if [ -n "${{EXPECTED_CAND_DB_SHA}}" ]; then
+            ACTUAL_CAND_DB_SHA=$(sha256sum "${{CANDIDATE_DIR}}/orders.db" | awk '{{print $1}}')
+            if [ "${{ACTUAL_CAND_DB_SHA}}" != "${{EXPECTED_CAND_DB_SHA}}" ]; then
+                echo "ERROR: Candidate database was modified after preparation; aborting replacement" >&2
+                exit 1
+            fi
+        fi
+
+        if [ -n "${{EXPECTED_CAND_MAN_SHA}}" ]; then
+            ACTUAL_CAND_MAN_SHA=$(sha256sum "${{CANDIDATE_DIR}}/manifest.sha256" | awk '{{print $1}}')
+            if [ "${{ACTUAL_CAND_MAN_SHA}}" != "${{EXPECTED_CAND_MAN_SHA}}" ]; then
+                echo "ERROR: Candidate manifest was modified after preparation; aborting replacement" >&2
+                exit 1
+            fi
+        fi
+
         # Verify candidate manifest
-        (cd "${{CANDIDATE_DIR}}" && sha256sum -c manifest.sha256 >/dev/null)
+        if ! (cd "${{CANDIDATE_DIR}}" && sha256sum -c manifest.sha256 >/dev/null 2>&1); then
+            echo "ERROR: Candidate manifest verification failed; aborting replacement" >&2
+            exit 1
+        fi
 
-        # Read metadata
-        EXPECTED_ORIG_SHA=$("${{PYTHON_BIN}}" -c 'import json, sys; print(json.load(open(sys.argv[1]))["orig_sha"])' "${{META_FILE}}")
-        HAD_MANIFEST=$("${{PYTHON_BIN}}" -c 'import json, sys; print("true" if json.load(open(sys.argv[1])).get("has_manifest") else "false")' "${{META_FILE}}")
-
-        # Verify active archive and baseline have not changed
-        CURRENT_ORIG_SHA=$(sha256sum "${{ARCHIVE_DIR}}/uploads.tar.gz" | awk '{{print $1}}')
-        if [ "${{CURRENT_ORIG_SHA}}" != "${{EXPECTED_ORIG_SHA}}" ]; then
+        # Verify active archive, database, manifest, and baselines have not changed before mutation
+        CURRENT_ORIG_ARCH_SHA=$(sha256sum "${{ARCHIVE_DIR}}/uploads.tar.gz" | awk '{{print $1}}')
+        if [ "${{CURRENT_ORIG_ARCH_SHA}}" != "${{EXPECTED_ORIG_ARCH_SHA}}" ]; then
             echo "ERROR: Original archive was modified after preparation; aborting replacement" >&2
             exit 1
+        fi
+
+        if [ -n "${{EXPECTED_ORIG_DB_SHA}}" ]; then
+            CURRENT_ORIG_DB_SHA=$(sha256sum "${{ARCHIVE_DIR}}/orders.db" | awk '{{print $1}}')
+            if [ "${{CURRENT_ORIG_DB_SHA}}" != "${{EXPECTED_ORIG_DB_SHA}}" ]; then
+                echo "ERROR: Original database was modified after preparation; aborting replacement" >&2
+                exit 1
+            fi
         fi
 
         if [ ! -f "${{ARCHIVE_DIR}}/uploads.tar.gz.pre-purge" ]; then
@@ -1050,14 +1363,37 @@ with open(sys.argv[5], "w") as f:
         fi
 
         CURRENT_PRE_PURGE_SHA=$(sha256sum "${{ARCHIVE_DIR}}/uploads.tar.gz.pre-purge" | awk '{{print $1}}')
-        if [ "${{CURRENT_PRE_PURGE_SHA}}" != "${{EXPECTED_ORIG_SHA}}" ]; then
-            echo "ERROR: Preserved baseline was modified; aborting replacement" >&2
+        if [ "${{CURRENT_PRE_PURGE_SHA}}" != "${{EXPECTED_ORIG_ARCH_SHA}}" ]; then
+            echo "ERROR: Preserved baseline uploads.tar.gz.pre-purge was modified; aborting replacement" >&2
             exit 1
         fi
 
         if [ "${{HAD_MANIFEST}}" = "true" ]; then
+            if [ ! -f "${{ARCHIVE_DIR}}/manifest.sha256" ]; then
+                echo "ERROR: Active manifest.sha256 was removed after preparation; aborting replacement" >&2
+                exit 1
+            fi
+            CURRENT_ORIG_MAN_SHA=$(sha256sum "${{ARCHIVE_DIR}}/manifest.sha256" | awk '{{print $1}}')
+            if [ "${{CURRENT_ORIG_MAN_SHA}}" != "${{EXPECTED_ORIG_MAN_SHA}}" ]; then
+                echo "ERROR: Active manifest.sha256 was modified after preparation; aborting replacement" >&2
+                exit 1
+            fi
             if [ ! -f "${{ARCHIVE_DIR}}/manifest.sha256.pre-purge" ]; then
                 echo "ERROR: Preserved baseline manifest.sha256.pre-purge is missing; aborting replacement" >&2
+                exit 1
+            fi
+            CURRENT_PRE_PURGE_MAN_SHA=$(sha256sum "${{ARCHIVE_DIR}}/manifest.sha256.pre-purge" | awk '{{print $1}}')
+            if [ "${{CURRENT_PRE_PURGE_MAN_SHA}}" != "${{EXPECTED_ORIG_MAN_SHA}}" ]; then
+                echo "ERROR: Preserved baseline manifest.sha256.pre-purge was modified; aborting replacement" >&2
+                exit 1
+            fi
+        else
+            if [ -e "${{ARCHIVE_DIR}}/manifest.sha256" ]; then
+                echo "ERROR: Active manifest.sha256 unexpectedly created after preparation; aborting replacement" >&2
+                exit 1
+            fi
+            if [ -e "${{ARCHIVE_DIR}}/manifest.sha256.pre-purge" ]; then
+                echo "ERROR: manifest.sha256.pre-purge unexpectedly created; aborting replacement" >&2
                 exit 1
             fi
         fi
@@ -1066,68 +1402,128 @@ with open(sys.argv[5], "w") as f:
         "${{PYTHON_BIN}}" "${{REPO_ROOT}}/scripts/verify_backup_integrity.py" --db "${{CANDIDATE_DIR}}/orders.db" --uploads "${{REBUILD_DIR}}/uploads"
         "${{PYTHON_BIN}}" "${{REPO_ROOT}}/scripts/audit_backup_archives.py" --archive-dir "${{CANDIDATE_DIR}}"
 
-        # Prepare temporary replacement files securely via Python (exclusive creation, no symlink following)
+        # Initialize transaction journal
+        init_journal
+
+        # Prepare temporary replacement files securely via Python (write through open fd, restrictive mode 0o600, fsync)
         TMP_FILES=$("${{PYTHON_BIN}}" -c '
-import os, sys, tempfile, shutil
+import os, sys, tempfile, shutil, pathlib
 
 arch_dir = sys.argv[1]
 cand_dir = sys.argv[2]
 
-# Temp archive file
-tf_arch = tempfile.NamedTemporaryFile(dir=arch_dir, prefix=".uploads.tmp_", delete=False)
-tf_arch_path = tf_arch.name
-tf_arch.close()
+with tempfile.NamedTemporaryFile(dir=arch_dir, prefix=".uploads.tmp_", delete=False) as tf_arch:
+    tf_arch_path = tf_arch.name
+    try:
+        os.chmod(tf_arch.fileno(), 0o600)
+    except Exception:
+        pass
+    with open(os.path.join(cand_dir, "uploads.tar.gz"), "rb") as src:
+        shutil.copyfileobj(src, tf_arch)
+    tf_arch.flush()
+    os.fsync(tf_arch.fileno())
 
 if os.path.islink(tf_arch_path):
+    os.unlink(tf_arch_path)
     print("ERROR: Temp archive file is a symlink", file=sys.stderr)
     sys.exit(1)
 
-shutil.copyfile(os.path.join(cand_dir, "uploads.tar.gz"), tf_arch_path)
-
-# Temp manifest file
-tf_man = tempfile.NamedTemporaryFile(dir=arch_dir, prefix=".manifest.tmp_", delete=False)
-tf_man_path = tf_man.name
-tf_man.close()
+with tempfile.NamedTemporaryFile(dir=arch_dir, prefix=".manifest.tmp_", delete=False) as tf_man:
+    tf_man_path = tf_man.name
+    try:
+        os.chmod(tf_man.fileno(), 0o600)
+    except Exception:
+        pass
+    with open(os.path.join(cand_dir, "manifest.sha256"), "rb") as src:
+        shutil.copyfileobj(src, tf_man)
+    tf_man.flush()
+    os.fsync(tf_man.fileno())
 
 if os.path.islink(tf_man_path):
+    os.unlink(tf_man_path)
     print("ERROR: Temp manifest file is a symlink", file=sys.stderr)
     sys.exit(1)
 
-shutil.copyfile(os.path.join(cand_dir, "manifest.sha256"), tf_man_path)
-
-import pathlib; print(pathlib.Path(tf_arch_path).as_posix() + "|" + pathlib.Path(tf_man_path).as_posix())
+print(pathlib.Path(tf_arch_path).as_posix() + "|" + pathlib.Path(tf_man_path).as_posix())
 ' "${{ARCHIVE_DIR}}" "${{CANDIDATE_DIR}}")
 
         TMP_ARCHIVE=$(echo "${{TMP_FILES}}" | cut -d'|' -f1)
         TMP_MANIFEST=$(echo "${{TMP_FILES}}" | cut -d'|' -f2)
 
-        # Validate temp archive checksum
+        # Validate temp archive & manifest checksums against expected candidate checksums
         TMP_ARCH_SHA=$(sha256sum "${{TMP_ARCHIVE}}" | awk '{{print $1}}')
         if [ "${{TMP_ARCH_SHA}}" != "${{ACTUAL_CAND_SHA}}" ]; then
             echo "ERROR: Temporary replacement archive checksum mismatch; aborting" >&2
             rm -f "${{TMP_ARCHIVE}}" "${{TMP_MANIFEST}}"
             exit 1
         fi
-
-        # Immediate pre-commit check: assert original archive has not changed immediately before replacement
-        FINAL_PRECOMMIT_SHA=$(sha256sum "${{ARCHIVE_DIR}}/uploads.tar.gz" | awk '{{print $1}}')
-        if [ "${{FINAL_PRECOMMIT_SHA}}" != "${{EXPECTED_ORIG_SHA}}" ]; then
-            echo "ERROR: Original archive was modified immediately prior to replacement commit; aborting" >&2
+        TMP_MAN_SHA=$(sha256sum "${{TMP_MANIFEST}}" | awk '{{print $1}}')
+        if [ "${{TMP_MAN_SHA}}" != "${{EXPECTED_CAND_MAN_SHA}}" ]; then
+            echo "ERROR: Temporary replacement manifest checksum mismatch; aborting" >&2
             rm -f "${{TMP_ARCHIVE}}" "${{TMP_MANIFEST}}"
             exit 1
         fi
 
-        # Atomic replacement commit
-        mv "${{TMP_ARCHIVE}}" "${{ARCHIVE_DIR}}/uploads.tar.gz"
-        mv "${{TMP_MANIFEST}}" "${{ARCHIVE_DIR}}/manifest.sha256"
+        # Optional deterministic sync point for signal testing before commit point
+        if [ -n "${{RUNBOOK_TEST_SYNC_FILE:-}}" ]; then
+            touch "${{RUNBOOK_TEST_SYNC_FILE}}"
+            while [ -f "${{RUNBOOK_TEST_SYNC_FILE}}" ]; do
+                sleep 0.05
+            done
+        fi
+
+        # Immediate pre-commit revalidation: assert active files have not changed immediately before replacement
+        FINAL_PRECOMMIT_ARCH_SHA=$(sha256sum "${{ARCHIVE_DIR}}/uploads.tar.gz" | awk '{{print $1}}')
+        if [ "${{FINAL_PRECOMMIT_ARCH_SHA}}" != "${{EXPECTED_ORIG_ARCH_SHA}}" ]; then
+            echo "ERROR: Original archive was modified immediately prior to replacement commit; aborting" >&2
+            rm -f "${{TMP_ARCHIVE}}" "${{TMP_MANIFEST}}"
+            exit 1
+        fi
+        FINAL_PRECOMMIT_DB_SHA=$(sha256sum "${{ARCHIVE_DIR}}/orders.db" | awk '{{print $1}}')
+        if [ "${{FINAL_PRECOMMIT_DB_SHA}}" != "${{EXPECTED_ORIG_DB_SHA}}" ]; then
+            echo "ERROR: Original database was modified immediately prior to replacement commit; aborting" >&2
+            rm -f "${{TMP_ARCHIVE}}" "${{TMP_MANIFEST}}"
+            exit 1
+        fi
+        if [ "${{HAD_MANIFEST}}" = "true" ]; then
+            FINAL_PRECOMMIT_MAN_SHA=$(sha256sum "${{ARCHIVE_DIR}}/manifest.sha256" | awk '{{print $1}}')
+            if [ "${{FINAL_PRECOMMIT_MAN_SHA}}" != "${{EXPECTED_ORIG_MAN_SHA}}" ]; then
+                echo "ERROR: Original manifest was modified immediately prior to replacement commit; aborting" >&2
+                rm -f "${{TMP_ARCHIVE}}" "${{TMP_MANIFEST}}"
+                exit 1
+            fi
+        fi
+
+        # Commit point: Mutate active archive and manifest with recoverable transaction journal
+        TRANSACTION_PHASE="ARCHIVE_MUTATED"
+        update_journal "ARCHIVE_MUTATED"
+        $MV_BIN "${{TMP_ARCHIVE}}" "${{ARCHIVE_DIR}}/uploads.tar.gz"
+
+        TRANSACTION_PHASE="MANIFEST_MUTATING"
+        if [ "${{RUNBOOK_TEST_FAIL_MANIFEST_RENAME:-0}}" = "1" ] || ! $MV_BIN "${{TMP_MANIFEST}}" "${{ARCHIVE_DIR}}/manifest.sha256"; then
+            echo "ERROR: Manifest replacement rename failed after archive replacement" >&2
+            execute_rollback
+            exit 1
+        fi
+        TRANSACTION_PHASE="MANIFEST_MUTATED"
+        update_journal "MANIFEST_MUTATED"
 
         # Post-replacement verification with rollback guard
         POST_CHECK_OK=true
+        TRANSACTION_PHASE="VERIFYING"
+        update_journal "VERIFYING"
 
-        echo "Verifying active manifest checksum..."
-        if ! (cd "${{ARCHIVE_DIR}}" && sha256sum -c manifest.sha256 >/dev/null 2>&1); then
-            echo "ERROR: Post-replacement manifest verification failed" >&2
+        if [ "${{RUNBOOK_TEST_FAIL_POST_VERIFY:-0}}" = "1" ]; then
+            echo "SIMULATED: Test injected post-replacement verification failure" >&2
             POST_CHECK_OK=false
+        fi
+
+        if [ "${{POST_CHECK_OK}}" = "true" ]; then
+            echo "Verifying active manifest checksum..."
+            if ! (cd "${{ARCHIVE_DIR}}" && sha256sum -c manifest.sha256 >/dev/null 2>&1); then
+                echo "ERROR: Post-replacement manifest verification failed" >&2
+                POST_CHECK_OK=false
+            fi
         fi
 
         if [ "${{POST_CHECK_OK}}" = "true" ]; then
@@ -1150,50 +1546,14 @@ import pathlib; print(pathlib.Path(tf_arch_path).as_posix() + "|" + pathlib.Path
         fi
 
         if [ "${{POST_CHECK_OK}}" != "true" ]; then
-            echo "CRITICAL: Post-replacement verification failed! Initiating safe atomic rollback..." >&2
-
-            # Rollback archive from pre-purge baseline safely
-            ROLLBACK_ARCH=$("${{PYTHON_BIN}}" -c '
-import sys, tempfile, shutil
-arch_dir = sys.argv[1]
-tf = tempfile.NamedTemporaryFile(dir=arch_dir, prefix=".uploads.rollback_", delete=False)
-p = tf.name
-tf.close()
-shutil.copyfile(sys.argv[2], p)
-import pathlib; print(pathlib.Path(p).as_posix())
-' "${{ARCHIVE_DIR}}" "${{ARCHIVE_DIR}}/uploads.tar.gz.pre-purge")
-
-            mv "${{ROLLBACK_ARCH}}" "${{ARCHIVE_DIR}}/uploads.tar.gz"
-
-            # Rollback manifest if present
-            if [ -f "${{ARCHIVE_DIR}}/manifest.sha256.pre-purge" ]; then
-                ROLLBACK_MAN=$("${{PYTHON_BIN}}" -c '
-import sys, tempfile, shutil
-arch_dir = sys.argv[1]
-tf = tempfile.NamedTemporaryFile(dir=arch_dir, prefix=".manifest.rollback_", delete=False)
-p = tf.name
-tf.close()
-shutil.copyfile(sys.argv[2], p)
-import pathlib; print(pathlib.Path(p).as_posix())
-' "${{ARCHIVE_DIR}}" "${{ARCHIVE_DIR}}/manifest.sha256.pre-purge")
-                mv "${{ROLLBACK_MAN}}" "${{ARCHIVE_DIR}}/manifest.sha256"
-            fi
-
-            # Verify rollback restored original state
-            ROLLBACK_CHECK_SHA=$(sha256sum "${{ARCHIVE_DIR}}/uploads.tar.gz" | awk '{{print $1}}')
-            if [ "${{ROLLBACK_CHECK_SHA}}" = "${{EXPECTED_ORIG_SHA}}" ]; then
-                echo "ROLLBACK_SUCCESS: Historical archive and manifest safely restored to original baseline (${{EXPECTED_ORIG_SHA}})" >&2
-                echo "Recovery artifacts and candidate files preserved in ${{STAGING_DIR}} for diagnostics" >&2
-                exit 1
-            else
-                echo "RECOVERY_REQUIRED: Manual intervention required! Restored archive checksum (${{ROLLBACK_CHECK_SHA}}) does not match expected (${{EXPECTED_ORIG_SHA}})" >&2
-                echo "Pre-purge baseline remains preserved at ${{ARCHIVE_DIR}}/uploads.tar.gz.pre-purge" >&2
-                exit 1
-            fi
+            execute_rollback
+            exit 1
         fi
 
-        # Cleanup staging workspace ONLY after all post-replacement verification passes
-        rm -rf "${{STAGING_DIR}}"
+        # Complete Success!
+        TRANSACTION_PHASE="COMMITTED"
+        update_journal "COMMITTED"
+        rm -rf "${{STAGING_DIR}}" "${{JOURNAL_FILE}}"
 
         echo ""
         echo "================================================================================"
@@ -1212,6 +1572,8 @@ import pathlib; print(pathlib.Path(p).as_posix())
         ;;
 esac
 """
+
+
 def generate_purge_runbook_commands(
     archive_dir: Path,
     repo_root: Path,
