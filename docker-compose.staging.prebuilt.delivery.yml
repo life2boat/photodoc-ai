@@ -1,0 +1,28 @@
+# PhotoDoc AI - Opt-in Staging Delivery Acceptance Override (Prebuilt Images)
+# Project: photodoc-staging
+#
+# IMPORTANT: For authorized staging acceptance testing ONLY.
+# Enables the background delivery worker against an isolated staging Yandex Disk root.
+#
+# Usage:
+#   PHOTODOC_BACKEND_IMAGE="ghcr.io/life2boat/photodoc-backend:<sha>" \
+#   PHOTODOC_FRONTEND_IMAGE="ghcr.io/life2boat/photodoc-frontend:<sha>" \
+#   YANDEX_DISK_STAGING_TOKEN="y0_..." \
+#   docker compose -p photodoc-staging \
+#     -f docker-compose.staging.prebuilt.yml \
+#     -f docker-compose.staging.prebuilt.delivery.yml up -d --no-build
+#
+# Safety Guarantees:
+# - DELIVERY_WORKER_ENABLED is set to "1" ONLY when this override is explicitly applied.
+# - Requires an explicit, non-placeholder YANDEX_DISK_STAGING_TOKEN.
+# - Forces remote root to dedicated staging directory 'PhotoDoc_Staging_R4' (strictly rejecting PhotoDoc_Orders).
+# - Retains isolated staging named volumes (photodoc_staging_backend-data, photodoc_staging_uploads).
+# - Never loads production .env or mounts production assets.
+# - Zero local build steps or compiler toolchains needed on the staging VPS.
+
+services:
+  backend:
+    environment:
+      DELIVERY_WORKER_ENABLED: "1"
+      YANDEX_DISK_TOKEN: "${YANDEX_DISK_STAGING_TOKEN:?Error: YANDEX_DISK_STAGING_TOKEN is required for staging delivery acceptance}"
+      YANDEX_DISK_ROOT_DIR: "${YANDEX_DISK_STAGING_ROOT:-PhotoDoc_Staging_R4}"
