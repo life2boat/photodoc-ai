@@ -30,7 +30,7 @@ $$\text{Upload} \longrightarrow \text{Persist Delivery Job} \longrightarrow \tex
 
 | Provision | Requirement | Owner Action Needed | Current Status |
 | :--- | :--- | :--- | :---: |
-| **1. Separate Web VPS** | Autonomous server physically distinct from Marzban `79.137.196.14` (Economy: 1 vCPU, 2 GB RAM, 25–30 GB NVMe with 2 GB swap, or Standard: 2 vCPU, 4 GB RAM) | Purchase VPS from Timeweb Cloud or Beget according to `LAUNCH_PROCUREMENT_REGISTER.md` | `NOT_PURCHASED` **(BLOCKED)** |
+| **1. Separate Web VPS** | Autonomous server physically distinct from Marzban `79.137.196.14` (Preliminary Economy: 1 vCPU, 2 GB RAM, 25–30 GB NVMe with prebuilt CI images, or Safer Alternative: 2 vCPU, 4 GB RAM, 40 GB NVMe) | Purchase VPS from Timeweb Cloud or Beget according to `LAUNCH_PROCUREMENT_REGISTER.md` | `NOT_PURCHASED` **(BLOCKED)** |
 | **2. SSH Access for Deployment** | Dedicated IP, SSH port (22), unprivileged deployment user (`deployer` with sudo rights), and authorized SSH public key | Provide connection endpoint and add deployment public key | `MISSING` **(BLOCKED)** |
 | **3. Dedicated Staging OAuth Token** | Independent Yandex OAuth token with scopes `cloud_api:disk.write`, `cloud_api:disk.read`, `cloud_api:disk.info`. **Never use the production token.** | Create staging app in Yandex OAuth (`https://oauth.yandex.ru/client/new`) and generate token | `MISSING` **(BLOCKED)** |
 | **4. Remote Directory `PhotoDoc_Staging_R4`** | Dedicated root folder created in staging Yandex Disk. Preflight guards fail closed if targeting `PhotoDoc_Orders` | Create folder `PhotoDoc_Staging_R4` in staging Yandex Disk | `MISSING` **(BLOCKED)** |
@@ -39,7 +39,7 @@ $$\text{Upload} \longrightarrow \text{Persist Delivery Job} \longrightarrow \tex
 ### 2.2 Next Actions Required from Project Owner
 
 To unblock the live staging acceptance rehearsal:
-1. **Procure Separate Web VPS:** Select either the Minimum Viable shape (1 vCPU, 2 GB RAM, 25–30 GB NVMe, ~290–350 ₽/mo) or Safer Alternative (2 vCPU, 4 GB RAM, 40 GB NVMe, ~540–590 ₽/mo) from Timeweb Cloud or Beget.
+1. **Procure Separate Web VPS:** Select either the Preliminary Economy shape (1 vCPU, 2 GB RAM, 25–30 GB NVMe, estimated ~290–350 ₽/mo, provisional until load-tested, deploying prebuilt CI images) or Safer Alternative (2 vCPU, 4 GB RAM, 40 GB NVMe, estimated ~540–590 ₽/mo) from Timeweb Cloud or Beget.
 2. **Configure SSH Access:** Deploy clean Ubuntu 24.04 LTS, add non-root deployment user, and provide IP address and SSH credentials.
 3. **Register Staging OAuth Token:** In `https://oauth.yandex.ru/client/new`, register a staging app, grant Disk write/read scopes, obtain OAuth token, and create folder `PhotoDoc_Staging_R4` in Yandex Disk.
 4. **Issue Authorization:** Authorize the deployment operator to run the staging setup protocol.
