@@ -98,54 +98,42 @@ docker run --rm \
 ```
 The result must be strictly `ok`.
 
-### 3. Synchronized Uploads Directory Archive
+### 3. Zero-Retention Backup Generation & Uploads Archive
 
-With the backend writer stopped, no new files can be written to `/opt/photodoc/backend/uploads`. Archive the uploads directory while preserving directory structure, permissions, and numeric ownership:
+To enforce the **Zero-Retention Privacy Gate**, newly generated backups must NEVER retain customer photos from orders whose delivery is complete. However, backups must preserve all local originals required for unfinished deliveries (`pending`, `processing`, or `failed`) to ensure disaster recovery.
 
-```bash
-tar --numeric-owner -czvf "${BACKUP_DIR}/uploads.tar.gz" -C /opt/photodoc/backend uploads
-```
-
-### 4. Cryptographic Manifest, Metadata, and Accidental Overwrite Protection
-
-Generate SHA-256 checksums for both artifacts:
+Use the automated zero-retention backup generator (`scripts/create_backup.py`), which transactionally snapshots SQLite, verifies application identity `PDAI` (1346650441), sweeps pending cleanups, archives strictly the required recovery files, records cryptographic manifests, and verifies the backup:
 
 ```bash
-cd "${BACKUP_DIR}"
-sha256sum orders.db uploads.tar.gz > manifest.sha256
+python3 /candidate/scripts/create_backup.py \
+  --db /opt/photodoc/backend/orders.db \
+  --uploads /opt/photodoc/backend/uploads \
+  --output-dir "${BACKUP_DIR}"
 ```
 
-Record the metadata manifest `backup_manifest.json` capturing database application identity, record counts, and file counts:
+This automated tool:
+- Sweeps pending cleanups for delivered orders before snapshotting to establish durable deletion state.
+- Snapshots SQLite `orders.db` via SQLite Online Backup API.
+- Archives **ONLY** local original files required for unfinished deliveries (`state IN ('pending', 'processing', 'failed')`) into `uploads.tar.gz`.
+- Strictly excludes photos from delivered orders (`state == 'delivered'`), guaranteeing zero delivered customer photo content in new backups.
+- Generates `manifest.sha256` and structured metadata `backup_manifest.json` (`zero_retention_enforced: true`).
+- Automatically extracts and verifies the generated backup with `scripts/verify_backup_integrity.py`.
+- Sets secure permissions (`chmod 600` on files, `chmod 700` on directory).
+
+### 4. Historical Backup Archive Auditing & Residual Privacy Risk
+
+Historical backup archives created prior to the zero-retention policy represent a **residual privacy risk** if they contain archived customer photos from orders that have since been delivered.
+
+To audit existing historical archives without modifying or deleting anything, use the read-only dry-run auditor:
 
 ```bash
-DB_APP_ID=$(sqlite3 "${BACKUP_DIR}/orders.db" "PRAGMA application_id;")
-ORDER_COUNT=$(sqlite3 "${BACKUP_DIR}/orders.db" "SELECT COUNT(*) FROM orders;")
-MAX_ORDER_ID=$(sqlite3 "${BACKUP_DIR}/orders.db" "SELECT COALESCE(MAX(id), 0) FROM orders;")
-FILE_COUNT=$(find /opt/photodoc/backend/uploads -type f | wc -l)
-DB_SHA256=$(sha256sum "${BACKUP_DIR}/orders.db" | awk '{print $1}')
-UPLOADS_SHA256=$(sha256sum "${BACKUP_DIR}/uploads.tar.gz" | awk '{print $1}')
-
-cat <<EOF > "${BACKUP_DIR}/backup_manifest.json"
-{
-  "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-  "application_id": ${DB_APP_ID},
-  "application_id_tag": "PDAI",
-  "orders_count": ${ORDER_COUNT},
-  "max_order_id": ${MAX_ORDER_ID},
-  "uploads_files_count": ${FILE_COUNT},
-  "orders_db_sha256": "${DB_SHA256}",
-  "uploads_tar_sha256": "${UPLOADS_SHA256}"
-}
-EOF
+python3 /candidate/scripts/audit_backup_archives.py --backup-root /var/backups/photodoc
 ```
 
-Confirm that `application_id` matches `1346650441` (`PDAI`).
-Protect completed backup artifacts from accidental modification or deletion:
-
-```bash
-chmod 600 "${BACKUP_DIR}/orders.db" "${BACKUP_DIR}/uploads.tar.gz" "${BACKUP_DIR}/manifest.sha256"
-chmod a-w "${BACKUP_DIR}"
-```
+The audit tool inspects `orders.db` and `uploads.tar.gz` in-memory, cross-references order delivery statuses, and reports:
+- Number of archives containing retained delivered customer photos (`residual_privacy_risk: HIGH`).
+- Number of legitimate recovery originals for unfinished deliveries.
+- Provides a safe, owner-controlled purge procedure (e.g. `tar --delete -f uploads.tar.gz uploads/<file>` and checksum recomputation) to allow an owner to redact historical customer photos without altering database audit trails.
 
 ### 5. Independent Sandbox Restore Rehearsal
 
