@@ -164,33 +164,37 @@ The audit tool inspects `orders.db` and `uploads.tar.gz` in-memory, cross-refere
 2. **Create Isolated Temporary Working Copy:**
    ```bash
    WORK_DIR=$(mktemp -d -t photodoc_rebuild_XXXXXX)
+   mkdir -p "${WORK_DIR}/rebuild" "${WORK_DIR}/candidate"
    cp uploads.tar.gz "${WORK_DIR}/uploads.tar.gz.orig"
+   cp orders.db "${WORK_DIR}/candidate/orders.db"
    ```
-3. **Rebuild Sanitized Archive (Excluding Only Approved Delivered Targets):**
+3. **Preserve Original Archive:**
    ```bash
-   mkdir -p "${WORK_DIR}/rebuild"
+   cp uploads.tar.gz uploads.tar.gz.pre-purge
+   ```
+4. **Rebuild Candidate Archive (Excluding Only Approved Delivered Targets):**
+   ```bash
    tar -xzf "${WORK_DIR}/uploads.tar.gz.orig" -C "${WORK_DIR}/rebuild"
    # Safely remove only the owner-approved delivered customer photo files:
    rm -f "${WORK_DIR}/rebuild/uploads/<approved_delivered_filename>"
-   tar --numeric-owner -czvf "${WORK_DIR}/uploads.tar.gz.sanitized" -C "${WORK_DIR}/rebuild" uploads
+   tar --numeric-owner -czvf "${WORK_DIR}/candidate/uploads.tar.gz" -C "${WORK_DIR}/rebuild" uploads
    ```
-4. **Verify Rebuilt Archive Readability and Member Inventory:**
+5. **Place Candidate Under Exact Expected Filenames for Verification:**
+   `${WORK_DIR}/candidate` contains exact expected filenames: `orders.db` and `uploads.tar.gz`.
+   `${WORK_DIR}/rebuild/uploads` contains the uncompressed tree for filesystem verification.
+6. **Run Integrity Verification, Privacy Audit, and Checksums on Candidate:**
    ```bash
-   tar -ztvf "${WORK_DIR}/uploads.tar.gz.sanitized"
+   tar -ztvf "${WORK_DIR}/candidate/uploads.tar.gz"
+   cd "${WORK_DIR}/candidate" && sha256sum orders.db uploads.tar.gz > manifest.sha256
+   python3 /candidate/scripts/verify_backup_integrity.py --db "${WORK_DIR}/candidate/orders.db" --uploads "${WORK_DIR}/rebuild/uploads"
+   python3 /candidate/scripts/audit_backup_archives.py --archive-dir "${WORK_DIR}/candidate"
    ```
-5. **Run Integrity Verification and Privacy Audit on Working Copy:**
+7. **Require Explicit Owner Authorization Before Replacing Historical Archive:**
    ```bash
-   cp orders.db "${WORK_DIR}/orders.db"
-   python3 /candidate/scripts/verify_backup_integrity.py --db "${WORK_DIR}/orders.db" --uploads "${WORK_DIR}/rebuild/uploads"
-   python3 /candidate/scripts/audit_backup_archives.py --archive-dir "${WORK_DIR}"
-   ```
-6. **Confirm Unfinished Delivery Recovery Originals Remain Intact:**
-   Verify that all pending/failed delivery jobs retain their source files and the audit reports `ZERO` residual delivered photos.
-7. **Preserve Original Archive Until Explicit Owner Authorization:**
-   ```bash
-   cp uploads.tar.gz uploads.tar.gz.pre-purge
-   mv "${WORK_DIR}/uploads.tar.gz.sanitized" uploads.tar.gz
-   sha256sum orders.db uploads.tar.gz > manifest.sha256
+   # OWNER AUTHORIZATION REQUIRED BEFORE PROCEEDING
+   # Once all verification checks above PASS cleanly, owner executes replacement:
+   cp "${WORK_DIR}/candidate/uploads.tar.gz" uploads.tar.gz
+   cp "${WORK_DIR}/candidate/manifest.sha256" manifest.sha256
    rm -rf "${WORK_DIR}"
    ```
 

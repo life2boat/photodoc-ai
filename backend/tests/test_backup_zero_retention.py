@@ -41,6 +41,7 @@ import main  # noqa: E402
 from audit_backup_archives import (  # noqa: E402
     audit_backup_root,
     audit_single_backup_dir,
+    audit_single_combined_tar,
     get_cli_exit_code,
     main_cli,
 )
@@ -710,10 +711,11 @@ def test_purge_remediation_workflow_simulation(zero_retention_env):
     with tarfile.open(work_dir / "uploads.tar.gz.orig", "r:gz") as tar:
         tar.extractall(path=rebuild_dir)
 
-    # Remove only delivered photo
+    # Remove delivered customer files (photo and metadata info.txt)
     del_photos = list((rebuild_dir / "uploads").glob(f"{order1}_*.jpg"))
+    del_info = list((rebuild_dir / "uploads").glob(f"{order1}_*.txt"))
     assert len(del_photos) >= 1
-    for dp in del_photos:
+    for dp in del_photos + del_info:
         dp.unlink()
 
     sanitized_tar = work_dir / "uploads.tar.gz.sanitized"
@@ -743,3 +745,419 @@ def test_purge_remediation_workflow_simulation(zero_retention_env):
     tar_stat_after = tar_path.stat()
     assert tar_stat_original.st_size == tar_stat_after.st_size
     assert hashlib.sha256(tar_path.read_bytes()).hexdigest() == sha_orig
+
+
+def test_delivered_metadata_alone_produces_high_risk(zero_retention_env):
+    """
+    Requirement 2:
+    An archive retaining delivered info.txt metadata files (even with zero photo bytes)
+    must produce HIGH risk and CLI exit code 1.
+    """
+    client, db_path, uploads_dir, tmp_path = zero_retention_env
+    order_id = create_order_helper(client, "Delivered Meta Only", [("photo.jpg", JPEG)])
+
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("UPDATE delivery_jobs SET state='delivered' WHERE order_id=?", (order_id,))
+
+    backup_dir = tmp_path / "delivered_meta_only_dir"
+    backup_dir.mkdir(parents=True)
+    shutil.copy2(db_path, backup_dir / "orders.db")
+
+    info_files = list(uploads_dir.glob(f"{order_id}_*.txt"))
+    assert len(info_files) >= 1
+
+    tar_path = backup_dir / "uploads.tar.gz"
+    with tarfile.open(tar_path, "w:gz") as tar:
+        for inf in info_files:
+            tar.add(inf, arcname=f"uploads/{inf.name}")
+
+    report = audit_single_backup_dir(backup_dir)
+    assert len(report["retained_delivered_photos"]) == 0
+    assert len(report["retained_delivered_info"]) >= 1
+    assert "HIGH" in report["residual_privacy_risk"]
+    assert "metadata file(s)" in report["residual_privacy_risk"]
+    assert get_cli_exit_code(report["residual_privacy_risk"]) == 1
+
+
+def test_mixed_delivered_photos_and_metadata_produces_high_risk(zero_retention_env):
+    """
+    Requirement 2:
+    Mixed delivered photos and metadata files must produce HIGH risk and itemize both.
+    """
+    client, db_path, uploads_dir, tmp_path = zero_retention_env
+    order_id = create_order_helper(client, "Delivered Mixed", [("photo.jpg", JPEG)])
+
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("UPDATE delivery_jobs SET state='delivered' WHERE order_id=?", (order_id,))
+
+    backup_dir = tmp_path / "delivered_mixed_dir"
+    backup_dir.mkdir(parents=True)
+    shutil.copy2(db_path, backup_dir / "orders.db")
+
+    tar_path = backup_dir / "uploads.tar.gz"
+    with tarfile.open(tar_path, "w:gz") as tar:
+        for f in uploads_dir.iterdir():
+            if f.is_file():
+                tar.add(f, arcname=f"uploads/{f.name}")
+
+    report = audit_single_backup_dir(backup_dir)
+    assert len(report["retained_delivered_photos"]) >= 1
+    assert len(report["retained_delivered_info"]) >= 1
+    assert "HIGH" in report["residual_privacy_risk"]
+    assert "photo(s)" in report["residual_privacy_risk"]
+    assert "metadata file(s)" in report["residual_privacy_risk"]
+    assert get_cli_exit_code(report["residual_privacy_risk"]) == 1
+
+
+def test_multiple_archives_one_risky_yields_high_root_risk(zero_retention_env):
+    """
+    Requirement 2:
+    Multiple archives in backup root where privacy risk exists in only one archive
+    must aggregate to overall HIGH risk and report exact counts.
+    """
+    client, db_path, uploads_dir, tmp_path = zero_retention_env
+
+    # Order 1: Delivered
+    order1 = create_order_helper(client, "Order Delivered", [("del.jpg", JPEG)])
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("UPDATE delivery_jobs SET state='delivered' WHERE order_id=?", (order1,))
+
+    # Order 2: Pending
+    order2 = create_order_helper(client, "Order Pending", [("pend.jpg", JPEG)])
+
+    backup_root = tmp_path / "root_multi"
+    backup_root.mkdir(parents=True)
+
+    # Archive 1: Clean zero-retention backup (only pending order files)
+    arch1_dir = backup_root / "release_clean"
+    arch1_dir.mkdir(parents=True)
+    shutil.copy2(db_path, arch1_dir / "orders.db")
+    with tarfile.open(arch1_dir / "uploads.tar.gz", "w:gz") as tar:
+        for f in uploads_dir.glob(f"{order2}_*"):
+            tar.add(f, arcname=f"uploads/{f.name}")
+
+    # Archive 2: Historical dirty backup (contains delivered order1 info.txt)
+    arch2_dir = backup_root / "release_dirty"
+    arch2_dir.mkdir(parents=True)
+    shutil.copy2(db_path, arch2_dir / "orders.db")
+    with tarfile.open(arch2_dir / "uploads.tar.gz", "w:gz") as tar:
+        for f in uploads_dir.glob(f"{order1}_*.txt"):
+            tar.add(f, arcname=f"uploads/{f.name}")
+
+    summary = audit_backup_root(backup_root)
+    assert summary["total_archives_scanned"] == 2
+    assert summary["archives_with_residual_privacy_risk"] == 1
+    assert summary["total_retained_delivered_photos"] == 0
+    assert summary["total_retained_delivered_info"] >= 1
+    assert "HIGH" in summary["overall_residual_privacy_risk"]
+    assert get_cli_exit_code(summary["overall_residual_privacy_risk"]) == 1
+
+
+def test_unfinished_delivery_info_distinguished_from_delivered(zero_retention_env):
+    """
+    Requirement 2:
+    Unfinished delivery originals (photos and info.txt) are recognized as legitimate recovery
+    data and evaluate to ZERO risk when no delivered customer data is retained.
+    """
+    client, db_path, uploads_dir, tmp_path = zero_retention_env
+    order_id = create_order_helper(client, "Pending Order", [("pending.jpg", JPEG)])
+
+    backup_dir = tmp_path / "pending_only_dir"
+    backup_dir.mkdir(parents=True)
+    shutil.copy2(db_path, backup_dir / "orders.db")
+
+    tar_path = backup_dir / "uploads.tar.gz"
+    with tarfile.open(tar_path, "w:gz") as tar:
+        for f in uploads_dir.iterdir():
+            if f.is_file():
+                tar.add(f, arcname=f"uploads/{f.name}")
+
+    report = audit_single_backup_dir(backup_dir)
+    assert len(report["retained_delivered_photos"]) == 0
+    assert len(report["retained_delivered_info"]) == 0
+    assert len(report["retained_unfinished_photos"]) >= 1
+    assert len(report["retained_unfinished_info"]) >= 1
+    assert "ZERO" in report["residual_privacy_risk"]
+    assert get_cli_exit_code(report["residual_privacy_risk"]) == 0
+
+
+def test_recursive_discovery_deep_nesting_and_no_duplicate_counting(zero_retention_env):
+    """
+    Requirement 3:
+    Discovers backups nested at least 3 levels deep (e.g. root/lvl1/lvl2/lvl3/dir_backup).
+    Avoids double-counting internal uploads.tar.gz as standalone archives.
+    """
+    client, db_path, uploads_dir, tmp_path = zero_retention_env
+    order_id = create_order_helper(client, "Deep Order", [("deep.jpg", JPEG)])
+
+    root_dir = tmp_path / "deep_root"
+    deep_dir = root_dir / "year_2026" / "month_10" / "day_28" / "release_01"
+    deep_dir.mkdir(parents=True)
+    shutil.copy2(db_path, deep_dir / "orders.db")
+
+    with tarfile.open(deep_dir / "uploads.tar.gz", "w:gz") as tar:
+        for f in uploads_dir.iterdir():
+            if f.is_file():
+                tar.add(f, arcname=f"uploads/{f.name}")
+
+    summary = audit_backup_root(root_dir)
+    assert summary["total_archives_scanned"] == 1
+    assert summary["archives"][0]["archive_type"] == "directory"
+    assert "release_01" in summary["archives"][0]["backup_dir"]
+
+
+def test_standalone_tar_archive_supported(zero_retention_env):
+    """
+    Requirement 3:
+    Standalone uncompressed .tar files are explicitly supported and audited safely.
+    """
+    client, db_path, uploads_dir, tmp_path = zero_retention_env
+    order_id = create_order_helper(client, "Tar Order", [("tar_pic.jpg", JPEG)])
+
+    tar_file = tmp_path / "combined_cutover.tar"
+    with tarfile.open(tar_file, "w") as tar:
+        tar.add(db_path, arcname="orders.db")
+        for f in uploads_dir.iterdir():
+            if f.is_file():
+                tar.add(f, arcname=f"uploads/{f.name}")
+
+    report = audit_single_combined_tar(tar_file)
+    assert report["db_found"] is True
+    assert report["total_orders"] >= 1
+    assert report["archived_files_total"] >= 1
+    assert "ZERO" in report["residual_privacy_risk"]
+
+
+def test_combined_tar_safe_inspection_path_traversal_rejected(tmp_path):
+    """
+    Requirement 4:
+    Path traversal in combined archive member names (e.g. ../../evil.db) must be rejected
+    and fail closed with ERROR without creating files outside temporary directory.
+    """
+    tar_path = tmp_path / "malicious_traversal.tar"
+    with tarfile.open(tar_path, "w") as tar:
+        tinfo = tarfile.TarInfo(name="../../evil.db")
+        tinfo.size = len(b"fake-db-bytes")
+        tinfo.type = tarfile.REGTYPE
+        import io
+        tar.addfile(tinfo, io.BytesIO(b"fake-db-bytes"))
+
+    report = audit_single_combined_tar(tar_path)
+    assert report["residual_privacy_risk"] == "ERROR"
+    assert any("Path traversal detected" in err for err in report["errors"])
+    assert not (tmp_path.parent / "evil.db").exists()
+
+
+def test_combined_tar_safe_inspection_duplicate_db_rejected(zero_retention_env):
+    """
+    Requirement 4:
+    Multiple database members in combined archive must fail closed with ERROR.
+    """
+    _, db_path, uploads_dir, tmp_path = zero_retention_env
+    tar_path = tmp_path / "duplicate_db.tar"
+    with tarfile.open(tar_path, "w") as tar:
+        tar.add(db_path, arcname="orders.db")
+        tar.add(db_path, arcname="backup/orders.db")
+
+    report = audit_single_combined_tar(tar_path)
+    assert report["residual_privacy_risk"] == "ERROR"
+    assert any("Multiple database members detected" in err for err in report["errors"])
+
+
+def test_combined_tar_safe_inspection_oversized_db_rejected(tmp_path, monkeypatch):
+    """
+    Requirement 4:
+    Database members exceeding resource limits must fail closed with ERROR.
+    """
+    import audit_backup_archives
+    import io
+    monkeypatch.setattr(audit_backup_archives, "MAX_DATABASE_MEMBER_SIZE_BYTES", 100)
+
+    tar_path = tmp_path / "oversized.tar"
+    with tarfile.open(tar_path, "w") as tar:
+        tinfo = tarfile.TarInfo(name="orders.db")
+        data = b"x" * 200
+        tinfo.size = len(data)
+        tinfo.type = tarfile.REGTYPE
+        tar.addfile(tinfo, io.BytesIO(data))
+
+    report = audit_single_combined_tar(tar_path)
+    assert report["residual_privacy_risk"] == "ERROR"
+    assert any("exceeds size limit" in err for err in report["errors"])
+
+
+def test_combined_tar_safe_inspection_symlink_db_rejected(tmp_path):
+    """
+    Requirement 4:
+    Database members that are symlinks/hardlinks must be rejected.
+    """
+    tar_path = tmp_path / "symlink_db.tar"
+    with tarfile.open(tar_path, "w") as tar:
+        tinfo = tarfile.TarInfo(name="orders.db")
+        tinfo.type = tarfile.SYMTYPE
+        tinfo.linkname = "/etc/passwd"
+        tar.addfile(tinfo)
+
+    report = audit_single_combined_tar(tar_path)
+    assert report["residual_privacy_risk"] == "ERROR"
+    assert any("unsafe symlink/hardlink" in err for err in report["errors"])
+
+
+def test_purge_runbook_executable_sequence(zero_retention_env):
+    """
+    Requirement 5:
+    Validates the exact 7-step owner-controlled purge runbook:
+    1. Inventory and checksum
+    2. Isolated working copy (rebuild and candidate subdirectories)
+    3. Preserve original (.pre-purge)
+    4. Rebuild candidate archive without delivered files
+    5. Place candidate under exact expected filenames (candidate/orders.db, candidate/uploads.tar.gz)
+    6. Run integrity verifier and audit on candidate copy (all PASS)
+    7. Owner authorized replacement
+    """
+    client, db_path, uploads_dir, tmp_path = zero_retention_env
+
+    order_del = create_order_helper(client, "To Purge", [("delivered.jpg", JPEG)])
+    order_pend = create_order_helper(client, "Keep Safe", [("keep.png", PNG)])
+
+    # Simulate historical archive containing both orders BEFORE cleanup
+    archive_dir = tmp_path / "hist_release"
+    archive_dir.mkdir(parents=True)
+
+    tar_path = archive_dir / "uploads.tar.gz"
+    with tarfile.open(tar_path, "w:gz") as tar:
+        for f in uploads_dir.iterdir():
+            if f.is_file():
+                tar.add(f, arcname=f"uploads/{f.name}")
+
+    # On server: delivery completes and cleanup is executed with durable evidence
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "UPDATE delivery_jobs SET state='delivered', delivered_at='2026-10-28T10:00:00+00:00' WHERE order_id=?",
+            (order_del,),
+        )
+        jids = [r[0] for r in conn.execute("SELECT id FROM delivery_jobs WHERE order_id=?", (order_del,)).fetchall()]
+
+    for jid in jids:
+        perform_job_cleanup(db_path, jid, uploads_dir=uploads_dir)
+
+    # Store latest DB (reflecting delivered & cleaned state) into historical archive dir
+    shutil.copy2(db_path, archive_dir / "orders.db")
+
+    assert "HIGH" in audit_single_backup_dir(archive_dir)["residual_privacy_risk"]
+
+    # STEP 1: Inventory & checksum
+    import hashlib
+    orig_sha = hashlib.sha256(tar_path.read_bytes()).hexdigest()
+
+    # STEP 2: Isolated working directory
+    work_dir = tmp_path / "work_dir"
+    rebuild_dir = work_dir / "rebuild"
+    candidate_dir = work_dir / "candidate"
+    rebuild_dir.mkdir(parents=True)
+    candidate_dir.mkdir(parents=True)
+    shutil.copy2(tar_path, work_dir / "uploads.tar.gz.orig")
+    shutil.copy2(archive_dir / "orders.db", candidate_dir / "orders.db")
+
+    # STEP 3: Preserve original
+    shutil.copy2(tar_path, archive_dir / "uploads.tar.gz.pre-purge")
+
+    # STEP 4: Rebuild candidate archive without delivered files
+    with tarfile.open(work_dir / "uploads.tar.gz.orig", "r:gz") as tar:
+        tar.extractall(path=rebuild_dir)
+
+    for f in list((rebuild_dir / "uploads").glob(f"{order_del}_*")):
+        f.unlink()
+
+    candidate_tar = candidate_dir / "uploads.tar.gz"
+    with tarfile.open(candidate_tar, "w:gz") as tar:
+        tar.add(rebuild_dir / "uploads", arcname="uploads")
+
+    # STEP 5: Exact expected filenames verified
+    assert (candidate_dir / "orders.db").is_file()
+    assert (candidate_dir / "uploads.tar.gz").is_file()
+    assert (rebuild_dir / "uploads").is_dir()
+
+    # STEP 6: Run verification commands on candidate inputs
+    valid_integrity, rep_integrity = verify_backup(candidate_dir / "orders.db", rebuild_dir / "uploads")
+    assert valid_integrity is True
+
+    audit_candidate = audit_single_backup_dir(candidate_dir)
+    assert len(audit_candidate["retained_delivered_photos"]) == 0
+    assert len(audit_candidate["retained_delivered_info"]) == 0
+    assert "ZERO" in audit_candidate["residual_privacy_risk"]
+    assert len(audit_candidate["retained_unfinished_photos"]) >= 1
+
+    # STEP 7: Owner replacement
+    shutil.copy2(candidate_tar, archive_dir / "uploads.tar.gz")
+    assert "ZERO" in audit_single_backup_dir(archive_dir)["residual_privacy_risk"]
+
+
+def test_legacy_p0_privacy_metadata_all_policies(zero_retention_env):
+    """
+    Requirement 6:
+    Verifies that backup_manifest.json accurately separates recovery integrity from
+    privacy compliance across all three legacy P0 policies (fail, include, exclude).
+    """
+    _, db_path, uploads_dir, tmp_path = zero_retention_env
+
+    p0_id = 888
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "INSERT INTO orders (id, name, phone, format, paper, crop, filename, status, created_at) "
+            "VALUES (?, 'Legacy Customer', '+79991118888', '10x15', 'Glossy', 'Fit', 'legacy.jpg', 'completed', datetime('now'));",
+            (p0_id,),
+        )
+    legacy_file = uploads_dir / f"{p0_id}_legacy.jpg"
+    legacy_file.write_bytes(JPEG)
+
+    # 1. Policy "fail" (default): fails closed
+    fail_dir = tmp_path / "out_p0_fail"
+    succ_fail, rep_fail = generate_backup(
+        db_path=db_path,
+        uploads_dir=uploads_dir,
+        output_dir=fail_dir,
+        legacy_p0_policy="fail",
+    )
+    assert succ_fail is False
+    assert any("Ambiguous legacy P0 files detected" in e for e in rep_fail["errors"])
+
+    # 2. Policy "include": preserves files for recovery, but zero-retention is NOT enforced!
+    inc_dir = tmp_path / "out_p0_inc"
+    succ_inc, rep_inc = generate_backup(
+        db_path=db_path,
+        uploads_dir=uploads_dir,
+        output_dir=inc_dir,
+        legacy_p0_policy="include",
+    )
+    assert succ_inc is True
+    assert rep_inc["zero_retention_enforced"] is False
+    assert "UNKNOWN" in rep_inc["privacy_status"]
+    assert rep_inc["legacy_files_recoverable"] is True
+    assert rep_inc["recovery_verification_result"] == "PASS"
+
+    manifest_inc = json.loads((inc_dir / "backup_manifest.json").read_text(encoding="utf-8"))
+    assert manifest_inc["zero_retention_enforced"] is False
+    assert "UNKNOWN" in manifest_inc["privacy_status"]
+    assert manifest_inc["legacy_files_recoverable"] is True
+    assert manifest_inc["recovery_verification_result"] == "PASS"
+
+    # 3. Policy "exclude": omits files, zero-retention is enforced, not recoverable
+    exc_dir = tmp_path / "out_p0_exc"
+    succ_exc, rep_exc = generate_backup(
+        db_path=db_path,
+        uploads_dir=uploads_dir,
+        output_dir=exc_dir,
+        legacy_p0_policy="exclude",
+    )
+    assert succ_exc is True
+    assert rep_exc["zero_retention_enforced"] is True
+    assert "ZERO_RETENTION_EXCLUDED_LEGACY" in rep_exc["privacy_status"]
+    assert rep_exc["legacy_files_recoverable"] is False
+    assert rep_exc["recovery_verification_result"] == "PASS"
+
+    manifest_exc = json.loads((exc_dir / "backup_manifest.json").read_text(encoding="utf-8"))
+    assert manifest_exc["zero_retention_enforced"] is True
+    assert "ZERO_RETENTION_EXCLUDED_LEGACY" in manifest_exc["privacy_status"]
+    assert manifest_exc["legacy_files_recoverable"] is False
+    assert manifest_exc["recovery_verification_result"] == "PASS"

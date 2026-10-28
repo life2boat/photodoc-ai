@@ -12,8 +12,9 @@ Creates consistent, verified backups adhering to the Zero-Retention Privacy Gate
    - Ambiguous legacy P0 files: fails closed by default unless owner explicitly reconciles policy.
 4. Packages necessary recovery originals into uploads.tar.gz.
 5. Generates cryptographic SHA-256 manifests (manifest.sha256) and metadata (backup_manifest.json).
-6. Automatically verifies the resulting backup via verify_backup_integrity.py.
+6. Automatically verifies the resulting backup via verify_backup_integrity.py using safe extraction.
 7. Strictly prevents accidental inclusion of delivered customer photos or silent loss of recovery files.
+8. Separates backup recovery integrity from privacy-compliance status in metadata.
 """
 
 from __future__ import annotations
@@ -168,8 +169,6 @@ def determine_required_and_excluded_files(
                 file_references.setdefault(filename, []).append(j)
 
             for filename, refs in file_references.items():
-                # If ANY job referencing this file is unfinished (pending, processing, failed),
-                # the file is strictly required for recovery
                 has_unfinished = any(r["state"] in ("pending", "processing", "failed") for r in refs)
                 if has_unfinished:
                     required_files.add(filename)
@@ -177,8 +176,6 @@ def determine_required_and_excluded_files(
                         1 for r in refs if r["state"] in ("pending", "processing", "failed")
                     )
                 else:
-                    # All jobs referencing this file are delivered!
-                    # Under Zero-Retention Privacy Gate, this file must NEVER be included in new backups.
                     excluded_files.add(filename)
                     stats["delivered_jobs_count"] += len(refs)
 
@@ -201,10 +198,18 @@ def determine_required_and_excluded_files(
         else:
             # Pure P0 schema handling: active orders
             if ambiguous_p0_files:
-                if legacy_p0_policy == "exclude":
+                if legacy_p0_policy == "fail":
+                    raise ValueError(
+                        f"Legacy P0 schema detected: found {len(ambiguous_p0_files)} file(s) on disk without "
+                        "delivery_jobs tracking. Cannot establish zero-retention status reliably. "
+                        "Specify --legacy-p0-policy [include|exclude]."
+                    )
+                elif legacy_p0_policy == "exclude":
                     excluded_files.update(ambiguous_p0_files)
-                else:
+                elif legacy_p0_policy == "include":
                     required_files.update(ambiguous_p0_files)
+                else:
+                    raise ValueError(f"Invalid legacy_p0_policy: {legacy_p0_policy}")
 
         stats["required_files_count"] = len(required_files)
         stats["excluded_delivered_files_count"] = len(excluded_files)
@@ -228,7 +233,6 @@ def create_uploads_tar(
     omitted_count = 0
 
     with tarfile.open(target_tar_path, "w:gz") as tar:
-        # Add root 'uploads' directory entry
         uploads_dir_info = tarfile.TarInfo(name="uploads")
         uploads_dir_info.type = tarfile.DIRTYPE
         uploads_dir_info.mode = 0o755
@@ -236,7 +240,6 @@ def create_uploads_tar(
         tar.addfile(uploads_dir_info)
 
         for filename in sorted(required_files):
-            # Assert file is not in excluded list
             if filename in excluded_files:
                 raise ValueError(
                     f"Privacy violation: File '{filename}' is both required and excluded. "
@@ -248,7 +251,6 @@ def create_uploads_tar(
                 raise ValueError(f"Path traversal detected in backup candidate: {filename}")
 
             if not src_file.is_file():
-                # Missing source file that is required for unfinished delivery!
                 raise FileNotFoundError(
                     f"Required recovery source file missing from uploads directory: {filename}"
                 )
@@ -280,6 +282,7 @@ def generate_backup(
 ) -> Tuple[bool, Dict[str, Any]]:
     """
     Main backup generation routine.
+    Separates backup recovery integrity from privacy-compliance status in metadata.
     """
     report: Dict[str, Any] = {
         "success": False,
@@ -300,6 +303,9 @@ def generate_backup(
         "orders_db_sha256": None,
         "uploads_tar_sha256": None,
         "zero_retention_enforced": True,
+        "privacy_status": "UNKNOWN",
+        "legacy_files_recoverable": None,
+        "recovery_verification_result": "FAIL",
         "verification_passed": False,
         "errors": [],
     }
@@ -355,7 +361,6 @@ def generate_backup(
     # 4. Transactional SQLite snapshot
     try:
         snapshot_sqlite_db(db_path, dst_db)
-        # Verify snapshot integrity
         snap_conn = sqlite3.connect(dst_db)
         snap_integrity = snap_conn.execute("PRAGMA integrity_check;").fetchone()[0]
         snap_conn.close()
@@ -395,6 +400,25 @@ def generate_backup(
         report["errors"].append(f"Failed to create uploads archive: {exc}")
         return False, report
 
+    # Privacy classification & zero-retention metadata separation
+    ambiguous_cnt = report["ambiguous_legacy_files_count"]
+    if ambiguous_cnt > 0 and legacy_p0_policy == "include":
+        report["zero_retention_enforced"] = False
+        report["privacy_status"] = "UNKNOWN (Ambiguous legacy P0 files included for recovery; zero-retention not enforced)"
+        report["legacy_files_recoverable"] = True
+    elif ambiguous_cnt > 0 and legacy_p0_policy == "exclude":
+        report["zero_retention_enforced"] = True
+        report["privacy_status"] = "ZERO_RETENTION_EXCLUDED_LEGACY (Ambiguous legacy files excluded to enforce zero-retention)"
+        report["legacy_files_recoverable"] = False
+    elif ambiguous_cnt == 0:
+        report["zero_retention_enforced"] = True
+        report["privacy_status"] = "ZERO_RETENTION_VERIFIED"
+        report["legacy_files_recoverable"] = None
+    else:
+        report["zero_retention_enforced"] = False
+        report["privacy_status"] = "UNKNOWN"
+        report["legacy_files_recoverable"] = None
+
     # 7. Checksums and Manifests
     db_sha = sha256_file(dst_db)
     tar_sha = sha256_file(dst_tar)
@@ -418,25 +442,54 @@ def generate_backup(
         "legacy_p0_policy": report["legacy_p0_policy"],
         "orders_db_sha256": db_sha,
         "uploads_tar_sha256": tar_sha,
-        "zero_retention_enforced": True,
+        "zero_retention_enforced": report["zero_retention_enforced"],
+        "privacy_status": report["privacy_status"],
+        "legacy_files_recoverable": report["legacy_files_recoverable"],
+        "recovery_verification_result": "PENDING",
     }
     manifest_json.write_text(json.dumps(manifest_data, indent=2), encoding="utf-8")
 
-    # 8. Post-creation verification
+    # 8. Post-creation verification using safe extraction
     if not skip_verification:
         with tempfile.TemporaryDirectory() as tmp_restore:
-            tmp_restore_path = Path(tmp_restore)
+            tmp_restore_path = Path(tmp_restore).resolve()
             restore_uploads = tmp_restore_path / "uploads"
             with tarfile.open(dst_tar, "r:gz") as tar:
-                tar.extractall(path=tmp_restore_path)
+                for member in tar.getmembers():
+                    if member.issym() or member.islnk():
+                        report["errors"].append(f"Unsafe symlink/hardlink member in backup archive: {member.name}")
+                        return False, report
+                    if ".." in Path(member.name).parts or member.name.startswith("/") or Path(member.name).is_absolute():
+                        report["errors"].append(f"Path traversal detected in backup archive member: {member.name}")
+                        return False, report
+
+                    target_dest = (tmp_restore_path / member.name).resolve()
+                    if not is_safe_child_path(tmp_restore_path, target_dest):
+                        report["errors"].append(f"Archive member extraction path escape: {member.name}")
+                        return False, report
+
+                    if member.isdir():
+                        target_dest.mkdir(parents=True, exist_ok=True)
+                    elif member.isreg():
+                        target_dest.parent.mkdir(parents=True, exist_ok=True)
+                        f_in = tar.extractfile(member)
+                        if f_in:
+                            with target_dest.open("wb") as f_out:
+                                shutil.copyfileobj(f_in, f_out, length=65536)
 
             valid, verify_report = verify_backup(dst_db, restore_uploads)
             if not valid:
                 report["errors"].append(f"Post-creation backup verification failed: {verify_report.get('errors')}")
                 return False, report
             report["verification_passed"] = True
+            report["recovery_verification_result"] = "PASS"
     else:
         report["verification_passed"] = True
+        report["recovery_verification_result"] = "SKIPPED"
+
+    # Update manifest with final recovery_verification_result
+    manifest_data["recovery_verification_result"] = report["recovery_verification_result"]
+    manifest_json.write_text(json.dumps(manifest_data, indent=2), encoding="utf-8")
 
     # 9. Set permissions (read-only protection)
     try:
@@ -469,7 +522,10 @@ def print_backup_report(success: bool, report: Dict[str, Any], *, as_json: bool 
     print(f"Archived Files Count:     {report['archived_files_count']} (only unfinished originals)")
     print(f"Omitted Delivered Files:  {report['omitted_delivered_files_count']} (zero-retention)")
     print(f"Ambiguous Legacy Files:   {report.get('ambiguous_legacy_files_count', 0)} (policy: {report.get('legacy_p0_policy', 'fail')})")
-    print(f"Zero Retention Enforced:  {report['zero_retention_enforced']}")
+    print(f"Zero Retention Enforced:  {report.get('zero_retention_enforced')}")
+    print(f"Privacy Classification:   {report.get('privacy_status')}")
+    print(f"Legacy Files Recoverable: {report.get('legacy_files_recoverable')}")
+    print(f"Recovery Verification:    {report.get('recovery_verification_result')}")
     print(f"Database SHA-256:         {report['orders_db_sha256']}")
     print(f"Uploads Tar SHA-256:      {report['uploads_tar_sha256']}")
     print(f"Verification Passed:      {report['verification_passed']}")
