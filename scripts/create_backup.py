@@ -9,10 +9,11 @@ Creates consistent, verified backups adhering to the Zero-Retention Privacy Gate
 3. Partitions photo uploads into:
    - Unfinished deliveries (pending, processing, failed): strictly ARCHIVED for crash recovery.
    - Delivered and cleaned orders: strictly EXCLUDED (zero delivered photo content retained).
+   - Ambiguous legacy P0 files: fails closed by default unless owner explicitly reconciles policy.
 4. Packages necessary recovery originals into uploads.tar.gz.
 5. Generates cryptographic SHA-256 manifests (manifest.sha256) and metadata (backup_manifest.json).
 6. Automatically verifies the resulting backup via verify_backup_integrity.py.
-7. Strictly prevents accidental inclusion of delivered customer photos.
+7. Strictly prevents accidental inclusion of delivered customer photos or silent loss of recovery files.
 """
 
 from __future__ import annotations
@@ -83,12 +84,19 @@ def snapshot_sqlite_db(src_path: Path, dst_path: Path) -> None:
 def determine_required_and_excluded_files(
     db_path: Path,
     uploads_dir: Path,
+    *,
+    legacy_p0_policy: str = "fail",
 ) -> Tuple[Set[str], Set[str], Dict[str, Any]]:
     """
     Analyzes the database to partition files into:
     1. required_files: files referenced by unfinished delivery jobs or active orders (must be archived).
     2. excluded_files: files belonging exclusively to delivered/cleaned orders (must NOT be archived).
-    3. metadata: stats on jobs, orders, and zero-retention counts.
+    3. metadata: stats on jobs, orders, legacy P0 ambiguity, and zero-retention counts.
+
+    Fail-Closed Legacy Protection:
+    When delivery_jobs exists, any legacy orders having local files on disk without
+    delivery_jobs tracking represent ambiguous status. Unless legacy_p0_policy is
+    explicitly 'include' or 'exclude', fails closed with a clear non-sensitive diagnostic.
     """
     conn = sqlite3.connect(f"file:{db_path.resolve().as_posix()}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
@@ -112,7 +120,32 @@ def determine_required_and_excluded_files(
             "delivered_jobs_count": 0,
             "required_files_count": 0,
             "excluded_delivered_files_count": 0,
+            "ambiguous_legacy_files_count": 0,
+            "legacy_p0_policy": legacy_p0_policy,
         }
+
+        # Identify legacy P0 orders
+        if has_order_token:
+            p0_orders = conn.execute(
+                "SELECT id, filename FROM orders WHERE order_token_hash IS NULL OR order_token_hash = '';"
+            ).fetchall()
+        else:
+            p0_orders = conn.execute("SELECT id, filename FROM orders;").fetchall()
+
+        # Find physical files on disk associated with legacy orders
+        ambiguous_p0_files: Set[str] = set()
+        for o in p0_orders:
+            raw_filename = o["filename"] or ""
+            names = [n.strip() for n in raw_filename.split(",") if n.strip()]
+            for n in names:
+                safe_name = sanitize_filename(n)
+                for cand in [f"{o['id']}_{safe_name}", f"{o['id']}_{n}", safe_name, n]:
+                    cand_path = uploads_dir / cand
+                    if is_safe_child_path(uploads_dir, cand_path) and cand_path.is_file():
+                        ambiguous_p0_files.add(cand)
+                        break
+
+        stats["ambiguous_legacy_files_count"] = len(ambiguous_p0_files)
 
         if has_delivery:
             p1_orders_count = conn.execute(
@@ -149,19 +182,29 @@ def determine_required_and_excluded_files(
                     excluded_files.add(filename)
                     stats["delivered_jobs_count"] += len(refs)
 
+            # Check legacy P0 files on disk under P1 delivery schema
+            if ambiguous_p0_files:
+                if legacy_p0_policy == "fail":
+                    raise ValueError(
+                        f"Ambiguous legacy P0 files detected: found {len(ambiguous_p0_files)} file(s) on disk for "
+                        "legacy order(s) without delivery_jobs records. Cannot establish delivery/retention status "
+                        "reliably under zero-retention contract. Reconcile legacy orders into delivery_jobs or "
+                        "specify --legacy-p0-policy [include|exclude]."
+                    )
+                elif legacy_p0_policy == "include":
+                    required_files.update(ambiguous_p0_files)
+                elif legacy_p0_policy == "exclude":
+                    excluded_files.update(ambiguous_p0_files)
+                else:
+                    raise ValueError(f"Invalid legacy_p0_policy: {legacy_p0_policy}")
+
         else:
-            # P0 schema handling: active orders
-            p0_orders = conn.execute("SELECT id, filename FROM orders;").fetchall()
-            for o in p0_orders:
-                raw_filename = o["filename"] or ""
-                names = [n.strip() for n in raw_filename.split(",") if n.strip()]
-                for n in names:
-                    safe_name = sanitize_filename(n)
-                    # Look for candidate local names
-                    for cand in [f"{o['id']}_{safe_name}", f"{o['id']}_{n}", safe_name, n]:
-                        if (uploads_dir / cand).is_file():
-                            required_files.add(cand)
-                            break
+            # Pure P0 schema handling: active orders
+            if ambiguous_p0_files:
+                if legacy_p0_policy == "exclude":
+                    excluded_files.update(ambiguous_p0_files)
+                else:
+                    required_files.update(ambiguous_p0_files)
 
         stats["required_files_count"] = len(required_files)
         stats["excluded_delivered_files_count"] = len(excluded_files)
@@ -233,6 +276,7 @@ def generate_backup(
     *,
     run_pending_cleanups_flag: bool = True,
     skip_verification: bool = False,
+    legacy_p0_policy: str = "fail",
 ) -> Tuple[bool, Dict[str, Any]]:
     """
     Main backup generation routine.
@@ -251,6 +295,8 @@ def generate_backup(
         "unfinished_jobs_count": 0,
         "archived_files_count": 0,
         "omitted_delivered_files_count": 0,
+        "ambiguous_legacy_files_count": 0,
+        "legacy_p0_policy": legacy_p0_policy,
         "orders_db_sha256": None,
         "uploads_tar_sha256": None,
         "zero_retention_enforced": True,
@@ -322,11 +368,15 @@ def generate_backup(
 
     # 5. Determine files to archive vs omit
     try:
-        required_files, excluded_files, stats = determine_required_and_excluded_files(dst_db, uploads_dir)
+        required_files, excluded_files, stats = determine_required_and_excluded_files(
+            dst_db, uploads_dir, legacy_p0_policy=legacy_p0_policy
+        )
         report["orders_count"] = stats["orders_count"]
         report["p1_orders_count"] = stats["p1_orders_count"]
         report["unfinished_jobs_count"] = stats["unfinished_jobs_count"]
         report["schema_generation"] = stats["schema_generation"]
+        report["ambiguous_legacy_files_count"] = stats["ambiguous_legacy_files_count"]
+        report["legacy_p0_policy"] = stats["legacy_p0_policy"]
     except Exception as exc:
         report["errors"].append(f"Failed to analyze file references: {exc}")
         return False, report
@@ -364,6 +414,8 @@ def generate_backup(
         "unfinished_jobs_count": report["unfinished_jobs_count"],
         "archived_files_count": report["archived_files_count"],
         "omitted_delivered_files_count": report["omitted_delivered_files_count"],
+        "ambiguous_legacy_files_count": report["ambiguous_legacy_files_count"],
+        "legacy_p0_policy": report["legacy_p0_policy"],
         "orders_db_sha256": db_sha,
         "uploads_tar_sha256": tar_sha,
         "zero_retention_enforced": True,
@@ -416,6 +468,7 @@ def print_backup_report(success: bool, report: Dict[str, Any], *, as_json: bool 
     print(f"Unfinished Jobs Count:    {report['unfinished_jobs_count']}")
     print(f"Archived Files Count:     {report['archived_files_count']} (only unfinished originals)")
     print(f"Omitted Delivered Files:  {report['omitted_delivered_files_count']} (zero-retention)")
+    print(f"Ambiguous Legacy Files:   {report.get('ambiguous_legacy_files_count', 0)} (policy: {report.get('legacy_p0_policy', 'fail')})")
     print(f"Zero Retention Enforced:  {report['zero_retention_enforced']}")
     print(f"Database SHA-256:         {report['orders_db_sha256']}")
     print(f"Uploads Tar SHA-256:      {report['uploads_tar_sha256']}")
@@ -450,6 +503,13 @@ def main_cli() -> int:
         help="Target directory to create backup (e.g. /var/backups/photodoc/release_YYYYMMDD_HHMMSS)",
     )
     parser.add_argument(
+        "--legacy-p0-policy",
+        choices=["fail", "include", "exclude"],
+        default="fail",
+        help="Policy for ambiguous legacy P0 files on disk without delivery_jobs tracking: "
+             "'fail' (default, fail-closed), 'include' (preserve for recovery), 'exclude' (omit for privacy)",
+    )
+    parser.add_argument(
         "--no-cleanup-sweep",
         action="store_true",
         help="Skip pre-backup sweep of pending cleanups for delivered orders",
@@ -473,6 +533,7 @@ def main_cli() -> int:
         output_dir=args.output_dir,
         run_pending_cleanups_flag=not args.no_cleanup_sweep,
         skip_verification=args.skip_verification,
+        legacy_p0_policy=args.legacy_p0_policy,
     )
 
     print_backup_report(success, report, as_json=args.json)
