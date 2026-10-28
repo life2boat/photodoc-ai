@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [ main, master, fix/p1-order-delivery-hardening, feat/p1-auto-photo-cleanup, infra/r4-prebuilt-staging-images ]
+    branches: [ main, master, fix/p1-order-delivery-hardening, feat/p1-auto-photo-cleanup, infra/r4-prebuilt-staging-images, infra/r4-safe-staging-bootstrap ]
   pull_request:
-    branches: [ main, master, fix/p0-production-readiness, infra/r2-public-https-preflight, feat/p1-auto-photo-cleanup ]
+    branches: [ main, master, fix/p0-production-readiness, infra/r2-public-https-preflight, feat/p1-auto-photo-cleanup, infra/r4-prebuilt-staging-images ]
   workflow_dispatch:
 
 jobs:
@@ -538,6 +538,50 @@ jobs:
 
         cleanup_prebuilt
         trap - EXIT
+    - name: Verify safe staging deployment preflight and gatekeeper
+      run: |
+        set -eu
+        echo "1. Testing preflight rejection of production IP 79.137.196.14..."
+        if python scripts/staging_deploy_preflight.py --target-host 79.137.196.14; then
+          echo "FAIL: Staging preflight accepted protected production IP!"
+          exit 1
+        fi
+        echo "PRODUCTION_IP_REJECTION=PASS"
+
+        echo "2. Testing preflight fail-closed on missing images..."
+        if python scripts/staging_deploy_preflight.py; then
+          echo "FAIL: Staging preflight succeeded without required images!"
+          exit 1
+        fi
+        echo "MISSING_IMAGES_FAIL_CLOSED=PASS"
+
+        echo "3. Testing preflight fail-closed on mutable :latest tag..."
+        if python scripts/staging_deploy_preflight.py \
+             --backend-image "ghcr.io/life2boat/photodoc-backend:latest" \
+             --frontend-image "ghcr.io/life2boat/photodoc-frontend:latest"; then
+          echo "FAIL: Staging preflight accepted mutable latest tag!"
+          exit 1
+        fi
+        echo "MUTABLE_TAG_REJECTION=PASS"
+
+        echo "4. Testing preflight success with valid digest-pinned images..."
+        SYNTH_B_DIGEST="sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        SYNTH_F_DIGEST="sha256:fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+        python scripts/staging_deploy_preflight.py \
+          --target-host 127.0.0.1 \
+          --backend-image "ghcr.io/life2boat/photodoc-backend@${SYNTH_B_DIGEST}" \
+          --frontend-image "ghcr.io/life2boat/photodoc-frontend@${SYNTH_F_DIGEST}" \
+          --json > /tmp/preflight_report.json
+        grep -q '"pass": true' /tmp/preflight_report.json
+        echo "DIGEST_PINNED_PREFLIGHT=PASS"
+
+        echo "5. Testing deploy script bash syntax and dry-run..."
+        bash -n scripts/deploy_staging_prebuilt.sh
+        PHOTODOC_BACKEND_IMAGE="ghcr.io/life2boat/photodoc-backend@${SYNTH_B_DIGEST}" \
+        PHOTODOC_FRONTEND_IMAGE="ghcr.io/life2boat/photodoc-frontend@${SYNTH_F_DIGEST}" \
+        PHOTODOC_TARGET_HOST="127.0.0.1" \
+        ./scripts/deploy_staging_prebuilt.sh --dry-run
+        echo "DEPLOY_SCRIPT_DRY_RUN=PASS"
     - name: Dump logs on failure
       if: failure()
       run: |
@@ -551,7 +595,7 @@ jobs:
     name: Build & Publish GHCR Images
     runs-on: ubuntu-latest
     needs: [docker-build, payment-security-tests, playwright-tests]
-    if: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/infra/r4-prebuilt-staging-images') }}
+    if: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/infra/r4-prebuilt-staging-images' || github.ref == 'refs/heads/infra/r4-safe-staging-bootstrap') }}
     permissions:
       contents: read
       packages: write
