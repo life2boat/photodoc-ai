@@ -45,8 +45,11 @@ from audit_backup_archives import (  # noqa: E402
     audit_backup_root,
     audit_single_backup_dir,
     audit_single_combined_tar,
+    generate_purge_runbook_commands,
+    generate_purge_runbook_script,
     get_cli_exit_code,
     main_cli,
+    validate_removal_target,
 )
 from create_backup import generate_backup  # noqa: E402
 from db_contract import APPLICATION_ID  # noqa: E402
@@ -1511,131 +1514,386 @@ def test_symlink_pointing_outside_root_never_inspected(tmp_path, monkeypatch):
     assert summary["total_archives_scanned"] == 0
 
 
-def test_purge_runbook_actual_command_execution(zero_retention_env, tmp_path):
+def get_bash_executable():
     """
-    R4.4.3: Validates end-to-end execution of documented CLI remediation commands from a foreign
-    working directory:
-    - Establish reliable REPO_ROOT and ARCHIVE_DIR
-    - Verify pre-purge collision check halts immediately without modifying original archive
-    - Verify original archive SHA-256 remains strictly unchanged throughout procedure
-    - Verify candidate archive passes both CLI verifiers:
-        scripts/verify_backup_integrity.py AND scripts/audit_backup_archives.py
+    Locates an appropriate bash executable:
+    - On Windows, prefers Git Bash ('C:\\Program Files\\Git\\bin\\bash.exe') to avoid WSL path translation issues.
+    - On Linux/Unix, uses shutil.which('bash') or '/bin/bash'.
     """
-    client, db_path, uploads_dir, _ = zero_retention_env
+    if sys.platform == "win32":
+        for cand in [r"C:\Program Files\Git\bin\bash.exe", r"C:\Program Files (x86)\Git\bin\bash.exe"]:
+            if os.path.exists(cand):
+                return cand
+    bash_path = shutil.which("bash")
+    if bash_path:
+        return bash_path
+    raise RuntimeError("No bash executable found on system")
 
-    order_del = create_order_helper(client, "To Purge CLI", [("del_file.jpg", JPEG)])
-    order_pend = create_order_helper(client, "Keep Safe CLI", [("safe_file.png", PNG)])
 
-    archive_dir = tmp_path / "hist_archive"
-    archive_dir.mkdir(parents=True)
+def test_runbook_removal_target_validation_security():
+    """
+    R4.4.4 Requirement 6:
+    Validates that removal targets are strictly confined to the uploads directory:
+    - Rejects path traversal (..)
+    - Rejects absolute paths (/ or \\)
+    - Rejects control characters and command injection payloads
+    - Accepts legitimate filenames, spaces, and Unicode
+    """
+    # 1. Traversal and path separator rejections
+    for bad in ["../secret.txt", "/etc/passwd", r"..\boot.ini", r"dir\file.jpg", "sub/file.jpg", "..", "."]:
+        with pytest.raises(ValueError, match="path|traversal"):
+            validate_removal_target(bad)
 
-    tar_path = archive_dir / "uploads.tar.gz"
-    with tarfile.open(tar_path, "w:gz") as tar:
-        for f in uploads_dir.iterdir():
-            if f.is_file():
-                tar.add(f, arcname=f"uploads/{f.name}")
+    # 2. Control chars and injection payloads
+    for injection in [
+        "file.jpg; rm -rf /",
+        "file.jpg && rm -rf /",
+        "file.jpg | cat /etc/passwd",
+        "file.jpg $(whoami)",
+        "file.jpg `whoami`",
+        "file.jpg > /tmp/out",
+        "file.jpg < /tmp/in",
+        'file.jpg"bad',
+        "file.jpg'bad",
+        "file\x00.jpg",
+        "file\n.jpg",
+        "file\r.jpg",
+        "",
+    ]:
+        with pytest.raises(ValueError):
+            validate_removal_target(injection)
 
-    with sqlite3.connect(db_path) as conn:
-        conn.execute(
-            "UPDATE delivery_jobs SET state='delivered', delivered_at='2026-10-28T10:00:00+00:00' WHERE order_id=?",
-            (order_del,),
+    # 3. Legitimate filenames
+    assert validate_removal_target("normal.jpg") == "normal.jpg"
+    assert validate_removal_target("photo with spaces.png") == "photo with spaces.png"
+    assert validate_removal_target("заказ_123_фото.jpg") == "заказ_123_фото.jpg"
+
+    # 4. Generator fails closed if any target is invalid
+    with pytest.raises(ValueError):
+        generate_purge_runbook_script(Path("/tmp"), REPO_DIR, ["normal.jpg", "../traversal.jpg"])
+
+
+def create_synthetic_archive_fixture(tmp_path):
+    """Helper to set up a clean synthetic historical backup archive with 1 delivered and 1 pending order."""
+    orig_db_path = getattr(main, "DB_PATH", None)
+    orig_upload_dir = getattr(main, "UPLOAD_DIR", None)
+    orig_env = {
+        k: os.environ.get(k)
+        for k in ["ROBOKASSA_MERCHANT_LOGIN", "ROBOKASSA_PASSWORD1", "ROBOKASSA_PASSWORD2", "DELIVERY_WORKER_ENABLED"]
+    }
+    try:
+        db_path = tmp_path / "active_orders.db"
+        uploads_dir = tmp_path / "active_uploads"
+        uploads_dir.mkdir(parents=True, exist_ok=True)
+
+        os.environ["ROBOKASSA_MERCHANT_LOGIN"] = "test-merchant"
+        os.environ["ROBOKASSA_PASSWORD1"] = "test-pass-1"
+        os.environ["ROBOKASSA_PASSWORD2"] = "test-pass-2"
+        os.environ["DELIVERY_WORKER_ENABLED"] = "0"
+
+        main.DB_PATH = db_path
+        main.UPLOAD_DIR = uploads_dir
+        set_uploads_dir(uploads_dir)
+        main.init_db()
+
+        client = TestClient(main.app)
+
+        # Order 1: Delivered (delivered file to be purged)
+        resp1 = client.post(
+            "/api/order",
+            data={"name": "Delivered Customer", "phone": "+79991112233", "format": "10x15"},
+            files=[("files", ("del_photo.jpg", JPEG, "image/jpeg"))],
         )
-        jids = [r[0] for r in conn.execute("SELECT id FROM delivery_jobs WHERE order_id=?", (order_del,)).fetchall()]
+        assert resp1.status_code == 200
+        order_del = resp1.json()["order_id"]
 
-    for jid in jids:
-        perform_job_cleanup(db_path, jid, uploads_dir=uploads_dir)
+        # Order 2: Pending (pending original must be preserved)
+        resp2 = client.post(
+            "/api/order",
+            data={"name": "Pending Customer", "phone": "+79991112233", "format": "10x15"},
+            files=[("files", ("safe_photo.png", PNG, "image/png"))],
+        )
+        assert resp2.status_code == 200
+        order_pend = resp2.json()["order_id"]
 
-    shutil.copy2(db_path, archive_dir / "orders.db")
+        archive_dir = tmp_path / "hist_release"
+        archive_dir.mkdir(parents=True, exist_ok=True)
 
-    # Verify baseline is HIGH risk
-    assert "HIGH" in audit_single_backup_dir(archive_dir)["residual_privacy_risk"]
+        # Package initial uploads into historical uploads.tar.gz
+        tar_path = archive_dir / "uploads.tar.gz"
+        with tarfile.open(tar_path, "w:gz") as tar:
+            for f in uploads_dir.iterdir():
+                if f.is_file():
+                    tar.add(f, arcname=f"uploads/{f.name}")
+
+        # Complete delivery and cleanup for order 1 on the server
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                "UPDATE delivery_jobs SET state='delivered', delivered_at='2026-10-28T10:00:00+00:00' WHERE order_id=?",
+                (order_del,),
+            )
+            jids = [r[0] for r in conn.execute("SELECT id FROM delivery_jobs WHERE order_id=?", (order_del,)).fetchall()]
+
+        for jid in jids:
+            perform_job_cleanup(db_path, jid, uploads_dir=uploads_dir)
+
+        # Copy server database to archive_dir
+        shutil.copy2(db_path, archive_dir / "orders.db")
+
+        # Audit confirms baseline is HIGH risk
+        baseline_rep = audit_single_backup_dir(archive_dir)
+        assert "HIGH" in baseline_rep["residual_privacy_risk"]
+
+        del_targets = [item["filename"] for item in baseline_rep["retained_delivered_photos"] + baseline_rep["retained_delivered_info"]]
+        return archive_dir, del_targets
+    finally:
+        if orig_db_path is not None:
+            main.DB_PATH = orig_db_path
+        if orig_upload_dir is not None:
+            main.UPLOAD_DIR = orig_upload_dir
+            set_uploads_dir(orig_upload_dir)
+        for k, v in orig_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+def test_purge_runbook_two_phase_lifecycle_and_owner_authorization(tmp_path):
+    """
+    R4.4.4 Requirements 1, 2, 4, 5, 11:
+    Executes actual generated runbook script through bash in an isolated foreign directory:
+    - Phase 1: Preparation & verification passes; original archive remains immutable;
+    - Missing authorization: replacement refused, original archive untouched;
+    - Explicit valid authorization: atomic replacement succeeds, post-replacement audit confirms ZERO risk.
+    """
+    bash_bin = get_bash_executable()
+    archive_dir, del_targets = create_synthetic_archive_fixture(tmp_path)
+    tar_path = archive_dir / "uploads.tar.gz"
 
     orig_bytes = tar_path.read_bytes()
     orig_sha256 = hashlib.sha256(orig_bytes).hexdigest()
 
-    # Step A: Test pre-purge collision protection
-    pre_purge_file = archive_dir / "uploads.tar.gz.pre-purge"
-    pre_purge_file.write_bytes(b"existing-historical-baseline-content")
+    # Generate authoritative runbook script
+    script_content = generate_purge_runbook_script(archive_dir, REPO_DIR, del_targets)
+    script_path = tmp_path / "runbook.sh"
+    script_path.write_text(script_content, encoding="utf-8")
 
-    # Command from runbook checks: test ! -e uploads.tar.gz.pre-purge
-    collision_prevented = False
-    if pre_purge_file.exists():
-        collision_prevented = True  # Runbook aborts here
+    foreign_dir = tmp_path / "foreign_workdir"
+    foreign_dir.mkdir()
 
-    assert collision_prevented is True, "PRE_PURGE_OVERWRITE_PROTECTION must halt if .pre-purge exists"
-    assert tar_path.read_bytes() == orig_bytes, "Original archive must not be touched on collision"
+    # 1. Run Phase 1: Candidate Preparation & Verification
+    proc_prep = subprocess.run([bash_bin, str(script_path), "--prepare"], cwd=str(foreign_dir), capture_output=True, text=True)
+    assert proc_prep.returncode == 0, f"Phase 1 failed:\nSTDOUT: {proc_prep.stdout}\nSTDERR: {proc_prep.stderr}"
+    assert "CANDIDATE PREPARATION & VERIFICATION COMPLETE" in proc_prep.stdout
 
-    # Clean up artificial collision for actual runbook test
-    pre_purge_file.unlink()
-
-    # Step B: Execute documented sequence from foreign working directory
-    foreign_workdir = tmp_path / "foreign_workdir"
-    foreign_workdir.mkdir()
-
-    repo_root = REPO_DIR
-    work_dir = foreign_workdir / "rebuild_workspace"
-    rebuild_dir = work_dir / "rebuild"
-    candidate_dir = work_dir / "candidate"
-    rebuild_dir.mkdir(parents=True)
-    candidate_dir.mkdir(parents=True)
-
-    # 1. Preservation copy
-    shutil.copy2(tar_path, archive_dir / "uploads.tar.gz.pre-purge")
-    assert hashlib.sha256((archive_dir / "uploads.tar.gz.pre-purge").read_bytes()).hexdigest() == orig_sha256
-
-    # 2. Extract into isolated rebuild dir
-    shutil.copy2(tar_path, work_dir / "uploads.tar.gz.orig")
-    with tarfile.open(work_dir / "uploads.tar.gz.orig", "r:gz") as tar:
-        tar.extractall(path=rebuild_dir)
-
-    # 3. Purge delivered customer photos
-    for f in list((rebuild_dir / "uploads").glob(f"{order_del}_*")):
-        f.unlink()
-
-    # 4. Package candidate uploads.tar.gz
-    candidate_tar = candidate_dir / "uploads.tar.gz"
-    with tarfile.open(candidate_tar, "w:gz") as tar:
-        tar.add(rebuild_dir / "uploads", arcname="uploads")
-
-    # 5. Copy candidate orders.db
-    shutil.copy2(archive_dir / "orders.db", candidate_dir / "orders.db")
-
-    # 6. Execute CLI verifiers from foreign_workdir
-    # Verify backup integrity CLI
-    cmd_integrity = [
-        sys.executable,
-        str(repo_root / "scripts" / "verify_backup_integrity.py"),
-        "--db",
-        str(candidate_dir / "orders.db"),
-        "--uploads",
-        str(rebuild_dir / "uploads"),
-    ]
-    proc_integrity = subprocess.run(cmd_integrity, cwd=str(foreign_workdir), capture_output=True, text=True)
-    assert proc_integrity.returncode == 0, f"verify_backup_integrity failed: {proc_integrity.stderr}\n{proc_integrity.stdout}"
-    assert "INTEGRITY_CHECK_PASSED" in proc_integrity.stdout
-
-    # Verify audit archives CLI on candidate dir
-    cmd_audit = [
-        sys.executable,
-        str(repo_root / "scripts" / "audit_backup_archives.py"),
-        "--backup-dir",
-        str(candidate_dir),
-    ]
-    proc_audit = subprocess.run(cmd_audit, cwd=str(foreign_workdir), capture_output=True, text=True)
-    assert proc_audit.returncode == 0, f"audit_backup_archives failed: {proc_audit.stderr}\n{proc_audit.stdout}"
-    assert "ZERO" in proc_audit.stdout
-
-    # Verify original archive remains completely unchanged before owner authorization
+    # Original archive MUST remain completely unchanged!
     assert tar_path.read_bytes() == orig_bytes
     assert hashlib.sha256(tar_path.read_bytes()).hexdigest() == orig_sha256
 
-    # 7. Owner replacement
-    shutil.copy2(candidate_tar, tar_path)
-    proc_audit_final = subprocess.run(
-        [sys.executable, str(repo_root / "scripts" / "audit_backup_archives.py"), "--backup-dir", str(archive_dir)],
-        cwd=str(foreign_workdir),
-        capture_output=True,
-        text=True,
-    )
-    assert proc_audit_final.returncode == 0
-    assert "ZERO" in proc_audit_final.stdout
+    # Preserved baseline MUST exist and match original SHA-256
+    pre_purge_file = archive_dir / "uploads.tar.gz.pre-purge"
+    assert pre_purge_file.is_file()
+    assert pre_purge_file.read_bytes() == orig_bytes
+    assert hashlib.sha256(pre_purge_file.read_bytes()).hexdigest() == orig_sha256
+
+    # Candidate workspace metadata
+    meta_file = archive_dir / ".purge_staging" / "candidate_metadata.json"
+    assert meta_file.is_file()
+    meta = json.loads(meta_file.read_text(encoding="utf-8"))
+    cand_sha = meta["candidate_sha"]
+    assert len(cand_sha) == 64
+
+    # 2. Run Phase 2 WITHOUT authorization argument -> must fail closed!
+    proc_no_auth = subprocess.run([bash_bin, str(script_path), "--replace-authorized"], cwd=str(foreign_dir), capture_output=True, text=True)
+    assert proc_no_auth.returncode == 2
+    assert "Owner authorization missing" in proc_no_auth.stderr
+    # Archive remains unchanged!
+    assert tar_path.read_bytes() == orig_bytes
+
+    # 3. Run Phase 2 WITH valid authorization argument -> replacement succeeds!
+    proc_auth = subprocess.run([bash_bin, str(script_path), "--replace-authorized", cand_sha], cwd=str(foreign_dir), capture_output=True, text=True)
+    assert proc_auth.returncode == 0, f"Phase 2 failed:\nSTDOUT: {proc_auth.stdout}\nSTDERR: {proc_auth.stderr}"
+    assert "OWNER-AUTHORIZED REPLACEMENT COMPLETED SUCCESSFULLY" in proc_auth.stdout
+
+    # Original archive has been replaced atomically with candidate
+    new_bytes = tar_path.read_bytes()
+    assert new_bytes != orig_bytes
+    assert hashlib.sha256(new_bytes).hexdigest() == cand_sha
+
+    # Preserved baseline remains completely untouched!
+    assert pre_purge_file.read_bytes() == orig_bytes
+
+    # Post-replacement audit passes with ZERO risk
+    post_audit = audit_single_backup_dir(archive_dir)
+    assert "ZERO" in post_audit["residual_privacy_risk"]
+    assert len(post_audit["retained_delivered_photos"]) == 0
+    assert len(post_audit["retained_delivered_info"]) == 0
+
+
+def test_purge_runbook_pre_purge_baseline_protection_and_collision(tmp_path):
+    """
+    R4.4.4 Requirement 3 & Scenarios 4 & 5:
+    - Pre-existing .pre-purge destination aborts execution immediately;
+    - Existing baseline remains byte-for-byte unchanged;
+    - Original archive remains byte-for-byte unchanged.
+    """
+    bash_bin = get_bash_executable()
+    archive_dir, del_targets = create_synthetic_archive_fixture(tmp_path)
+    tar_path = archive_dir / "uploads.tar.gz"
+
+    orig_bytes = tar_path.read_bytes()
+
+    # Pre-create artificial baseline
+    pre_purge_file = archive_dir / "uploads.tar.gz.pre-purge"
+    existing_content = b"unrelated-existing-historical-pre-purge-baseline"
+    pre_purge_file.write_bytes(existing_content)
+
+    script_content = generate_purge_runbook_script(archive_dir, REPO_DIR, del_targets)
+    script_path = tmp_path / "runbook_collision.sh"
+    script_path.write_text(script_content, encoding="utf-8")
+
+    foreign_dir = tmp_path / "foreign_workdir_coll"
+    foreign_dir.mkdir()
+
+    # Execute preparation -> MUST abort because .pre-purge exists!
+    proc = subprocess.run([bash_bin, str(script_path), "--prepare"], cwd=str(foreign_dir), capture_output=True, text=True)
+    assert proc.returncode != 0
+    assert "uploads.tar.gz.pre-purge already exists" in proc.stderr
+
+    # Both files MUST remain byte-for-byte unchanged!
+    assert pre_purge_file.read_bytes() == existing_content
+    assert tar_path.read_bytes() == orig_bytes
+
+
+def test_purge_runbook_original_immutability_guard(tmp_path):
+    """
+    R4.4.4 Requirement 4 & Scenario 6:
+    If original archive is modified after Phase 1 inventory/preparation,
+    Phase 2 refuses replacement and aborts safely.
+    """
+    bash_bin = get_bash_executable()
+    archive_dir, del_targets = create_synthetic_archive_fixture(tmp_path)
+    tar_path = archive_dir / "uploads.tar.gz"
+
+    script_content = generate_purge_runbook_script(archive_dir, REPO_DIR, del_targets)
+    script_path = tmp_path / "runbook_guard.sh"
+    script_path.write_text(script_content, encoding="utf-8")
+
+    foreign_dir = tmp_path / "foreign_workdir_guard"
+    foreign_dir.mkdir()
+
+    # Phase 1 passes
+    proc_prep = subprocess.run([bash_bin, str(script_path), "--prepare"], cwd=str(foreign_dir), capture_output=True, text=True)
+    assert proc_prep.returncode == 0
+
+    cand_sha = json.loads((archive_dir / ".purge_staging" / "candidate_metadata.json").read_text())["candidate_sha"]
+
+    # Tamper with original archive before Phase 2 replacement
+    tampered_bytes = tar_path.read_bytes() + b"tampered-corruption"
+    tar_path.write_bytes(tampered_bytes)
+
+    # Phase 2 must refuse replacement!
+    proc_repl = subprocess.run([bash_bin, str(script_path), "--replace-authorized", cand_sha], cwd=str(foreign_dir), capture_output=True, text=True)
+    assert proc_repl.returncode != 0
+    assert "Original archive was modified after preparation" in proc_repl.stderr
+
+    # Archive is NOT replaced with candidate
+    assert tar_path.read_bytes() == tampered_bytes
+
+
+def test_purge_runbook_failed_verification_prevents_replacement(tmp_path):
+    """
+    R4.4.4 Scenarios 7, 8, 9:
+    - Candidate checksum mismatch prevents replacement;
+    - Invalid candidate / verification failure halts execution before replacement.
+    """
+    bash_bin = get_bash_executable()
+    archive_dir, del_targets = create_synthetic_archive_fixture(tmp_path)
+    tar_path = archive_dir / "uploads.tar.gz"
+    orig_bytes = tar_path.read_bytes()
+
+    script_content = generate_purge_runbook_script(archive_dir, REPO_DIR, del_targets)
+    script_path = tmp_path / "runbook_fail.sh"
+    script_path.write_text(script_content, encoding="utf-8")
+
+    foreign_dir = tmp_path / "foreign_workdir_fail"
+    foreign_dir.mkdir()
+
+    # Phase 1 succeeds
+    proc_prep = subprocess.run([bash_bin, str(script_path), "--prepare"], cwd=str(foreign_dir), capture_output=True, text=True)
+    assert proc_prep.returncode == 0
+
+    # Scenario 9: Candidate checksum mismatch
+    wrong_sha = "0000000000000000000000000000000000000000000000000000000000000000"
+    proc_mismatch = subprocess.run([bash_bin, str(script_path), "--replace-authorized", wrong_sha], cwd=str(foreign_dir), capture_output=True, text=True)
+    assert proc_mismatch.returncode != 0
+    assert "Authorization SHA-256 mismatch" in proc_mismatch.stderr
+    assert tar_path.read_bytes() == orig_bytes
+
+
+def test_purge_runbook_paths_with_spaces_and_special_chars(tmp_path):
+    """
+    R4.4.4 Scenario 12:
+    Paths and target filenames containing spaces and Unicode characters
+    are correctly quoted and execute cleanly end-to-end.
+    """
+    bash_bin = get_bash_executable()
+    space_base = tmp_path / "archive dir with spaces"
+    space_base.mkdir(parents=True)
+
+    archive_dir, del_targets = create_synthetic_archive_fixture(space_base)
+    tar_path = archive_dir / "uploads.tar.gz"
+
+    script_content = generate_purge_runbook_script(archive_dir, REPO_DIR, del_targets)
+    script_path = space_base / "runbook_spaces.sh"
+    script_path.write_text(script_content, encoding="utf-8")
+
+    foreign_dir = tmp_path / "foreign space dir"
+    foreign_dir.mkdir(parents=True)
+
+    # Phase 1: prepare
+    proc_prep = subprocess.run([bash_bin, str(script_path), "--prepare"], cwd=str(foreign_dir), capture_output=True, text=True)
+    assert proc_prep.returncode == 0, f"STDOUT: {proc_prep.stdout}\nSTDERR: {proc_prep.stderr}"
+
+    cand_sha = json.loads((archive_dir / ".purge_staging" / "candidate_metadata.json").read_text(encoding="utf-8"))["candidate_sha"]
+
+    # Phase 2: replace
+    proc_repl = subprocess.run([bash_bin, str(script_path), "--replace-authorized", cand_sha], cwd=str(foreign_dir), capture_output=True, text=True)
+    assert proc_repl.returncode == 0, f"STDOUT: {proc_repl.stdout}\nSTDERR: {proc_repl.stderr}"
+    assert hashlib.sha256(tar_path.read_bytes()).hexdigest() == cand_sha
+
+
+def test_purge_runbook_replacement_failure_preserves_recovery_artifacts(tmp_path):
+    """
+    R4.4.4 Scenario 10:
+    If replacement encounters an error, the staging recovery artifacts
+    are kept intact for investigation and never automatically deleted.
+    """
+    bash_bin = get_bash_executable()
+    archive_dir, del_targets = create_synthetic_archive_fixture(tmp_path)
+
+    script_content = generate_purge_runbook_script(archive_dir, REPO_DIR, del_targets)
+    script_path = tmp_path / "runbook_recovery.sh"
+    script_path.write_text(script_content, encoding="utf-8")
+
+    foreign_dir = tmp_path / "foreign_workdir_rec"
+    foreign_dir.mkdir()
+
+    proc_prep = subprocess.run([bash_bin, str(script_path), "--prepare"], cwd=str(foreign_dir), capture_output=True, text=True)
+    assert proc_prep.returncode == 0
+
+    staging_dir = archive_dir / ".purge_staging"
+    assert staging_dir.is_dir()
+    assert (staging_dir / "candidate" / "uploads.tar.gz").is_file()
+
+    # Corrupt candidate metadata so Phase 2 fails during verification
+    (staging_dir / "candidate" / "orders.db").unlink()
+
+    cand_sha = json.loads((staging_dir / "candidate_metadata.json").read_text())["candidate_sha"]
+    proc_fail = subprocess.run([bash_bin, str(script_path), "--replace-authorized", cand_sha], cwd=str(foreign_dir), capture_output=True, text=True)
+    assert proc_fail.returncode != 0
+
+    # Staging artifacts MUST still exist for recovery!
+    assert staging_dir.is_dir()
+    assert (staging_dir / "candidate" / "uploads.tar.gz").is_file()
