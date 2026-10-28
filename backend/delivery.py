@@ -413,6 +413,23 @@ def perform_job_cleanup(
             # Durable crash recovery: app started deletion and crashed around unlink/completion
             return _mark_cleanup_completed(db_path, job_id, token)
         else:
+            # Check if a sibling job with the same local_path already legally deleted the file with durable evidence
+            conn = sqlite3.connect(db_path, timeout=10)
+            sibling_deleted = 0
+            try:
+                sibling_deleted = conn.execute(
+                    "SELECT COUNT(*) FROM delivery_jobs "
+                    "WHERE local_path=? AND id!=? AND cleanup_state='completed' "
+                    "AND cleanup_phase='deleted' AND local_deleted_at IS NOT NULL",
+                    (raw_local_path, job_id),
+                ).fetchone()[0]
+            finally:
+                conn.close()
+
+            if sibling_deleted > 0:
+                # Sibling job already performed the physical deletion with durable evidence!
+                return _mark_cleanup_completed(db_path, job_id, token)
+
             # File missing before application deletion intent was ever established
             _mark_cleanup_failed(db_path, job_id, token, "MissingSourceBeforeCleanup")
             return False
