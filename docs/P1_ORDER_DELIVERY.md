@@ -116,6 +116,12 @@ This automated tool:
 - Snapshots SQLite `orders.db` via SQLite Online Backup API.
 - Archives **ONLY** local original files required for unfinished deliveries (`state IN ('pending', 'processing', 'failed')`) into `uploads.tar.gz`.
 - Strictly excludes photos from delivered orders (`state == 'delivered'`), guaranteeing zero delivered customer photo content in new backups.
+- **Fail-Closed Legacy P0 Recovery Protection (`--legacy-p0-policy [fail|include|exclude]`, default: `fail`):**
+  If physical files exist on disk for legacy P0 orders that lack `delivery_jobs` tracking records, their delivery and retention status cannot be verified with cryptographic certainty. The backup generator fails closed by default rather than silently omitting them or leaking delivered photos.
+  - **Reconciliation Runbook:**
+    1. *Active Legacy Orders:* Reconcile them into `delivery_jobs` so their lifecycle is tracked with P1 hashes and delivery states.
+    2. *Fulfilled Historical Orders:* If photos are obsolete copies, remove unindexed files or pass `--legacy-p0-policy exclude`.
+    3. *Preservation for Disaster Recovery:* If legacy files must be preserved in backup, explicitly pass `--legacy-p0-policy include`.
 - Generates `manifest.sha256` and structured metadata `backup_manifest.json` (`zero_retention_enforced: true`).
 - Automatically extracts and verifies the generated backup with `scripts/verify_backup_integrity.py`.
 - Sets secure permissions (`chmod 600` on files, `chmod 700` on directory).
@@ -130,10 +136,63 @@ To audit existing historical archives without modifying or deleting anything, us
 python3 /candidate/scripts/audit_backup_archives.py --backup-root /var/backups/photodoc
 ```
 
-The audit tool inspects `orders.db` and `uploads.tar.gz` in-memory, cross-references order delivery statuses, and reports:
-- Number of archives containing retained delivered customer photos (`residual_privacy_risk: HIGH`).
-- Number of legitimate recovery originals for unfinished deliveries.
-- Provides a safe, owner-controlled purge procedure (e.g. `tar --delete -f uploads.tar.gz uploads/<file>` and checksum recomputation) to allow an owner to redact historical customer photos without altering database audit trails.
+The audit tool inspects `orders.db` and `uploads.tar.gz` in-memory, cross-references order delivery statuses, and adheres to a strict fail-closed contract:
+- **Fail-Closed Risk Classification:**
+  - `HIGH`: Confirmed retained customer photos from delivered orders.
+  - `UNKNOWN` / `BLOCKED`: Untracked or unclassified archive files present, or unsupported archive formats detected. Never falsely classified as `ZERO`.
+  - `ERROR`: Corrupted archives, unreadable SQLite databases, or missing required backup directories.
+  - `ZERO`: Strictly all archives are readable, valid, fully accounted for, with 0 delivered customer photos and 0 untracked files.
+- **Deterministic CLI Exit Codes:**
+  - Exit `0`: All archives inspected have confirmed `ZERO` residual privacy risk.
+  - Exit `1`: Confirmed privacy risk (`HIGH`).
+  - Exit `2`: Inconclusive / unclassified files, empty inventory, or unsupported archive formats (`UNKNOWN` / `BLOCKED`).
+  - Exit `3`: Read or integrity errors (`ERROR`).
+- **Privacy Sanitization in Default Diagnostics:**
+  Default diagnostic output withholds customer PII and raw original filenames. Full detailed itemization for owner remediation is explicitly opt-in via `--show-details`.
+
+#### Safe 7-Step Owner-Controlled Remediation Workflow for Compressed Archives
+
+> [!IMPORTANT]
+> GNU tar does not support in-place deletion (`tar --delete`) on compressed archives (`.tar.gz`). Attempting to run `tar --delete` on a `.tar.gz` file fails with `tar: Cannot update compressed archives`. Use the following safe, verified reconstruction workflow instead:
+
+1. **Inventory and Verify Original Checksum:**
+   ```bash
+   cd /var/backups/photodoc/release_YYYYMMDD_HHMMSS
+   sha256sum -c manifest.sha256
+   tar -ztvf uploads.tar.gz > original_manifest.txt
+   ```
+2. **Create Isolated Temporary Working Copy:**
+   ```bash
+   WORK_DIR=$(mktemp -d -t photodoc_rebuild_XXXXXX)
+   cp uploads.tar.gz "${WORK_DIR}/uploads.tar.gz.orig"
+   ```
+3. **Rebuild Sanitized Archive (Excluding Only Approved Delivered Targets):**
+   ```bash
+   mkdir -p "${WORK_DIR}/rebuild"
+   tar -xzf "${WORK_DIR}/uploads.tar.gz.orig" -C "${WORK_DIR}/rebuild"
+   # Safely remove only the owner-approved delivered customer photo files:
+   rm -f "${WORK_DIR}/rebuild/uploads/<approved_delivered_filename>"
+   tar --numeric-owner -czvf "${WORK_DIR}/uploads.tar.gz.sanitized" -C "${WORK_DIR}/rebuild" uploads
+   ```
+4. **Verify Rebuilt Archive Readability and Member Inventory:**
+   ```bash
+   tar -ztvf "${WORK_DIR}/uploads.tar.gz.sanitized"
+   ```
+5. **Run Integrity Verification and Privacy Audit on Working Copy:**
+   ```bash
+   cp orders.db "${WORK_DIR}/orders.db"
+   python3 /candidate/scripts/verify_backup_integrity.py --db "${WORK_DIR}/orders.db" --uploads "${WORK_DIR}/rebuild/uploads"
+   python3 /candidate/scripts/audit_backup_archives.py --archive-dir "${WORK_DIR}"
+   ```
+6. **Confirm Unfinished Delivery Recovery Originals Remain Intact:**
+   Verify that all pending/failed delivery jobs retain their source files and the audit reports `ZERO` residual delivered photos.
+7. **Preserve Original Archive Until Explicit Owner Authorization:**
+   ```bash
+   cp uploads.tar.gz uploads.tar.gz.pre-purge
+   mv "${WORK_DIR}/uploads.tar.gz.sanitized" uploads.tar.gz
+   sha256sum orders.db uploads.tar.gz > manifest.sha256
+   rm -rf "${WORK_DIR}"
+   ```
 
 ### 5. Independent Sandbox Restore Rehearsal
 
