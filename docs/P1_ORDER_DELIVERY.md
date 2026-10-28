@@ -150,32 +150,48 @@ The audit tool inspects `orders.db` and `uploads.tar.gz` in-memory, cross-refere
 - **Privacy Sanitization in Default Diagnostics:**
   Default diagnostic output withholds customer PII and raw original filenames. Full detailed itemization for owner remediation is explicitly opt-in via `--show-details`.
 
-#### Safe Two-Phase Owner-Controlled Remediation Workflow for Compressed Archives
+#### Safe Two-Phase Owner-Controlled Remediation Workflow for Compressed Archives (R4.4.5 Transaction-Safe)
 
 > [!IMPORTANT]
 > GNU tar does not support in-place deletion (`tar --delete`) on compressed archives (`.tar.gz`). Attempting to run `tar --delete` on a `.tar.gz` file fails with `tar: Cannot update compressed archives`.
-> Furthermore, historical archives must never be replaced without an explicit, verifiable owner authorization gate. A two-phase workflow is strictly enforced:
-> - **Phase 1 (Preparation & Verification):** Prepares the candidate archive in an isolated staging workspace, performs race-safe baseline preservation, and verifies privacy and integrity contracts. Historical archives remain strictly untouched.
-> - **Phase 2 (Owner-Authorized Replacement):** Requires explicit owner authorization specifying the exact verified candidate SHA-256. Re-verifies baseline immutability and executes atomic replacement only when all contracts PASS.
+> Historical archives must never be replaced without an explicit, verifiable operator confirmation gate and strict transaction safety:
+> - **Cross-Process Exclusive Transaction Lock:** Remediations acquire `${ARCHIVE_DIR}/.remediation.lock` atomically via `mkdir` recording process PID, releasing it via bash trap (`EXIT INT TERM`). Concurrent invocations fail-closed immediately.
+> - **Symlink & Path Boundary Defense:** Archive directory and repository root are validated without path resolution (`os.path.islink()` / `[ -L ... ]`) and rejected if symlinked. Critical file paths are strictly bounded to the target directory.
+> - **Preservation of Recovery Artifacts:** `--prepare` never deletes pre-existing `.purge_staging` directories, failing closed if previous recovery artifacts exist.
+> - **Phase 1 (Preparation & Verification):** Prepares candidate archive in staging, creates atomic uncompressed/compressed pre-purge baselines (`uploads.tar.gz.pre-purge` and `manifest.sha256.pre-purge`), eliminates unredacted manifest dumps, and verifies candidate integrity and zero-retention privacy contracts. Active archive remains completely untouched.
+> - **Phase 2 (Operator-Confirmed Replacement & Atomic Rollback):** Requires explicit confirmation parameter (`--confirm <CANDIDATE_SHA>` or `--replace-authorized <CANDIDATE_SHA>`) with strict 64-hex character validation. Immediately re-validates original archive SHA-256 before commit, replaces archive and manifest atomically via secure non-predictable temporary files, runs post-replacement double-verification (manifest, privacy, integrity), and executes verified atomic rollback to `.pre-purge` baselines if any post-replacement check fails.
 
 ##### Phase 1: Candidate Preparation & Verification (`--prepare`)
 
-1. **Verify Source Files & Record Original Checksum:**
+1. **Acquire Exclusive Transaction Lock & Validate Path Boundaries:**
    ```bash
    ARCHIVE_DIR="/var/backups/photodoc/release_YYYYMMDD_HHMMSS"
    REPO_ROOT="/opt/photodoc"
-   ORIG_SHA=$(sha256sum "${ARCHIVE_DIR}/uploads.tar.gz" | awk '{print $1}')
-   tar -ztvf "${ARCHIVE_DIR}/uploads.tar.gz" > "${ARCHIVE_DIR}/original_manifest.txt"
+   LOCK_DIR="${ARCHIVE_DIR}/.remediation.lock"
+
+   # Cross-process mutex:
+   mkdir "${LOCK_DIR}" || { echo "ERROR: Another remediation process is currently running" >&2; exit 1; }
+   echo $$ > "${LOCK_DIR}/pid"
+   trap 'rm -rf "${LOCK_DIR}"' EXIT INT TERM
+
+   # Symlink rejection without dereferencing:
+   [ ! -L "${ARCHIVE_DIR}" ] || { echo "ERROR: Symlink archive directory rejected" >&2; exit 1; }
    ```
 
-2. **Race-Safe Atomic Baseline Preservation (`uploads.tar.gz.pre-purge`):**
+2. **Preserve Existing Staging Artifacts & Record Original Checksum:**
    ```bash
-   # Abort immediately if baseline already exists
-   test ! -e "${ARCHIVE_DIR}/uploads.tar.gz.pre-purge" || {
-     echo "ERROR: uploads.tar.gz.pre-purge already exists; aborting to prevent overwrite" >&2
+   STAGING_DIR="${ARCHIVE_DIR}/.purge_staging"
+   # Fail-closed if staging workspace already exists to protect forensics:
+   [ ! -e "${STAGING_DIR}" ] || {
+     echo "ERROR: Staging directory ${STAGING_DIR} already exists. Inspect or remove recovery artifacts before preparing a new candidate." >&2
      exit 1
    }
 
+   ORIG_SHA=$(sha256sum "${ARCHIVE_DIR}/uploads.tar.gz" | awk '{print $1}')
+   ```
+
+3. **Race-Safe Atomic Baseline Preservation (`uploads.tar.gz.pre-purge` and `manifest.sha256.pre-purge`):**
+   ```bash
    # Exclusive creation via O_CREAT | O_EXCL prevents concurrent clobbering:
    python3 -c '
    import sys, shutil
@@ -188,14 +204,18 @@ The audit tool inspects `orders.db` and `uploads.tar.gz` in-memory, cross-refere
        sys.exit(1)
    ' "${ARCHIVE_DIR}/uploads.tar.gz" "${ARCHIVE_DIR}/uploads.tar.gz.pre-purge"
 
+   # Preserve original manifest baseline:
+   if [ -f "${ARCHIVE_DIR}/manifest.sha256" ]; then
+     cp -n "${ARCHIVE_DIR}/manifest.sha256" "${ARCHIVE_DIR}/manifest.sha256.pre-purge"
+   fi
+
    # Verify preserved baseline matches recorded original checksum:
    PRE_PURGE_SHA=$(sha256sum "${ARCHIVE_DIR}/uploads.tar.gz.pre-purge" | awk '{print $1}')
    test "${PRE_PURGE_SHA}" = "${ORIG_SHA}" || { echo "ERROR: Baseline checksum mismatch" >&2; exit 1; }
    ```
 
-3. **Rebuild Candidate in Isolated Staging Workspace:**
+4. **Rebuild Candidate in Isolated Staging Workspace:**
    ```bash
-   STAGING_DIR="${ARCHIVE_DIR}/.purge_staging"
    mkdir -p "${STAGING_DIR}/rebuild" "${STAGING_DIR}/candidate"
    cp "${ARCHIVE_DIR}/uploads.tar.gz" "${STAGING_DIR}/uploads.tar.gz.orig"
    cp "${ARCHIVE_DIR}/orders.db" "${STAGING_DIR}/candidate/orders.db"
@@ -209,7 +229,7 @@ The audit tool inspects `orders.db` and `uploads.tar.gz` in-memory, cross-refere
    CANDIDATE_SHA=$(sha256sum "${STAGING_DIR}/candidate/uploads.tar.gz" | awk '{print $1}')
    ```
 
-4. **Verify Candidate via Integrity Verifier and Privacy Auditor:**
+5. **Verify Candidate via Integrity Verifier and Privacy Auditor:**
    ```bash
    python3 "${REPO_ROOT}/scripts/verify_backup_integrity.py" \
      --db "${STAGING_DIR}/candidate/orders.db" \
@@ -219,42 +239,48 @@ The audit tool inspects `orders.db` and `uploads.tar.gz` in-memory, cross-refere
      --archive-dir "${STAGING_DIR}/candidate"
    ```
 
-5. **Verify Original Archive Immutability & Record Metadata:**
+6. **Verify Original Archive Immutability & Record Metadata:**
    ```bash
    CHECK_ORIG_SHA=$(sha256sum "${ARCHIVE_DIR}/uploads.tar.gz" | awk '{print $1}')
    test "${CHECK_ORIG_SHA}" = "${ORIG_SHA}" || { echo "ERROR: Original archive modified during preparation" >&2; exit 1; }
    ```
    At the end of Phase 1, the historical archive remains completely untouched.
 
-##### Phase 2: Explicit Owner-Authorized Atomic Replacement (`--replace-authorized <CANDIDATE_SHA>`)
+##### Phase 2: Explicit Operator-Confirmed Atomic Replacement (`--confirm <CANDIDATE_SHA>`)
 
-6. **Owner Authorization Gate & Pre-Replacement Verification:**
+7. **Operator Confirmation Contract & Pre-Replacement Verification:**
    Replacement strictly requires passing the verified candidate SHA-256:
    ```bash
    # Phase 2 command:
-   # ./remediation_runbook.sh --replace-authorized <CANDIDATE_SHA>
+   # ./remediation_runbook.sh --confirm <CANDIDATE_SHA>
+   # (also accepts --replace-authorized <CANDIDATE_SHA>)
    ```
-   The replacement script verifies:
-   - Provided authorization matches `ACTUAL_CAND_SHA`.
-   - Current active `${ARCHIVE_DIR}/uploads.tar.gz` matches `${ORIG_SHA}` (no unrecorded modifications).
-   - Preserved baseline `${ARCHIVE_DIR}/uploads.tar.gz.pre-purge` matches `${ORIG_SHA}`.
-   - Candidate passes both integrity check and privacy audit prior to replacement.
+   The replacement script validates:
+   - Format: exactly 64 hexadecimal characters (exit code 2 if missing/invalid).
+   - Value: matches `ACTUAL_CAND_SHA` (exit code 1 if mismatch).
+   - Baselines: `uploads.tar.gz.pre-purge` matches `ORIG_SHA`.
+   - Candidate: passes both integrity verification and zero-retention privacy audit prior to replacement.
+   - Pre-commit check: immediately re-verifies active `uploads.tar.gz` SHA-256 before the rename step to close the race window.
 
-7. **Atomic Replacement on Same Filesystem:**
+8. **Atomic Replacement on Same Filesystem via Secure Temporary Files:**
    ```bash
-   # Copy candidate to temporary file on same filesystem to ensure atomic POSIX rename:
-   cp "${STAGING_DIR}/candidate/uploads.tar.gz" "${ARCHIVE_DIR}/.uploads.tar.gz.tmp_replacement"
-   mv "${ARCHIVE_DIR}/.uploads.tar.gz.tmp_replacement" "${ARCHIVE_DIR}/uploads.tar.gz"
-   (cd "${ARCHIVE_DIR}" && sha256sum orders.db uploads.tar.gz > manifest.sha256)
+   # Generates unguessable, exclusive temporary replacement files:
+   # Verifies target is not a pre-existing file or symlink:
+   mv "${TMP_REPLACEMENT_ARCHIVE}" "${ARCHIVE_DIR}/uploads.tar.gz"
+   mv "${TMP_REPLACEMENT_MANIFEST}" "${ARCHIVE_DIR}/manifest.sha256"
    ```
 
-8. **Post-Replacement Audit and Staging Cleanup:**
+9. **Post-Replacement Double Verification & Automatic Atomic Rollback:**
    ```bash
+   # 1. Manifest verification:
+   (cd "${ARCHIVE_DIR}" && sha256sum -c manifest.sha256)
+   # 2. Privacy verification:
    python3 "${REPO_ROOT}/scripts/audit_backup_archives.py" --archive-dir "${ARCHIVE_DIR}"
-   # Cleanup staging workspace ONLY after post-replacement verification PASSES:
-   rm -rf "${STAGING_DIR}"
+   # 3. Integrity verification on active archive:
+   python3 "${REPO_ROOT}/scripts/verify_backup_integrity.py" ...
    ```
-   If any failure occurs, `${STAGING_DIR}` is retained for investigation.
+   - **On Success:** Staging workspace `${STAGING_DIR}` is cleanly removed.
+   - **On Verification Failure:** Atomic rollback restores `${ARCHIVE_DIR}/uploads.tar.gz` and `${ARCHIVE_DIR}/manifest.sha256` from `.pre-purge` baselines (without deleting `.pre-purge`), verifies the restored hash against `ORIG_SHA`, retains `${STAGING_DIR}` intact for forensics, and exits with code 1 (`ROLLBACK_SUCCESS` or `RECOVERY_REQUIRED`).
 
 ### 5. Independent Sandbox Restore Rehearsal
 
