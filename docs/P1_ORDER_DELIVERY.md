@@ -212,9 +212,9 @@ Retries are capped at a maximum attempt limit (default: 10, configurable via
 Delivery state is in the same persistent database as the order. The Yandex upload uses
 the existing OAuth token, `overwrite=false`, and verifies remote SHA-256 and size before
 marking a job delivered. A matching remote file makes retries idempotent; a
-different file at that path is an error. Local sources remain available after
-delivery for manual recovery and backup; plan storage monitoring and a separate
-retention policy before deleting them.
+different file at that path is an error. Local sources are automatically and safely cleaned up immediately upon confirmed
+delivery to Yandex.Disk according to the Privacy by Design model (see Section 7 below).
+Temporary storage on the VPS is strictly ephemeral; Yandex.Disk is the authoritative persistent storage.
 
 Upload limits are aligned across the containerized reverse proxy (`client_max_body_size 100M`)
 and backend (20 MiB per file, 80 MiB per order) to guarantee that multipart requests within
@@ -230,3 +230,61 @@ SMTP jobs also persist. An SMTP failure leaves the job retryable. Delivery is
 at least once: if the SMTP server accepts a message and the process crashes
 before the success record is committed, a duplicate message remains possible.
 Payment status itself remains terminal and is never retried as a new charge.
+
+
+---
+
+## 7. Automated Photo Cleanup & Privacy by Design Architecture
+
+### 7.1 Core Storage Principle
+**Яндекс.Диск является постоянным защищённым хранилищем заказа; локальный VPS выполняет роль временного буфера до подтверждения доставки.**
+
+PhotoDoc AI реализует принцип *Privacy by Design* и минимизации хранения чувствительных персональных данных (фотографий клиентов). Клиентские фотографии и сопроводительные карточки (`info.txt`) удаляются с локального диска VPS автоматически, сразу же после гарантированной доставки в облако лаборатории.
+
+### 7.2 Детерминированный жизненный цикл клиентской фотографии
+Для каждого входящего файла:
+1. **Приём файла:** Поток загрузки сохраняется во временный файл `.incoming-*` в `/app/uploads` с вычислением SHA-256 и размера.
+2. **Атомарная фиксация заказа:** Файл перемещается в `{order_id}_{uuid}.{ext}`, и в одной SQLite-транзакции создаётся запись `delivery_jobs` (`kind='file'`) с исходными `content_sha256` и `content_size`.
+3. **Загрузка на Яндекс.Диск:** Фоновый worker забирает задачу по SQLite-лизингу (`claim_due`) и выгружает файл по OAuth API с параметром `overwrite=false`.
+4. **Удалённая сверка метаданных:** По завершении выгрузки worker запрашивает ресурсные метаданные Яндекс.Диска и сверяет удалённые `sha256` и `size` **строго с сохранёнными в `delivery_jobs`**, а не только с локальным файлом на диске.
+5. **Фиксация доставки:** SQLite транзакционно фиксирует `state='delivered'` с проверкой действующего лизинга (`finish`).
+6. **Независимая очистка:** Сразу после успешного COMMIT планируется очистка (`perform_job_cleanup`). **Каждый доставленный файл удаляется независимо**, не дожидаясь оплаты заказа, отправки email или доставки остальных вложений.
+7. **Верификация локального файла перед удалением:** Перед вызовом `unlink()` система проверяет:
+   - Путь строго внутри `/app/uploads` (защита от directory traversal `..`).
+   - Отсутствие символьных ссылок (защита от symlink-атак).
+   - Размер и SHA-256 локального файла точно совпадают с метаданными задачи (защита от подмены файла).
+   - Никакая другая незавершённая задача в `delivery_jobs` не ссылается на этот файл.
+8. **Фиксация очистки в SQLite:** Локальный файл удаляется (`unlink()`), и в БД фиксируется `cleanup_state='completed'`, `local_deleted_at=utc_now()`.
+
+Аналогичный цикл выполняется для файла `info.txt` (`kind='info'`).
+
+### 7.3 Устойчивость к сбоям (Crash Recovery State Machine)
+Состояние очистки отслеживается отдельным конечным автоматом в `delivery_jobs`:
+- `pending`: файл ожидает очистки после доставки.
+- `processing`: очистка выполняется конкретным worker под лизингом `cleanup_lease_until`.
+- `completed`: файл успешно удалён с локального диска, зафиксирован `local_deleted_at`.
+- `failed`: ошибка удаления (например, временная блокировка файла ОС), инкрементирован `cleanup_attempts`.
+- `not_applicable`: для почтовых задач (`admin_email`, `paid_email`).
+
+**Гарантии отказоустойчивости:**
+- **Идемпотентность:** Повторная очистка уже удалённого файла штатно возвращает успех и обновляет статус до `completed`.
+- **Никаких повторных отправок:** Сбой очистки **никогда не переводит** задачу обратно в `state='pending'` для повторной загрузки на Яндекс.Диск.
+- **Автоматическое восстановление при рестарте:** При перезапуске backend фоновый процесс `process_due_cleanups()` находит все доставленные задачи с `cleanup_state IN ('pending', 'failed')` и завершает очистку.
+- **Сбой между unlink и commit:** Если процесс аварийно завершился сразу после удаления файла до коммита в БД, при следующем запуске система видит отсутствие файла на диске при подтверждённой доставке и корректно фиксирует `cleanup_state='completed'`.
+
+### 7.4 Уборка временных файлов
+Функция `cleanup_orphaned_temporary_files()` безопасно удаляет остаточные файлы:
+- Осиротевшие `.incoming-*` после аварийного отключения клиентов при загрузке.
+- Временные файлы `.tmp*`.
+- **Защитный возрастной порог:** Файлы удаляются только при возрасте более 1 часа (`max_age_seconds=3600`) и при отсутствии ссылок из активных задач `delivery_jobs`.
+- **Запрет удаления по возрасту:** Файлы заказов (фотографии и `info.txt`) **категорически запрещено удалять по одному лишь возрасту** без подтверждения доставки в `delivery_jobs`.
+
+### 7.5 Физическое удаление на твердотельных накопителях (SSD/NVMe Disclaimer)
+> **Техническое уточнение о приватности:**
+> Стандартный системный вызов `unlink()` удаляет дескриптор файла и возвращает блоки файловой системе, передавая команду TRIM контроллеру диска. Однако из-за аппаратных особенностей SSD/NVMe (алгоритмы выравнивания износа Wear-Leveling, трансляция адресов FTL, резервные пулы Over-Provisioning) стандартное удаление файлов операционной системой **не даёт криптографической гарантии немедленного физического зануления ячеек flash-памяти**.
+> PhotoDoc AI обеспечивает защиту персональных данных за счёт минимизации времени жизни файлов на сервере (буферизация на несколько минут до выгрузки в облако) и запрета логирования содержимого. Для систем с абсолютными требованиями к криптографическому уничтожению рекомендуется применение полнодискового шифрования LUKS/dm-crypt с уничтожением эфемерных ключей при выводе дисков из эксплуатации.
+
+### 7.6 Регламент хранения существующих архивных копий
+1. **Исторические архивы:** Существующие архивные дампы (`photodoc_cutover.tar.gz`, снапшоты до внедрения очистки), содержащие клиентские фотографии, подлежат безопасному хранению в изолированном каталоге с правами `chmod 600` в течение 30-дневного скользящего периода (rolling retention) для целей аудита и аварийного восстановления.
+2. **Запрет автоматического удаления:** Автоматические скрипты **НЕ имеют права удалять существующие архивные дампы** без отдельного утверждённого регламента и прямого подтверждения владельца.
+3. **Новые инкрементальные бэкапы:** Все новые резервные копии, создаваемые после подтверждения доставки и очистки, содержат только базу данных SQLite (`orders.db`), метаданные и ещё не доставленные файлы, что минимизирует объём бэкапа и исключает накопление персональных фотографий.

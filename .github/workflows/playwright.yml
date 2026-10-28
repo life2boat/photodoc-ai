@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [ main, master, fix/p1-order-delivery-hardening ]
+    branches: [ main, master, fix/p1-order-delivery-hardening, feat/p1-auto-photo-cleanup ]
   pull_request:
-    branches: [ main, master, fix/p0-production-readiness ]
+    branches: [ main, master, fix/p0-production-readiness, infra/r2-public-https-preflight ]
   workflow_dispatch:
 
 jobs:
@@ -58,13 +58,14 @@ jobs:
         python-version: "3.11"
     - name: Install backend dependencies
       run: pip install -r requirements.txt
-    - name: Install pytest
-      run: pip install pytest
+    - name: Install pytest and pyyaml
+      run: pip install pytest pyyaml
     - name: Run backend security, migration, and delivery tests
       run: pytest tests -v
-    - name: Verify preflight script
+    - name: Verify preflight scripts
       run: |
         python ../scripts/production_preflight.py --db nonexistent.db || true
+        python ../scripts/verify_staging_delivery_preflight.py
 
   docker-build:
     name: Docker Build
@@ -458,6 +459,18 @@ jobs:
         echo "${STAGING_HEALTH_AFTER}" | grep -q '"status"[[:space:]]*:[[:space:]]*"ok"'
 
         echo "STAGING_COLD_START_AND_RESTART=PASS"
+
+        echo "7. Verifying staging delivery override configuration..."
+        # Missing staging token must fail closed
+        if docker compose -f docker-compose.staging.yml -f docker-compose.staging.delivery.yml config >/dev/null 2>&1; then
+          echo "FAIL: Staging delivery override succeeded without required YANDEX_DISK_STAGING_TOKEN!"
+          exit 1
+        fi
+        echo "STAGING_OVERRIDE_REQUIRES_EXPLICIT_TOKEN=true"
+        # Providing explicit staging token validates compose config
+        YANDEX_DISK_STAGING_TOKEN=y0_ci_test_token docker compose -f docker-compose.staging.yml -f docker-compose.staging.delivery.yml config >/dev/null
+        echo "STAGING_OVERRIDE_COMPOSE_VALID=true"
+
         cleanup_staging
         trap - EXIT
     - name: Dump logs on failure
