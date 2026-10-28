@@ -25,6 +25,7 @@ import sqlite3
 import subprocess
 import sys
 import tarfile
+import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
@@ -1529,6 +1530,18 @@ def get_bash_executable():
         return bash_path
     raise RuntimeError("No bash executable found on system")
 
+def can_create_symlinks():
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            src = os.path.join(td, "src")
+            dst = os.path.join(td, "dst")
+            open(src, "w").close()
+            os.symlink(src, dst)
+            return os.path.islink(dst)
+    except OSError:
+        return False
+
+
 
 def test_runbook_removal_target_validation_security():
     """
@@ -1897,3 +1910,343 @@ def test_purge_runbook_replacement_failure_preserves_recovery_artifacts(tmp_path
     # Staging artifacts MUST still exist for recovery!
     assert staging_dir.is_dir()
     assert (staging_dir / "candidate" / "uploads.tar.gz").is_file()
+
+
+def test_purge_runbook_existing_staging_artifacts_preserved(tmp_path):
+    """
+    R4.4.5 Requirement 2:
+    Existing .purge_staging directory is never silently deleted.
+    Preparation aborts without touching pre-existing recovery artifacts.
+    """
+    bash_bin = get_bash_executable()
+    archive_dir, del_targets = create_synthetic_archive_fixture(tmp_path)
+    tar_path = archive_dir / "uploads.tar.gz"
+    orig_bytes = tar_path.read_bytes()
+
+    # Pre-populate staging directory with synthetic recovery evidence
+    staging_dir = archive_dir / ".purge_staging"
+    staging_dir.mkdir(parents=True)
+    evidence_file = staging_dir / "recovery_evidence.txt"
+    sentinel_content = b"CRITICAL_RECOVERY_EVIDENCE_DO_NOT_DELETE"
+    evidence_file.write_bytes(sentinel_content)
+
+    script_content = generate_purge_runbook_script(archive_dir, REPO_DIR, del_targets)
+    script_path = tmp_path / "runbook_staging_guard.sh"
+    script_path.write_text(script_content, encoding="utf-8")
+
+    foreign_dir = tmp_path / "foreign_workdir_staging"
+    foreign_dir.mkdir()
+
+    proc = subprocess.run([bash_bin, str(script_path), "--prepare"], cwd=str(foreign_dir), capture_output=True, text=True)
+    assert proc.returncode != 0
+    assert "already exists; aborting to preserve recovery artifacts" in proc.stderr
+
+    # Assert evidence is completely untouched!
+    assert evidence_file.is_file()
+    assert evidence_file.read_bytes() == sentinel_content
+    # Original archive untouched!
+    assert tar_path.read_bytes() == orig_bytes
+
+
+def test_purge_runbook_concurrent_remediation_serialized(tmp_path):
+    """
+    R4.4.5 Requirement 4:
+    Remediation transaction uses an exclusive cross-process lock.
+    Competing invocations abort without touching or corrupting artifacts.
+    """
+    bash_bin = get_bash_executable()
+    archive_dir, del_targets = create_synthetic_archive_fixture(tmp_path)
+    tar_path = archive_dir / "uploads.tar.gz"
+    orig_bytes = tar_path.read_bytes()
+
+    script_content = generate_purge_runbook_script(archive_dir, REPO_DIR, del_targets)
+    script_path = tmp_path / "runbook_lock.sh"
+    script_path.write_text(script_content, encoding="utf-8")
+
+    foreign_dir = tmp_path / "foreign_workdir_lock"
+    foreign_dir.mkdir()
+
+    # Artificially acquire transaction lock
+    lock_dir = archive_dir / ".remediation.lock"
+    lock_dir.mkdir()
+    (lock_dir / "pid").write_text("999999", encoding="utf-8")
+
+    # Invocation MUST fail closed immediately!
+    proc = subprocess.run([bash_bin, str(script_path), "--prepare"], cwd=str(foreign_dir), capture_output=True, text=True)
+    assert proc.returncode != 0
+    assert "Remediation transaction lock is held by another process" in proc.stderr
+
+    # Original archive remains unchanged
+    assert tar_path.read_bytes() == orig_bytes
+
+    # Release lock manually and verify preparation can now succeed
+    lock_dir.rmdir() if not any(lock_dir.iterdir()) else shutil.rmtree(lock_dir)
+
+    proc_ok = subprocess.run([bash_bin, str(script_path), "--prepare"], cwd=str(foreign_dir), capture_output=True, text=True)
+    assert proc_ok.returncode == 0
+
+
+def test_purge_runbook_temporary_replacement_file_or_symlink_rejected(tmp_path):
+    """
+    R4.4.5 Requirement 3:
+    Rejects predictable temporary replacement path if pre-existing or symlinked.
+    External sentinel files remain byte-for-byte unchanged.
+    """
+    bash_bin = get_bash_executable()
+    archive_dir, del_targets = create_synthetic_archive_fixture(tmp_path)
+    tar_path = archive_dir / "uploads.tar.gz"
+    orig_bytes = tar_path.read_bytes()
+
+    sentinel_path = tmp_path / "external_sentinel.txt"
+    sentinel_bytes = b"EXTERNAL_SENTINEL_CONFIDENTIAL_CONTENT"
+    sentinel_path.write_bytes(sentinel_bytes)
+
+    # Place predictable temporary replacement path as regular file or symlink
+    tmp_replace = archive_dir / ".uploads.tar.gz.tmp_replacement"
+    if can_create_symlinks():
+        os.symlink(str(sentinel_path), str(tmp_replace))
+    else:
+        tmp_replace.write_bytes(b"EXISTING_TMP_FILE_BLOCKER")
+
+    script_content = generate_purge_runbook_script(archive_dir, REPO_DIR, del_targets)
+    script_path = tmp_path / "runbook_symlink_trap.sh"
+    script_path.write_text(script_content, encoding="utf-8")
+
+    foreign_dir = tmp_path / "foreign_workdir_symlink"
+    foreign_dir.mkdir()
+
+    proc = subprocess.run([bash_bin, str(script_path), "--prepare"], cwd=str(foreign_dir), capture_output=True, text=True)
+    assert proc.returncode != 0
+    assert "Predictable replacement path" in proc.stderr or "Path is a symbolic link" in proc.stderr
+
+    # Sentinel file MUST remain 100% byte-for-byte unchanged!
+    assert sentinel_path.read_bytes() == sentinel_bytes
+    assert tar_path.read_bytes() == orig_bytes
+
+
+def test_purge_runbook_symlink_archive_dir_rejected(tmp_path):
+    """
+    R4.4.5 Requirement 3:
+    Rejects symlinked archive directory in Python and at runtime.
+    Does not use Path.resolve() to convert untrusted symlink.
+    """
+    archive_dir, del_targets = create_synthetic_archive_fixture(tmp_path)
+
+    if can_create_symlinks():
+        symlink_arch = tmp_path / "symlinked_archive"
+        os.symlink(str(archive_dir), str(symlink_arch))
+
+        # Python generator rejects symlinked archive directory
+        with pytest.raises(ValueError, match="cannot be a symbolic link"):
+            generate_purge_runbook_script(symlink_arch, REPO_DIR, del_targets)
+
+
+def test_purge_runbook_candidate_change_after_prepare_aborts(tmp_path):
+    """
+    R4.4.5 Scenario 5:
+    If candidate archive is modified after Phase 1 preparation,
+    Phase 2 confirmation SHA mismatch aborts replacement.
+    """
+    bash_bin = get_bash_executable()
+    archive_dir, del_targets = create_synthetic_archive_fixture(tmp_path)
+    tar_path = archive_dir / "uploads.tar.gz"
+    orig_bytes = tar_path.read_bytes()
+
+    script_content = generate_purge_runbook_script(archive_dir, REPO_DIR, del_targets)
+    script_path = tmp_path / "runbook_cand_tamper.sh"
+    script_path.write_text(script_content, encoding="utf-8")
+
+    foreign_dir = tmp_path / "foreign_workdir_cand"
+    foreign_dir.mkdir()
+
+    proc_prep = subprocess.run([bash_bin, str(script_path), "--prepare"], cwd=str(foreign_dir), capture_output=True, text=True)
+    assert proc_prep.returncode == 0
+
+    cand_sha = json.loads((archive_dir / ".purge_staging" / "candidate_metadata.json").read_text())["candidate_sha"]
+
+    # Tamper with candidate archive in staging
+    cand_tar = archive_dir / ".purge_staging" / "candidate" / "uploads.tar.gz"
+    cand_tar.write_bytes(cand_tar.read_bytes() + b"corrupt")
+
+    # Phase 2 confirmation must abort!
+    proc_conf = subprocess.run([bash_bin, str(script_path), "--confirm", cand_sha], cwd=str(foreign_dir), capture_output=True, text=True)
+    assert proc_conf.returncode != 0
+    assert "Confirmation / Authorization SHA-256 mismatch" in proc_conf.stderr
+
+    # Original archive remains unchanged!
+    assert tar_path.read_bytes() == orig_bytes
+
+
+def test_purge_runbook_candidate_integrity_failure_aborts(tmp_path):
+    """
+    R4.4.5 Scenario 8:
+    If candidate database verification fails prior to replacement,
+    Phase 2 halts before active archive is modified.
+    """
+    bash_bin = get_bash_executable()
+    archive_dir, del_targets = create_synthetic_archive_fixture(tmp_path)
+    tar_path = archive_dir / "uploads.tar.gz"
+    orig_bytes = tar_path.read_bytes()
+
+    script_content = generate_purge_runbook_script(archive_dir, REPO_DIR, del_targets)
+    script_path = tmp_path / "runbook_integ_fail.sh"
+    script_path.write_text(script_content, encoding="utf-8")
+
+    foreign_dir = tmp_path / "foreign_workdir_integ"
+    foreign_dir.mkdir()
+
+    proc_prep = subprocess.run([bash_bin, str(script_path), "--prepare"], cwd=str(foreign_dir), capture_output=True, text=True)
+    assert proc_prep.returncode == 0
+
+    cand_sha = json.loads((archive_dir / ".purge_staging" / "candidate_metadata.json").read_text())["candidate_sha"]
+
+    # Corrupt candidate DB schema by corrupting file header
+    cand_db = archive_dir / ".purge_staging" / "candidate" / "orders.db"
+    cand_db.write_bytes(b"NOT_A_SQLITE_DATABASE_HEADER")
+
+    # Re-verify candidate fails, preventing replacement
+    proc_conf = subprocess.run([bash_bin, str(script_path), "--confirm", cand_sha], cwd=str(foreign_dir), capture_output=True, text=True)
+    assert proc_conf.returncode != 0
+
+    # Original archive remains 100% unchanged!
+    assert tar_path.read_bytes() == orig_bytes
+
+
+def test_purge_runbook_operator_confirmation_contract(tmp_path):
+    """
+    R4.4.5 Requirement 6:
+    Operator confirmation contract:
+    - Missing confirmation argument -> exit code 2
+    - Malformed confirmation argument (not 64-hex SHA) -> exit code 2
+    - Mismatched confirmation argument -> exit code 1
+    In all cases, active archive remains untouched.
+    """
+    bash_bin = get_bash_executable()
+    archive_dir, del_targets = create_synthetic_archive_fixture(tmp_path)
+    tar_path = archive_dir / "uploads.tar.gz"
+    orig_bytes = tar_path.read_bytes()
+
+    script_content = generate_purge_runbook_script(archive_dir, REPO_DIR, del_targets)
+    script_path = tmp_path / "runbook_confirm.sh"
+    script_path.write_text(script_content, encoding="utf-8")
+
+    foreign_dir = tmp_path / "foreign_workdir_conf"
+    foreign_dir.mkdir()
+
+    proc_prep = subprocess.run([bash_bin, str(script_path), "--prepare"], cwd=str(foreign_dir), capture_output=True, text=True)
+    assert proc_prep.returncode == 0
+
+    # 1. Missing argument -> code 2
+    res_missing = subprocess.run([bash_bin, str(script_path), "--confirm"], cwd=str(foreign_dir), capture_output=True, text=True)
+    assert res_missing.returncode == 2
+    assert "Owner authorization missing" in res_missing.stderr or "confirmation value missing" in res_missing.stderr
+
+    # 2. Malformed argument (not 64-hex) -> code 2
+    for bad_arg in ["short_hash", "xyz" * 21, "not-hex-chars-1234567890123456789012345678901234567890123456789012"]:
+        res_malformed = subprocess.run([bash_bin, str(script_path), "--confirm", bad_arg], cwd=str(foreign_dir), capture_output=True, text=True)
+        assert res_malformed.returncode == 2
+        assert "malformed or invalid" in res_malformed.stderr
+
+    # 3. Mismatched 64-hex -> code 1
+    res_mismatch = subprocess.run([bash_bin, str(script_path), "--confirm", "a" * 64], cwd=str(foreign_dir), capture_output=True, text=True)
+    assert res_mismatch.returncode == 1
+    assert "Confirmation / Authorization SHA-256 mismatch" in res_mismatch.stderr
+
+    # Archive untouched in all cases
+    assert tar_path.read_bytes() == orig_bytes
+
+
+def test_purge_runbook_post_replacement_failure_triggers_atomic_rollback(tmp_path):
+    """
+    R4.4.5 Requirement 5 & Scenarios 12, 14:
+    If post-replacement verification fails:
+    - Safe atomic rollback restores original archive from pre-purge baseline;
+    - Preserved baseline is NEVER deleted;
+    - Original archive checksum is verified;
+    - Recovery artifacts are kept for diagnostics.
+    """
+    bash_bin = get_bash_executable()
+    archive_dir, del_targets = create_synthetic_archive_fixture(tmp_path)
+    tar_path = archive_dir / "uploads.tar.gz"
+    orig_bytes = tar_path.read_bytes()
+    orig_sha = hashlib.sha256(orig_bytes).hexdigest()
+
+    # Pre-create valid manifest.sha256 using sha256sum in bash so checksum format matches exactly
+    subprocess.run([bash_bin, "-c", "sha256sum orders.db uploads.tar.gz > manifest.sha256"], cwd=str(archive_dir), check=True)
+
+    script_content = generate_purge_runbook_script(archive_dir, REPO_DIR, del_targets)
+    script_path = tmp_path / "runbook_rollback.sh"
+    script_path.write_text(script_content, encoding="utf-8")
+
+    foreign_dir = tmp_path / "foreign_workdir_rollback"
+    foreign_dir.mkdir()
+
+    # Phase 1 passes
+    proc_prep = subprocess.run([bash_bin, str(script_path), "--prepare"], cwd=str(foreign_dir), capture_output=True, text=True)
+    assert proc_prep.returncode == 0
+
+    cand_sha = json.loads((archive_dir / ".purge_staging" / "candidate_metadata.json").read_text())["candidate_sha"]
+
+    # Inject failure into post-replacement integrity check by mutating orders.db in active archive
+    # to corrupt expected checksum of pending job:
+    with sqlite3.connect(archive_dir / "orders.db") as conn:
+        conn.execute("UPDATE delivery_jobs SET content_sha256='0000000000000000000000000000000000000000000000000000000000000000' WHERE state='pending'")
+        conn.commit()
+
+    # Run Phase 2 confirmation
+    proc_repl = subprocess.run([bash_bin, str(script_path), "--confirm", cand_sha], cwd=str(foreign_dir), capture_output=True, text=True)
+    assert proc_repl.returncode != 0
+    assert "CRITICAL: Post-replacement verification failed! Initiating safe atomic rollback..." in proc_repl.stderr
+    assert "ROLLBACK_SUCCESS: Historical archive and manifest safely restored to original baseline" in proc_repl.stderr
+
+    # PROVE: Active archive restored byte-for-byte to original!
+    assert tar_path.read_bytes() == orig_bytes
+    assert hashlib.sha256(tar_path.read_bytes()).hexdigest() == orig_sha
+
+    # PROVE: Pre-purge baseline remains intact!
+    pre_purge_file = archive_dir / "uploads.tar.gz.pre-purge"
+    assert pre_purge_file.is_file()
+    assert pre_purge_file.read_bytes() == orig_bytes
+
+    # PROVE: Staging artifacts PRESERVED for investigation!
+    assert (archive_dir / ".purge_staging").is_dir()
+    assert (archive_dir / ".purge_staging" / "candidate" / "uploads.tar.gz").is_file()
+
+
+def test_purge_runbook_rollback_failure_reports_recovery_required(tmp_path):
+    """
+    R4.4.5 Scenario 15:
+    If rollback cannot be completed safely (e.g. baseline was corrupted during rollback),
+    emits RECOVERY_REQUIRED and preserves all artifacts.
+    """
+    bash_bin = get_bash_executable()
+    archive_dir, del_targets = create_synthetic_archive_fixture(tmp_path)
+
+    script_content = generate_purge_runbook_script(archive_dir, REPO_DIR, del_targets)
+
+    # In the generated script, simulate corruption during rollback copy
+    target_pattern = 'shutil.copyfile(sys.argv[2], p)'
+    replacement_pattern = 'shutil.copyfile(sys.argv[2], p)\nopen(p, "wb").write(b"CORRUPTED_DURING_ROLLBACK")'
+    assert target_pattern in script_content
+    script_content = script_content.replace(target_pattern, replacement_pattern, 1)
+
+    script_path = tmp_path / "runbook_rec_req.sh"
+    script_path.write_text(script_content, encoding="utf-8")
+
+    foreign_dir = tmp_path / "foreign_workdir_rec_req"
+    foreign_dir.mkdir()
+
+    proc_prep = subprocess.run([bash_bin, str(script_path), "--prepare"], cwd=str(foreign_dir), capture_output=True, text=True)
+    assert proc_prep.returncode == 0
+
+    cand_sha = json.loads((archive_dir / ".purge_staging" / "candidate_metadata.json").read_text())["candidate_sha"]
+
+    # Mutate active orders.db so post-replacement verification fails
+    with sqlite3.connect(archive_dir / "orders.db") as conn:
+        conn.execute("UPDATE delivery_jobs SET content_sha256='0000000000000000000000000000000000000000000000000000000000000000' WHERE state='pending'")
+        conn.commit()
+
+    proc_repl = subprocess.run([bash_bin, str(script_path), "--confirm", cand_sha], cwd=str(foreign_dir), capture_output=True, text=True)
+    assert proc_repl.returncode != 0
+    assert "RECOVERY_REQUIRED: Manual intervention required" in proc_repl.stderr
+    assert (archive_dir / ".purge_staging").is_dir()
