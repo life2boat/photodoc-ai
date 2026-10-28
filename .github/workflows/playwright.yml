@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [ main, master, fix/p1-order-delivery-hardening, feat/p1-auto-photo-cleanup ]
+    branches: [ main, master, fix/p1-order-delivery-hardening, feat/p1-auto-photo-cleanup, infra/r4-prebuilt-staging-images ]
   pull_request:
-    branches: [ main, master, fix/p0-production-readiness, infra/r2-public-https-preflight ]
+    branches: [ main, master, fix/p0-production-readiness, infra/r2-public-https-preflight, feat/p1-auto-photo-cleanup ]
   workflow_dispatch:
 
 jobs:
@@ -473,6 +473,71 @@ jobs:
 
         cleanup_staging
         trap - EXIT
+    - name: Verify prebuilt staging Docker Compose configurations and cold-start
+      run: |
+        set -eu
+        echo "1. Verifying prebuilt compose files contain zero build sections..."
+        if grep -E '^[[:space:]]*build[[:space:]]*:' docker-compose.staging.prebuilt.yml docker-compose.staging.prebuilt.delivery.yml; then
+          echo "FAIL: Found forbidden 'build:' section in prebuilt compose files!"
+          exit 1
+        fi
+        echo "ZERO_BUILD_SECTIONS_VERIFIED=true"
+
+        echo "2. Verifying prebuilt staging compose fails closed when images are missing..."
+        if docker compose -f docker-compose.staging.prebuilt.yml config >/dev/null 2>&1; then
+          echo "FAIL: prebuilt staging compose succeeded without required images!"
+          exit 1
+        fi
+        echo "PREBUILT_MISSING_IMAGES_FAILS_CLOSED=true"
+
+        echo "3. Verifying prebuilt staging compose succeeds when image variables are supplied..."
+        PHOTODOC_BACKEND_IMAGE="ghcr.io/life2boat/photodoc-backend:cand" \
+        PHOTODOC_FRONTEND_IMAGE="ghcr.io/life2boat/photodoc-frontend:cand" \
+        docker compose -f docker-compose.staging.prebuilt.yml config >/dev/null
+        echo "PREBUILT_COMPOSE_VALID=true"
+
+        echo "4. Verifying prebuilt delivery override requires token..."
+        if PHOTODOC_BACKEND_IMAGE="ghcr.io/life2boat/photodoc-backend:cand" \
+           PHOTODOC_FRONTEND_IMAGE="ghcr.io/life2boat/photodoc-frontend:cand" \
+           docker compose -f docker-compose.staging.prebuilt.yml -f docker-compose.staging.prebuilt.delivery.yml config >/dev/null 2>&1; then
+          echo "FAIL: prebuilt delivery override succeeded without required YANDEX_DISK_STAGING_TOKEN!"
+          exit 1
+        fi
+        echo "PREBUILT_OVERRIDE_REQUIRES_TOKEN=true"
+
+        PHOTODOC_BACKEND_IMAGE="ghcr.io/life2boat/photodoc-backend:cand" \
+        PHOTODOC_FRONTEND_IMAGE="ghcr.io/life2boat/photodoc-frontend:cand" \
+        YANDEX_DISK_STAGING_TOKEN="y0_ci_test" \
+        docker compose -f docker-compose.staging.prebuilt.yml -f docker-compose.staging.prebuilt.delivery.yml config >/dev/null
+        echo "PREBUILT_OVERRIDE_CONFIG_VALID=true"
+
+        echo "5. Verifying prebuilt staging container cold-start without --build..."
+        PREBUILT_PROJECT="staging-prebuilt-ci-${GITHUB_RUN_ID}"
+        PREBUILT_PORT="8082"
+        cleanup_prebuilt() {
+          docker compose -p "${PREBUILT_PROJECT}" -f docker-compose.staging.prebuilt.yml logs --no-color 2>/dev/null || true
+          docker compose -p "${PREBUILT_PROJECT}" -f docker-compose.staging.prebuilt.yml down -v --remove-orphans >/dev/null 2>&1 || true
+        }
+        trap cleanup_prebuilt EXIT
+
+        # Find locally built images from previous compose build step
+        BACKEND_IMG=$(docker compose images -q backend | head -n1)
+        FRONTEND_IMG=$(docker compose images -q frontend | head -n1)
+        docker tag "${BACKEND_IMG}" "photodoc-backend-candidate:${GITHUB_SHA}"
+        docker tag "${FRONTEND_IMG}" "photodoc-frontend-candidate:${GITHUB_SHA}"
+
+        PHOTODOC_BACKEND_IMAGE="photodoc-backend-candidate:${GITHUB_SHA}" \
+        PHOTODOC_FRONTEND_IMAGE="photodoc-frontend-candidate:${GITHUB_SHA}" \
+        STAGING_PORT="${PREBUILT_PORT}" \
+        docker compose -p "${PREBUILT_PROJECT}" -f docker-compose.staging.prebuilt.yml up -d --no-build --wait --wait-timeout 180
+
+        PREBUILT_HEALTH=$(curl --fail -sS "http://127.0.0.1:${PREBUILT_PORT}/api/health")
+        echo "Prebuilt Staging Health: ${PREBUILT_HEALTH}"
+        echo "${PREBUILT_HEALTH}" | grep -q '"status"[[:space:]]*:[[:space:]]*"ok"'
+        echo "PREBUILT_COLD_START_PASSES=true"
+
+        cleanup_prebuilt
+        trap - EXIT
     - name: Dump logs on failure
       if: failure()
       run: |
@@ -481,3 +546,130 @@ jobs:
     - name: Teardown containers
       if: always()
       run: docker compose down -v
+
+  publish-images:
+    name: Build & Publish GHCR Images
+    runs-on: ubuntu-latest
+    needs: [docker-build, payment-security-tests, playwright-tests]
+    if: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/infra/r4-prebuilt-staging-images') }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute build metadata and tags
+        id: meta
+        run: |
+          set -eu
+          SHORT_SHA=$(echo "${GITHUB_SHA}" | cut -c1-7)
+          BUILD_TIME=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          OWNER_LOWER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          echo "short_sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "build_time=${BUILD_TIME}" >> "$GITHUB_OUTPUT"
+          echo "backend_full=ghcr.io/${OWNER_LOWER}/photodoc-backend:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          echo "backend_short=ghcr.io/${OWNER_LOWER}/photodoc-backend:${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "frontend_full=ghcr.io/${OWNER_LOWER}/photodoc-frontend:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          echo "frontend_short=ghcr.io/${OWNER_LOWER}/photodoc-frontend:${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push Backend image
+        id: build_backend
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend
+          file: ./backend/Dockerfile
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.backend_full }}
+            ${{ steps.meta.outputs.backend_short }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.created=${{ steps.meta.outputs.build_time }}
+          cache-from: type=gha,scope=backend
+          cache-to: type=gha,mode=max,scope=backend
+
+      - name: Build and push Frontend image
+        id: build_frontend
+        uses: docker/build-push-action@v6
+        with:
+          context: ./frontend
+          file: ./frontend/Dockerfile
+          push: true
+          build-args: |
+            VITE_API_URL=/api
+            VITE_YANDEX_METRIKA_ID=
+            VITE_SUPABASE_URL=
+            VITE_SUPABASE_ANON_KEY=
+          tags: |
+            ${{ steps.meta.outputs.frontend_full }}
+            ${{ steps.meta.outputs.frontend_short }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.created=${{ steps.meta.outputs.build_time }}
+          cache-from: type=gha,scope=frontend
+          cache-to: type=gha,mode=max,scope=frontend
+
+      - name: Generate release manifest
+        id: manifest
+        run: |
+          set -eu
+          BACKEND_DIGEST="${{ steps.build_backend.outputs.digest }}"
+          FRONTEND_DIGEST="${{ steps.build_frontend.outputs.digest }}"
+
+          cat << EOF > release-manifest.json
+          {
+            "repository": "${{ github.repository }}",
+            "commit_sha": "${{ github.sha }}",
+            "short_sha": "${{ steps.meta.outputs.short_sha }}",
+            "created_at": "${{ steps.meta.outputs.build_time }}",
+            "images": {
+              "backend": {
+                "image": "${{ steps.meta.outputs.backend_full }}",
+                "short_tag": "${{ steps.meta.outputs.backend_short }}",
+                "digest": "${BACKEND_DIGEST}"
+              },
+              "frontend": {
+                "image": "${{ steps.meta.outputs.frontend_full }}",
+                "short_tag": "${{ steps.meta.outputs.frontend_short }}",
+                "digest": "${FRONTEND_DIGEST}"
+              }
+            }
+          }
+          EOF
+
+          echo "Release manifest generated:"
+          cat release-manifest.json
+
+          echo "### PhotoDoc AI Prebuilt Images Published to GHCR" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Component | Tag | Immutable Digest |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Backend** | \`${{ steps.meta.outputs.backend_full }}\` | \`${BACKEND_DIGEST}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Frontend** | \`${{ steps.meta.outputs.frontend_full }}\` | \`${FRONTEND_DIGEST}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Staging Deployment via Digest (Pinned & Immutable):**" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`\`\`bash" >> "$GITHUB_STEP_SUMMARY"
+          echo "PHOTODOC_BACKEND_IMAGE="ghcr.io/${{ github.repository_owner }}/photodoc-backend@${BACKEND_DIGEST}" \\" >> "$GITHUB_STEP_SUMMARY"
+          echo "PHOTODOC_FRONTEND_IMAGE="ghcr.io/${{ github.repository_owner }}/photodoc-frontend@${FRONTEND_DIGEST}" \\" >> "$GITHUB_STEP_SUMMARY"
+          echo "docker compose -p photodoc-staging -f docker-compose.staging.prebuilt.yml up -d --no-build" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`\`\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload release manifest artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-manifest
+          path: release-manifest.json
+          retention-days: 90
