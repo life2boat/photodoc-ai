@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shlex
 import os
 import shutil
 import sqlite3
@@ -729,45 +730,25 @@ def _aggregate_archive_report(summary: Dict[str, Any], rep: Dict[str, Any]) -> N
         summary["errors"].extend(rep["errors"])
 
 
-def generate_purge_runbook_commands(
-    archive_dir: Path,
-    repo_root: Path,
-    delivered_files_to_remove: Optional[List[str]] = None,
-) -> List[str]:
+def validate_removal_target(filename: str) -> str:
     """
-    Authoritative generator of the exact 7-step remediation runbook command sequence.
-    Guarantees deterministic, genuinely executable commands with explicit paths,
-    pre-purge collision detection, and zero reliance on relative caller directories.
+    Validates that a removal target is a safe single filename within uploads:
+    - Rejects path traversal (..), absolute paths, and path separators (/ or \\).
+    - Rejects control characters and dangerous shell injection characters.
+    - Allows valid filenames containing spaces and Unicode characters.
     """
-    arch_str = str(archive_dir)
-    repo_str = str(repo_root)
-    targets = delivered_files_to_remove or ["<approved_delivered_filename>"]
-    rm_cmds = " && ".join([f'rm -f "${{WORK_DIR}}/rebuild/uploads/{f}"' for f in targets])
-
-    return [
-        f'ARCHIVE_DIR="{arch_str}"',
-        f'REPO_ROOT="{repo_str}"',
-        'test ! -e "${ARCHIVE_DIR}/uploads.tar.gz.pre-purge" || { echo "ERROR: uploads.tar.gz.pre-purge already exists; aborting to prevent overwrite" >&2; exit 1; }',
-        '(cd "${ARCHIVE_DIR}" && sha256sum -c manifest.sha256)',
-        'tar -ztvf "${ARCHIVE_DIR}/uploads.tar.gz" > "${ARCHIVE_DIR}/original_manifest.txt"',
-        'ORIG_SHA=$(sha256sum "${ARCHIVE_DIR}/uploads.tar.gz" | awk \'{print $1}\')',
-        'WORK_DIR=$(mktemp -d -t photodoc_rebuild_XXXXXX)',
-        'mkdir -p "${WORK_DIR}/rebuild" "${WORK_DIR}/candidate"',
-        'cp "${ARCHIVE_DIR}/uploads.tar.gz" "${WORK_DIR}/uploads.tar.gz.orig"',
-        'cp "${ARCHIVE_DIR}/orders.db" "${WORK_DIR}/candidate/orders.db"',
-        'cp -n "${ARCHIVE_DIR}/uploads.tar.gz" "${ARCHIVE_DIR}/uploads.tar.gz.pre-purge" || { echo "ERROR: Pre-purge copy failed or file exists" >&2; exit 1; }',
-        'tar -xzf "${WORK_DIR}/uploads.tar.gz.orig" -C "${WORK_DIR}/rebuild"',
-        rm_cmds,
-        'tar --numeric-owner -czvf "${WORK_DIR}/candidate/uploads.tar.gz" -C "${WORK_DIR}/rebuild" uploads',
-        'tar -ztvf "${WORK_DIR}/candidate/uploads.tar.gz" >/dev/null',
-        '(cd "${WORK_DIR}/candidate" && sha256sum orders.db uploads.tar.gz > manifest.sha256)',
-        'python3 "${REPO_ROOT}/scripts/verify_backup_integrity.py" --db "${WORK_DIR}/candidate/orders.db" --uploads "${WORK_DIR}/rebuild/uploads"',
-        'python3 "${REPO_ROOT}/scripts/audit_backup_archives.py" --archive-dir "${WORK_DIR}/candidate"',
-        '# OWNER AUTHORIZATION REQUIRED BEFORE PROCEEDING TO REPLACEMENT',
-        'cp "${WORK_DIR}/candidate/uploads.tar.gz" "${ARCHIVE_DIR}/uploads.tar.gz"',
-        'cp "${WORK_DIR}/candidate/manifest.sha256" "${ARCHIVE_DIR}/manifest.sha256"',
-        'rm -rf "${WORK_DIR}"',
-    ]
+    if not filename or not isinstance(filename, str):
+        raise ValueError("Removal target must be a non-empty string")
+    if "\x00" in filename or "\n" in filename or "\r" in filename:
+        raise ValueError(f"Removal target contains control characters: {repr(filename)}")
+    if "/" in filename or "\\" in filename:
+        raise ValueError(f"Removal target cannot contain path separators: {filename}")
+    if filename in (".", "..") or ".." in filename:
+        raise ValueError(f"Removal target cannot contain path traversal: {filename}")
+    for ch in [";", "&", "|", "`", "$", "(", ")", "<", ">", '"', "'", "*", "?", "[", "]"]:
+        if ch in filename:
+            raise ValueError(f"Removal target contains disallowed shell character '{ch}': {filename}")
+    return filename
 
 
 def generate_purge_runbook_script(
@@ -776,16 +757,256 @@ def generate_purge_runbook_script(
     delivered_files_to_remove: Optional[List[str]] = None,
 ) -> str:
     """
-    Renders an executable shell script of the authoritative remediation runbook.
+    Authoritative generator of the two-phase owner-controlled remediation runbook script.
+    - Phase 1 (--prepare): Prepares and validates candidate; verifies original archive immutability;
+      preserves race-safe pre-purge baseline. NEVER replaces historical archives.
+    - Phase 2 (--replace-authorized <CANDIDATE_SHA>): Owner-authorized atomic replacement. Fails closed
+      if authorization is missing or mismatched, or if any verification check fails.
     """
-    commands = generate_purge_runbook_commands(archive_dir, repo_root, delivered_files_to_remove)
-    header = [
-        "#!/usr/bin/env bash",
-        "set -euo pipefail",
-        "# PhotoDoc AI — Safe Owner-Controlled Archive Remediation Runbook",
-        "",
-    ]
-    return "\n".join(header + commands) + "\n"
+    arch_resolved = Path(archive_dir).resolve()
+    repo_resolved = Path(repo_root).resolve()
+    arch_posix = arch_resolved.as_posix()
+    repo_posix = repo_resolved.as_posix()
+    q_arch = shlex.quote(arch_posix)
+    q_repo = shlex.quote(repo_posix)
+
+    if delivered_files_to_remove:
+        validated_targets = [validate_removal_target(f) for f in delivered_files_to_remove]
+        rm_lines = [f'rm -f "${{REBUILD_DIR}}/uploads/"{shlex.quote(f)}' for f in validated_targets]
+        rm_cmds = "\n        ".join(rm_lines)
+    else:
+        rm_cmds = 'rm -f "${REBUILD_DIR}/uploads/<approved_delivered_filename>"'
+
+    return f"""#!/usr/bin/env bash
+set -euo pipefail
+# PhotoDoc AI — Safe Owner-Controlled Archive Remediation Runbook
+# Two-Phase Workflow: Prepare & Verify (Phase 1) -> Owner-Authorized Replacement (Phase 2)
+
+ARCHIVE_DIR={q_arch}
+REPO_ROOT={q_repo}
+STAGING_DIR="${{ARCHIVE_DIR}}/.purge_staging"
+REBUILD_DIR="${{STAGING_DIR}}/rebuild"
+CANDIDATE_DIR="${{STAGING_DIR}}/candidate"
+META_FILE="${{STAGING_DIR}}/candidate_metadata.json"
+
+# Detect Python interpreter
+if command -v python3 >/dev/null 2>&1 && python3 -c 'import sys' 2>/dev/null; then
+    PYTHON_BIN="python3"
+elif command -v python >/dev/null 2>&1 && python -c 'import sys' 2>/dev/null; then
+    PYTHON_BIN="python"
+else
+    echo "ERROR: Python interpreter not found" >&2
+    exit 1
+fi
+
+ACTION="${{1:---prepare}}"
+
+case "${{ACTION}}" in
+    --prepare)
+        echo "=== [Phase 1: Candidate Preparation & Verification] ==="
+        if [ ! -d "${{ARCHIVE_DIR}}" ]; then
+            echo "ERROR: Archive directory does not exist: ${{ARCHIVE_DIR}}" >&2
+            exit 1
+        fi
+        if [ ! -f "${{ARCHIVE_DIR}}/uploads.tar.gz" ] || [ ! -f "${{ARCHIVE_DIR}}/orders.db" ]; then
+            echo "ERROR: Missing uploads.tar.gz or orders.db in ${{ARCHIVE_DIR}}" >&2
+            exit 1
+        fi
+
+        # Pre-purge baseline overwrite protection
+        if [ -e "${{ARCHIVE_DIR}}/uploads.tar.gz.pre-purge" ]; then
+            echo "ERROR: uploads.tar.gz.pre-purge already exists; aborting to prevent overwrite" >&2
+            exit 1
+        fi
+
+        # Calculate original archive checksum
+        ORIG_SHA=$(sha256sum "${{ARCHIVE_DIR}}/uploads.tar.gz" | awk '{{print $1}}')
+        tar --force-local -ztvf "${{ARCHIVE_DIR}}/uploads.tar.gz" > "${{ARCHIVE_DIR}}/original_manifest.txt"
+
+        # Race-safe atomic exclusive creation of .pre-purge baseline
+        "${{PYTHON_BIN}}" -c '
+import sys, shutil
+src = sys.argv[1]
+dst = sys.argv[2]
+try:
+    with open(src, "rb") as f_in, open(dst, "xb") as f_out:
+        shutil.copyfileobj(f_in, f_out)
+except FileExistsError:
+    sys.stderr.write("ERROR: Pre-purge baseline already exists; aborting to prevent overwrite\\n")
+    sys.exit(1)
+' "${{ARCHIVE_DIR}}/uploads.tar.gz" "${{ARCHIVE_DIR}}/uploads.tar.gz.pre-purge"
+
+        # Verify preserved baseline matches recorded original checksum
+        PRE_PURGE_SHA=$(sha256sum "${{ARCHIVE_DIR}}/uploads.tar.gz.pre-purge" | awk '{{print $1}}')
+        if [ "${{PRE_PURGE_SHA}}" != "${{ORIG_SHA}}" ]; then
+            echo "ERROR: Preserved baseline SHA-256 (${{PRE_PURGE_SHA}}) does not match original (${{ORIG_SHA}})" >&2
+            exit 1
+        fi
+
+        # Prepare isolated workspace
+        rm -rf "${{STAGING_DIR}}"
+        mkdir -p "${{REBUILD_DIR}}" "${{CANDIDATE_DIR}}"
+        cp "${{ARCHIVE_DIR}}/uploads.tar.gz" "${{STAGING_DIR}}/uploads.tar.gz.orig"
+        cp "${{ARCHIVE_DIR}}/orders.db" "${{CANDIDATE_DIR}}/orders.db"
+
+        # Extract uploads
+        tar --force-local -xzf "${{STAGING_DIR}}/uploads.tar.gz.orig" -C "${{REBUILD_DIR}}"
+
+        # Remove approved target delivered files
+        {rm_cmds}
+
+        # Repackage candidate archive
+        tar --force-local --numeric-owner -czf "${{CANDIDATE_DIR}}/uploads.tar.gz" -C "${{REBUILD_DIR}}" uploads
+        tar --force-local -ztvf "${{CANDIDATE_DIR}}/uploads.tar.gz" >/dev/null
+
+        # Candidate manifest & checksum
+        (cd "${{CANDIDATE_DIR}}" && sha256sum orders.db uploads.tar.gz > manifest.sha256)
+        CANDIDATE_SHA=$(sha256sum "${{CANDIDATE_DIR}}/uploads.tar.gz" | awk '{{print $1}}')
+
+        # Run verification CLIs
+        echo "Running backup integrity verifier on candidate..."
+        "${{PYTHON_BIN}}" "${{REPO_ROOT}}/scripts/verify_backup_integrity.py" --db "${{CANDIDATE_DIR}}/orders.db" --uploads "${{REBUILD_DIR}}/uploads"
+        echo "Running privacy risk auditor on candidate..."
+        "${{PYTHON_BIN}}" "${{REPO_ROOT}}/scripts/audit_backup_archives.py" --archive-dir "${{CANDIDATE_DIR}}"
+
+        # Guard original archive immutability during preparation
+        CHECK_ORIG_SHA=$(sha256sum "${{ARCHIVE_DIR}}/uploads.tar.gz" | awk '{{print $1}}')
+        if [ "${{CHECK_ORIG_SHA}}" != "${{ORIG_SHA}}" ]; then
+            echo "ERROR: Original archive was modified during preparation; aborting" >&2
+            exit 1
+        fi
+        CHECK_PRE_PURGE_SHA=$(sha256sum "${{ARCHIVE_DIR}}/uploads.tar.gz.pre-purge" | awk '{{print $1}}')
+        if [ "${{CHECK_PRE_PURGE_SHA}}" != "${{ORIG_SHA}}" ]; then
+            echo "ERROR: Preserved baseline was modified during preparation; aborting" >&2
+            exit 1
+        fi
+
+        # Save metadata for authorization gate
+        "${{PYTHON_BIN}}" -c '
+import json, sys
+data = {{
+    "archive_dir": sys.argv[1],
+    "orig_sha": sys.argv[2],
+    "candidate_sha": sys.argv[3],
+    "prepared": True
+}}
+with open(sys.argv[4], "w") as f:
+    json.dump(data, f)
+' "${{ARCHIVE_DIR}}" "${{ORIG_SHA}}" "${{CANDIDATE_SHA}}" "${{META_FILE}}"
+
+        echo ""
+        echo "================================================================================"
+        echo "CANDIDATE PREPARATION & VERIFICATION COMPLETE (PHASE 1)"
+        echo "Target Archive:            ${{ARCHIVE_DIR}}"
+        echo "Original SHA-256:          ${{ORIG_SHA}}"
+        echo "Preserved Baseline:        ${{ARCHIVE_DIR}}/uploads.tar.gz.pre-purge"
+        echo "Preserved Baseline SHA:    ${{ORIG_SHA}}"
+        echo "Candidate SHA-256:         ${{CANDIDATE_SHA}}"
+        echo "Integrity Verification:    PASS"
+        echo "Privacy Audit Verdict:     ZERO (residual privacy risk eliminated)"
+        echo "Historical Archive State:  UNCHANGED / IMMUTABLE"
+        echo ""
+        echo "[OWNER ACTION REQUIRED FOR REPLACEMENT]"
+        echo "Phase 1 has NOT modified or deleted the historical archive."
+        echo "To authorize replacement, run Phase 2 with explicit authorization:"
+        echo "  $0 --replace-authorized ${{CANDIDATE_SHA}}"
+        echo "================================================================================"
+        ;;
+
+    --replace-authorized)
+        echo "=== [Phase 2: Owner-Authorized Replacement] ==="
+        AUTHORIZED_SHA="${{2:-}}"
+        if [ -z "${{AUTHORIZED_SHA}}" ]; then
+            echo "ERROR: Owner authorization missing. To authorize replacement, pass candidate SHA-256: --replace-authorized <SHA256>" >&2
+            exit 2
+        fi
+
+        if [ ! -f "${{META_FILE}}" ] || [ ! -f "${{CANDIDATE_DIR}}/uploads.tar.gz" ]; then
+            echo "ERROR: Candidate workspace or metadata missing; run preparation phase first" >&2
+            exit 1
+        fi
+
+        # Check candidate SHA-256
+        ACTUAL_CAND_SHA=$(sha256sum "${{CANDIDATE_DIR}}/uploads.tar.gz" | awk '{{print $1}}')
+        if [ "${{AUTHORIZED_SHA}}" != "${{ACTUAL_CAND_SHA}}" ]; then
+            echo "ERROR: Authorization SHA-256 mismatch (provided: ${{AUTHORIZED_SHA}}, candidate: ${{ACTUAL_CAND_SHA}}); aborting" >&2
+            exit 1
+        fi
+
+        # Read expected original SHA
+        EXPECTED_ORIG_SHA=$("${{PYTHON_BIN}}" -c 'import json, sys; print(json.load(open(sys.argv[1]))["orig_sha"])' "${{META_FILE}}")
+
+        # Verify original archive and baseline have not changed
+        CURRENT_ORIG_SHA=$(sha256sum "${{ARCHIVE_DIR}}/uploads.tar.gz" | awk '{{print $1}}')
+        if [ "${{CURRENT_ORIG_SHA}}" != "${{EXPECTED_ORIG_SHA}}" ]; then
+            echo "ERROR: Original archive was modified after preparation; aborting replacement" >&2
+            exit 1
+        fi
+
+        if [ ! -f "${{ARCHIVE_DIR}}/uploads.tar.gz.pre-purge" ]; then
+            echo "ERROR: Preserved baseline uploads.tar.gz.pre-purge is missing; aborting replacement" >&2
+            exit 1
+        fi
+
+        CURRENT_PRE_PURGE_SHA=$(sha256sum "${{ARCHIVE_DIR}}/uploads.tar.gz.pre-purge" | awk '{{print $1}}')
+        if [ "${{CURRENT_PRE_PURGE_SHA}}" != "${{EXPECTED_ORIG_SHA}}" ]; then
+            echo "ERROR: Preserved baseline was modified; aborting replacement" >&2
+            exit 1
+        fi
+
+        echo "Re-verifying candidate integrity and privacy audit prior to replacement..."
+        "${{PYTHON_BIN}}" "${{REPO_ROOT}}/scripts/verify_backup_integrity.py" --db "${{CANDIDATE_DIR}}/orders.db" --uploads "${{REBUILD_DIR}}/uploads"
+        "${{PYTHON_BIN}}" "${{REPO_ROOT}}/scripts/audit_backup_archives.py" --archive-dir "${{CANDIDATE_DIR}}"
+
+        # Atomic replacement on same filesystem
+        TMP_REPLACE="${{ARCHIVE_DIR}}/.uploads.tar.gz.tmp_replacement"
+        cp "${{CANDIDATE_DIR}}/uploads.tar.gz" "${{TMP_REPLACE}}"
+        TMP_SHA=$(sha256sum "${{TMP_REPLACE}}" | awk '{{print $1}}')
+        if [ "${{TMP_SHA}}" != "${{ACTUAL_CAND_SHA}}" ]; then
+            echo "ERROR: Temporary replacement file checksum mismatch; aborting" >&2
+            rm -f "${{TMP_REPLACE}}"
+            exit 1
+        fi
+
+        mv "${{TMP_REPLACE}}" "${{ARCHIVE_DIR}}/uploads.tar.gz"
+        (cd "${{ARCHIVE_DIR}}" && sha256sum orders.db uploads.tar.gz > manifest.sha256)
+
+        # Post-replacement verification
+        echo "Running post-replacement privacy audit on active archive..."
+        "${{PYTHON_BIN}}" "${{REPO_ROOT}}/scripts/audit_backup_archives.py" --archive-dir "${{ARCHIVE_DIR}}"
+
+        # Cleanup staging workspace ONLY after all verification passes
+        rm -rf "${{STAGING_DIR}}"
+
+        echo ""
+        echo "================================================================================"
+        echo "OWNER-AUTHORIZED REPLACEMENT COMPLETED SUCCESSFULLY"
+        echo "Archive:                   ${{ARCHIVE_DIR}}"
+        echo "Preserved Baseline:        ${{ARCHIVE_DIR}}/uploads.tar.gz.pre-purge"
+        echo "New Archive SHA-256:       ${{ACTUAL_CAND_SHA}}"
+        echo "Post-Replacement Audit:    PASS (ZERO residual privacy risk)"
+        echo "================================================================================"
+        ;;
+
+    *)
+        echo "Usage: $0 [--prepare | --replace-authorized <CANDIDATE_SHA>]" >&2
+        exit 2
+        ;;
+esac
+"""
+
+
+def generate_purge_runbook_commands(
+    archive_dir: Path,
+    repo_root: Path,
+    delivered_files_to_remove: Optional[List[str]] = None,
+) -> List[str]:
+    """
+    Returns the individual command lines from the authoritative two-phase runbook script.
+    Guarantees that generate_purge_runbook_commands and generate_purge_runbook_script never diverge.
+    """
+    script = generate_purge_runbook_script(archive_dir, repo_root, delivered_files_to_remove)
+    return [line for line in script.splitlines() if line.strip() and not line.strip().startswith("#")]
 
 
 def print_audit_report(summary: Dict[str, Any], *, as_json: bool = False, show_details: bool = False) -> None:
