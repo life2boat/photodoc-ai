@@ -8,21 +8,28 @@ Fail-Closed Privacy Audit Contract:
    - Standalone combined archives (e.g. photodoc_cutover.tar.gz, .tgz, .tar).
    - Identifies and flags unsupported or unclassified archive formats (.zip, .tar.bz2, etc.).
    - Recursively traverses subdirectories to arbitrary depth without double-counting internal archives.
-2. Reads SQLite database in read-only mode to retrieve delivery job and order records.
-3. Inspects uploads archive in-memory without extracting files to permanent storage.
-4. Distinguishes:
-   - Confirmed delivered photos and customer-information metadata files (HIGH risk: retained customer data).
+2. Symbolic Link Boundary Security:
+   - Never follows symbolic links when discovering or inspecting backup archives.
+   - Rejects symlinked directories, database files, upload archives, and combined archives.
+   - Prunes symlinked directories during traversal and excludes symlinked files.
+   - Fails closed with BLOCKED (exit code 2) upon detecting any symlink in backup paths.
+3. Centralized Resource Limits:
+   - Enforces MAX_ARCHIVE_MEMBERS across ALL archive inspection paths.
+   - Enforces MAX_SINGLE_FILE_SIZE_BYTES and MAX_TOTAL_UNCOMPRESSED_SIZE_BYTES.
+   - Rejects malformed metadata, impossible sizes (size < 0), and disallowed member types.
+   - Streams database extraction with strict size bounding to prevent decompression bombs.
+4. Reads SQLite database in read-only mode to retrieve delivery job and order records.
+5. Inspects uploads archive in-memory without extracting files to permanent storage.
+6. Distinguishes:
+   - Confirmed delivered photos and customer-information metadata files (HIGH risk).
    - Legitimate recovery originals for unfinished deliveries (pending/processing/failed).
    - Untracked or unclassified archive files (UNKNOWN / BLOCKED: never falsely classified as ZERO).
-5. Strictly read-only / dry-run: never modifies, moves, or deletes any backup archive.
-6. Safe combined tar extraction:
-   - Extracts ONLY regular database members matching naming contract to fixed temporary path.
-   - Rejects path traversal, absolute paths, symlinks, hardlinks, duplicate databases, and oversized members.
-7. CLI Exit Code Contract:
-   - 0: Strictly all archives are readable, valid, fully classified, and have ZERO retained delivered photos/metadata and ZERO untracked files.
-   - Nonzero: Confirmed privacy risk (1), unclassified/untracked files or empty inventory (2), read/integrity error (3).
-8. Default output sanitization: customer PII and sensitive filenames are withheld unless --show-details is explicitly requested.
-9. Provides a safe, verified 7-step owner-controlled remediation workflow for compressed archives.
+7. Strictly read-only / dry-run: never modifies, moves, or deletes any backup archive.
+8. CLI Exit Code Contract:
+   - 0: Strictly all archives are readable, valid, fully classified, with ZERO retained delivered data and ZERO untracked files.
+   - Nonzero: Confirmed privacy risk (1), unclassified/untracked/blocked files or empty inventory (2), read/integrity/resource error (3).
+9. Output sanitization: customer PII and sensitive filenames are withheld unless --show-details is explicitly requested.
+10. Provides an authoritative, executable 7-step owner-controlled remediation runbook.
 """
 
 from __future__ import annotations
@@ -57,15 +64,17 @@ except ImportError:
 SUPPORTED_ARCHIVE_EXTENSIONS = {".tar.gz", ".tgz", ".tar"}
 UNSUPPORTED_ARCHIVE_EXTENSIONS = {".zip", ".tar.bz2", ".tbz2", ".tar.xz", ".txz", ".7z", ".rar"}
 
-MAX_COMBINED_ARCHIVE_MEMBERS = 100_000
-MAX_DATABASE_MEMBER_SIZE_BYTES = 500 * 1024 * 1024  # 500 MB
-MAX_SINGLE_FILE_SIZE_BYTES = 1024 * 1024 * 1024     # 1 GB
+# Centralized Resource Limits Contract
+MAX_ARCHIVE_MEMBERS = 100_000
+MAX_DATABASE_MEMBER_SIZE_BYTES = 500 * 1024 * 1024           # 500 MB
+MAX_SINGLE_FILE_SIZE_BYTES = 1024 * 1024 * 1024              # 1 GB
+MAX_TOTAL_UNCOMPRESSED_SIZE_BYTES = 10 * 1024 * 1024 * 1024  # 10 GB
 
 
 def audit_single_backup_dir(backup_dir: Path) -> Dict[str, Any]:
     """
     Audits a single backup directory containing orders.db and uploads.tar.gz (or uploads.tar).
-    Strictly read-only and fail-closed.
+    Strictly read-only, symlink-resistant, and fail-closed.
     """
     archive_report: Dict[str, Any] = {
         "archive_type": "directory",
@@ -84,8 +93,37 @@ def audit_single_backup_dir(backup_dir: Path) -> Dict[str, Any]:
         "unclassified_legacy_files": [],
         "untracked_archived_files": [],
         "residual_privacy_risk": "UNKNOWN",
+        "privacy_status": "UNKNOWN",
         "errors": [],
     }
+
+    # Symlink boundary enforcement
+    if backup_dir.is_symlink():
+        archive_report["errors"].append(f"Backup directory cannot be a symbolic link: {backup_dir}")
+        archive_report["residual_privacy_risk"] = "BLOCKED (Symlinked backup directory)"
+        return archive_report
+
+    if not backup_dir.exists():
+        archive_report["errors"].append(f"Backup directory does not exist: {backup_dir}")
+        archive_report["residual_privacy_risk"] = "ERROR"
+        return archive_report
+
+    if not backup_dir.is_dir():
+        archive_report["errors"].append(f"Backup target is not a directory: {backup_dir}")
+        archive_report["residual_privacy_risk"] = "ERROR"
+        return archive_report
+
+    # Check for symlink entries inside backup_dir
+    try:
+        for entry in backup_dir.iterdir():
+            if entry.is_symlink():
+                archive_report["errors"].append(f"Symbolic link detected inside backup directory: {entry.name}")
+                archive_report["residual_privacy_risk"] = "BLOCKED (Symlinked entry in backup directory)"
+                return archive_report
+    except Exception as exc:
+        archive_report["errors"].append(f"Failed to inspect backup directory entries: {exc}")
+        archive_report["residual_privacy_risk"] = "ERROR"
+        return archive_report
 
     # Locate database
     db_candidates = [
@@ -102,6 +140,12 @@ def audit_single_backup_dir(backup_dir: Path) -> Dict[str, Any]:
         archive_report["errors"].append(f"No SQLite database found in backup directory: {backup_dir}")
         archive_report["residual_privacy_risk"] = "ERROR"
         return archive_report
+
+    if db_path.is_symlink():
+        archive_report["errors"].append(f"Database file cannot be a symbolic link: {db_path}")
+        archive_report["residual_privacy_risk"] = "BLOCKED (Symlinked database file)"
+        return archive_report
+
     archive_report["db_found"] = True
 
     # Locate uploads tar
@@ -115,6 +159,12 @@ def audit_single_backup_dir(backup_dir: Path) -> Dict[str, Any]:
         archive_report["errors"].append(f"No uploads archive found in backup directory: {backup_dir}")
         archive_report["residual_privacy_risk"] = "ERROR"
         return archive_report
+
+    if tar_path.is_symlink():
+        archive_report["errors"].append(f"Uploads archive cannot be a symbolic link: {tar_path}")
+        archive_report["residual_privacy_risk"] = "BLOCKED (Symlinked uploads archive)"
+        return archive_report
+
     archive_report["uploads_tar_found"] = True
 
     return _audit_db_and_tar(db_path, tar_path, archive_report)
@@ -123,7 +173,7 @@ def audit_single_backup_dir(backup_dir: Path) -> Dict[str, Any]:
 def audit_single_combined_tar(tar_path: Path) -> Dict[str, Any]:
     """
     Audits a standalone combined archive (e.g. photodoc_cutover.tar.gz or .tar containing orders.db and uploads/).
-    Strictly read-only, safe extraction, and fail-closed.
+    Strictly read-only, symlink-resistant, safe extraction with bounded copying, and fail-closed.
     """
     archive_report: Dict[str, Any] = {
         "archive_type": "combined_tar",
@@ -142,8 +192,14 @@ def audit_single_combined_tar(tar_path: Path) -> Dict[str, Any]:
         "unclassified_legacy_files": [],
         "untracked_archived_files": [],
         "residual_privacy_risk": "UNKNOWN",
+        "privacy_status": "UNKNOWN",
         "errors": [],
     }
+
+    if tar_path.is_symlink():
+        archive_report["errors"].append(f"Combined archive cannot be a symbolic link: {tar_path}")
+        archive_report["residual_privacy_risk"] = "BLOCKED (Symlinked combined archive)"
+        return archive_report
 
     if not tar_path.is_file():
         archive_report["errors"].append(f"Archive file not found: {tar_path}")
@@ -153,36 +209,66 @@ def audit_single_combined_tar(tar_path: Path) -> Dict[str, Any]:
     try:
         with tarfile.open(tar_path, "r:*") as tar:
             members = tar.getmembers()
-            if len(members) > MAX_COMBINED_ARCHIVE_MEMBERS:
+            if len(members) > MAX_ARCHIVE_MEMBERS:
                 archive_report["errors"].append(
-                    f"Combined archive exceeds member count limit ({len(members)} > {MAX_COMBINED_ARCHIVE_MEMBERS})"
+                    f"Combined archive exceeds member count limit ({len(members)} > {MAX_ARCHIVE_MEMBERS})"
                 )
+                archive_report["privacy_status"] = "ERROR_LIMIT_EXCEEDED"
                 archive_report["residual_privacy_risk"] = "ERROR"
                 return archive_report
 
+            total_uncompressed_bytes = 0
             db_candidates: List[tarfile.TarInfo] = []
+
             for m in members:
+                # Malformed size validation
+                if not isinstance(m.size, int) or m.size < 0:
+                    archive_report["errors"].append(f"Malformed member size in archive: {m.name} ({m.size})")
+                    archive_report["privacy_status"] = "ERROR_CORRUPT"
+                    archive_report["residual_privacy_risk"] = "ERROR"
+                    return archive_report
+
                 # Security: reject path traversal and absolute paths
                 if ".." in Path(m.name).parts or m.name.startswith("/") or Path(m.name).is_absolute():
                     archive_report["errors"].append(f"Path traversal detected in archive member: {m.name}")
                     archive_report["residual_privacy_risk"] = "ERROR"
                     return archive_report
 
-                # Only regular files can be database members
+                # Security: reject symlinks and hardlinks inside archive
+                if m.issym() or m.islnk():
+                    archive_report["errors"].append(f"Combined archive {tar_path.name} contains unsafe symlink/hardlink member: {m.name}")
+                    archive_report["residual_privacy_risk"] = "ERROR"
+                    return archive_report
+
+                if not (m.isreg() or m.isdir()):
+                    archive_report["errors"].append(f"Disallowed archive member type: {m.name} (type={m.type})")
+                    archive_report["residual_privacy_risk"] = "ERROR"
+                    return archive_report
+
+                if m.isreg():
+                    if m.size > MAX_SINGLE_FILE_SIZE_BYTES:
+                        archive_report["errors"].append(
+                            f"Archive member exceeds single-file size limit: {m.name} ({m.size} > {MAX_SINGLE_FILE_SIZE_BYTES})"
+                        )
+                        archive_report["privacy_status"] = "ERROR_LIMIT_EXCEEDED"
+                        archive_report["residual_privacy_risk"] = "ERROR"
+                        return archive_report
+
+                    total_uncompressed_bytes += m.size
+                    if total_uncompressed_bytes > MAX_TOTAL_UNCOMPRESSED_SIZE_BYTES:
+                        archive_report["errors"].append(
+                            f"Archive exceeds total uncompressed size limit ({total_uncompressed_bytes} > {MAX_TOTAL_UNCOMPRESSED_SIZE_BYTES})"
+                        )
+                        archive_report["privacy_status"] = "ERROR_LIMIT_EXCEEDED"
+                        archive_report["residual_privacy_risk"] = "ERROR"
+                        return archive_report
+
                 base_name = Path(m.name).name
                 is_db_name = (
                     base_name in ("orders.db", "orders.db.cutover")
                     or (base_name.endswith(".db") and "orders" in base_name.lower())
                 )
-                if is_db_name:
-                    if m.issym() or m.islnk():
-                        archive_report["errors"].append(f"Database member is an unsafe symlink/hardlink: {m.name}")
-                        archive_report["residual_privacy_risk"] = "ERROR"
-                        return archive_report
-                    if not m.isreg():
-                        archive_report["errors"].append(f"Database member is not a regular file: {m.name}")
-                        archive_report["residual_privacy_risk"] = "ERROR"
-                        return archive_report
+                if is_db_name and m.isreg():
                     db_candidates.append(m)
 
             if len(db_candidates) == 0:
@@ -202,10 +288,11 @@ def audit_single_combined_tar(tar_path: Path) -> Dict[str, Any]:
                 archive_report["errors"].append(
                     f"Database member exceeds size limit ({db_member.size} > {MAX_DATABASE_MEMBER_SIZE_BYTES})"
                 )
+                archive_report["privacy_status"] = "ERROR_LIMIT_EXCEEDED"
                 archive_report["residual_privacy_risk"] = "ERROR"
                 return archive_report
 
-            # Safe extraction to a fixed temporary file (never using untrusted member name)
+            # Safe, strictly bounded streaming extraction to a fixed temporary file
             with tempfile.TemporaryDirectory() as tmpdir:
                 tmp_path = Path(tmpdir)
                 tmp_db_file = tmp_path / "orders_inspected.db"
@@ -215,8 +302,28 @@ def audit_single_combined_tar(tar_path: Path) -> Dict[str, Any]:
                     archive_report["residual_privacy_risk"] = "ERROR"
                     return archive_report
 
+                bytes_copied = 0
+                chunk_size = 65536
                 with tmp_db_file.open("wb") as f_out:
-                    shutil.copyfileobj(f_in, f_out, length=65536)
+                    while True:
+                        chunk = f_in.read(chunk_size)
+                        if not chunk:
+                            break
+                        bytes_copied += len(chunk)
+                        if bytes_copied > MAX_DATABASE_MEMBER_SIZE_BYTES:
+                            archive_report["errors"].append(
+                                f"Database member stream exceeded maximum permitted size ({bytes_copied} > {MAX_DATABASE_MEMBER_SIZE_BYTES})"
+                            )
+                            archive_report["residual_privacy_risk"] = "ERROR"
+                            return archive_report
+                        f_out.write(chunk)
+
+                if bytes_copied != db_member.size:
+                    archive_report["errors"].append(
+                        f"Database member size mismatch: declared {db_member.size} bytes but extracted {bytes_copied} bytes"
+                    )
+                    archive_report["residual_privacy_risk"] = "ERROR"
+                    return archive_report
 
                 archive_report["db_found"] = True
                 return _audit_db_and_tar(tmp_db_file, tar_path, archive_report)
@@ -232,6 +339,7 @@ def _audit_db_and_tar(db_path: Path, tar_path: Path, archive_report: Dict[str, A
     file_status_map: Dict[str, Dict[str, Any]] = {}
     legacy_order_files: Dict[str, int] = {}
 
+    conn = None
     try:
         conn = sqlite3.connect(f"file:{db_path.resolve().as_posix()}?mode=ro", uri=True, timeout=10.0)
         conn.row_factory = sqlite3.Row
@@ -240,7 +348,6 @@ def _audit_db_and_tar(db_path: Path, tar_path: Path, archive_report: Dict[str, A
         if integrity != "ok":
             archive_report["errors"].append(f"SQLite PRAGMA integrity_check failed: {integrity}")
             archive_report["residual_privacy_risk"] = "ERROR"
-            conn.close()
             return archive_report
 
         app_id_row = conn.execute("PRAGMA application_id;").fetchone()
@@ -282,31 +389,50 @@ def _audit_db_and_tar(db_path: Path, tar_path: Path, archive_report: Dict[str, A
                 }
 
         # Also map legacy P0 orders
-        p0_orders = conn.execute(
-            "SELECT id, filename FROM orders WHERE order_token_hash IS NULL OR order_token_hash = '';"
-            if has_token else "SELECT id, filename FROM orders;"
-        ).fetchall()
-        for o in p0_orders:
-            raw_fn = o["filename"] or ""
-            names = [n.strip() for n in raw_fn.split(",") if n.strip()]
-            for n in names:
-                safe_n = sanitize_filename(n)
-                legacy_order_files[f"{o['id']}_{safe_n}"] = o["id"]
-                legacy_order_files[f"{o['id']}_{n}"] = o["id"]
-                legacy_order_files[safe_n] = o["id"]
-                legacy_order_files[n] = o["id"]
-
-        conn.close()
+        if "filename" in orders_cols:
+            p0_orders = conn.execute(
+                "SELECT id, filename FROM orders WHERE order_token_hash IS NULL OR order_token_hash = '';"
+                if has_token else "SELECT id, filename FROM orders;"
+            ).fetchall()
+            for o in p0_orders:
+                raw_fn = o["filename"] or ""
+                names = [n.strip() for n in raw_fn.split(",") if n.strip()]
+                for n in names:
+                    safe_n = sanitize_filename(n)
+                    legacy_order_files[f"{o['id']}_{safe_n}"] = o["id"]
+                    legacy_order_files[f"{o['id']}_{n}"] = o["id"]
+                    legacy_order_files[safe_n] = o["id"]
+                    legacy_order_files[n] = o["id"]
     except Exception as exc:
         archive_report["errors"].append(f"Database read error: {exc}")
         archive_report["residual_privacy_risk"] = "ERROR"
         return archive_report
+    finally:
+        if conn is not None:
+            conn.close()
 
-    # 2. Inspect tarball in-memory
+    # 2. Inspect tarball in-memory with strict resource limit enforcement
     try:
         with tarfile.open(tar_path, "r:*") as tar:
             members = tar.getmembers()
+            if len(members) > MAX_ARCHIVE_MEMBERS:
+                archive_report["errors"].append(
+                    f"Archive exceeds member count limit ({len(members)} > {MAX_ARCHIVE_MEMBERS}): {tar_path}"
+                )
+                archive_report["privacy_status"] = "ERROR_LIMIT_EXCEEDED"
+                archive_report["residual_privacy_risk"] = "ERROR"
+                return archive_report
+
+            total_uncompressed_bytes = 0
+
             for m in members:
+                # Malformed size validation
+                if not isinstance(m.size, int) or m.size < 0:
+                    archive_report["errors"].append(f"Malformed member size in archive: {m.name} ({m.size})")
+                    archive_report["privacy_status"] = "ERROR_CORRUPT"
+                    archive_report["residual_privacy_risk"] = "ERROR"
+                    return archive_report
+
                 # Security: check traversal and symlinks
                 if ".." in Path(m.name).parts or m.name.startswith("/") or Path(m.name).is_absolute():
                     archive_report["errors"].append(f"Path traversal detected in archive member: {m.name}")
@@ -314,7 +440,12 @@ def _audit_db_and_tar(db_path: Path, tar_path: Path, archive_report: Dict[str, A
                     return archive_report
 
                 if m.issym() or m.islnk():
-                    archive_report["errors"].append(f"Symlink or hardlink entry detected in archive: {m.name}")
+                    archive_report["errors"].append(f"Uploads archive {tar_path.name} contains unsafe symlink/hardlink member: {m.name}")
+                    archive_report["residual_privacy_risk"] = "ERROR"
+                    return archive_report
+
+                if not (m.isreg() or m.isdir()):
+                    archive_report["errors"].append(f"Disallowed archive member type: {m.name} (type={m.type})")
                     archive_report["residual_privacy_risk"] = "ERROR"
                     return archive_report
 
@@ -325,6 +456,16 @@ def _audit_db_and_tar(db_path: Path, tar_path: Path, archive_report: Dict[str, A
                     archive_report["errors"].append(
                         f"Archive member exceeds size limit ({m.size} > {MAX_SINGLE_FILE_SIZE_BYTES}): {m.name}"
                     )
+                    archive_report["privacy_status"] = "ERROR_LIMIT_EXCEEDED"
+                    archive_report["residual_privacy_risk"] = "ERROR"
+                    return archive_report
+
+                total_uncompressed_bytes += m.size
+                if total_uncompressed_bytes > MAX_TOTAL_UNCOMPRESSED_SIZE_BYTES:
+                    archive_report["errors"].append(
+                        f"Archive exceeds total uncompressed size limit ({total_uncompressed_bytes} > {MAX_TOTAL_UNCOMPRESSED_SIZE_BYTES})"
+                    )
+                    archive_report["privacy_status"] = "ERROR_LIMIT_EXCEEDED"
                     archive_report["residual_privacy_risk"] = "ERROR"
                     return archive_report
 
@@ -407,8 +548,10 @@ def _audit_db_and_tar(db_path: Path, tar_path: Path, archive_report: Dict[str, A
 def audit_backup_root(root_dir: Path) -> Dict[str, Any]:
     """
     Recursively scans a root backup directory (e.g. /var/backups/photodoc) containing one or more backup dirs or archives.
-    Fail-closed: returns BLOCKED if empty, if unsupported archive formats are detected, or if traversal is incomplete.
-    Avoids double-counting internal uploads archives that belong to an already discovered backup directory.
+    Fail-closed:
+    - Prunes symlinked directories and excludes symlinked files.
+    - Returns BLOCKED if symlinks are detected, if root is a symlink, if empty, or if unsupported formats are present.
+    - Avoids double-counting internal uploads archives that belong to an already discovered backup directory.
     """
     summary: Dict[str, Any] = {
         "root_dir": str(root_dir),
@@ -427,6 +570,11 @@ def audit_backup_root(root_dir: Path) -> Dict[str, Any]:
         "errors": [],
     }
 
+    if root_dir.is_symlink():
+        summary["errors"].append(f"Configured backup root cannot be a symbolic link: {root_dir}")
+        summary["overall_residual_privacy_risk"] = "BLOCKED (Backup root is a symbolic link)"
+        return summary
+
     if not root_dir.exists():
         summary["errors"].append(f"Configured backup root does not exist: {root_dir}")
         summary["overall_residual_privacy_risk"] = "ERROR (Configured backup root does not exist)"
@@ -443,33 +591,49 @@ def audit_backup_root(root_dir: Path) -> Dict[str, Any]:
     def _walk_error(err: OSError) -> None:
         summary["errors"].append(f"Directory traversal error: {err}")
 
-    # Recursive traversal of root_dir
+    # Recursive traversal with symlink pruning
     for current_dir_str, dirnames, filenames in os.walk(str(root_dir), followlinks=False, onerror=_walk_error):
         current_dir = Path(current_dir_str)
 
-        # Detect symlinks in directories
-        for dname in dirnames:
+        # 1. Prune symbolic-link directories from recursive traversal
+        for dname in list(dirnames):
             dp = current_dir / dname
             if dp.is_symlink():
                 summary["symlinked_entries"].append(str(dp))
+                dirnames.remove(dname)  # NEVER traverse into symlink directories!
 
-        # Check if current_dir is a backup directory candidate (contains orders.db or matching DB)
-        has_db = (
-            (current_dir / "orders.db").is_file()
-            or (current_dir / "orders.db.cutover").is_file()
-            or any(p.is_file() and p.name.endswith(".db") and "orders" in p.name.lower() for p in current_dir.iterdir())
-        )
-        has_tar = any(
-            (current_dir / cand).is_file() for cand in ["uploads.tar.gz", "uploads.tgz", "uploads.tar"]
-        )
-        if has_db and has_tar:
-            candidate_dirs.add(current_dir.resolve())
+        # 2. Check current_dir for candidate directory backup (only if not a symlink)
+        if not current_dir.is_symlink():
+            has_symlink_file = False
+            has_db = False
+            has_tar = False
 
-        # Check filenames
+            # Check DB candidates in current_dir without following symlinks
+            for cand_db_name in ["orders.db", "orders.db.cutover"]:
+                p = current_dir / cand_db_name
+                if p.is_symlink():
+                    summary["symlinked_entries"].append(str(p))
+                    has_symlink_file = True
+                elif p.is_file():
+                    has_db = True
+
+            for cand_tar_name in ["uploads.tar.gz", "uploads.tgz", "uploads.tar"]:
+                p = current_dir / cand_tar_name
+                if p.is_symlink():
+                    summary["symlinked_entries"].append(str(p))
+                    has_symlink_file = True
+                elif p.is_file():
+                    has_tar = True
+
+            if has_db and has_tar and not has_symlink_file:
+                candidate_dirs.add(current_dir)
+
+        # 3. Check filenames in current_dir
         for fname in filenames:
             fp = current_dir / fname
             if fp.is_symlink():
                 summary["symlinked_entries"].append(str(fp))
+                continue  # EXCLUDE symbolic-link files from candidate archives!
 
             lower_name = fname.lower()
             for ext in UNSUPPORTED_ARCHIVE_EXTENSIONS:
@@ -481,15 +645,13 @@ def audit_backup_root(root_dir: Path) -> Dict[str, Any]:
 
             for ext in SUPPORTED_ARCHIVE_EXTENSIONS:
                 if lower_name.endswith(ext):
-                    # Check whether this archive belongs to an already discovered backup directory
-                    candidate_tarballs.add(fp.resolve())
+                    candidate_tarballs.add(fp)
                     break
 
     # Filter candidate_tarballs:
-    # Avoid double-counting internal uploads.tar.gz / uploads.tar that belong to a discovered backup directory
+    # Avoid double-counting internal uploads archives that belong to an already discovered backup directory
     filtered_tarballs: Set[Path] = set()
     for ctar in candidate_tarballs:
-        # If ctar is inside any discovered candidate_dir, it belongs to that directory backup
         inside_dir_backup = False
         for cdir in candidate_dirs:
             try:
@@ -519,18 +681,20 @@ def audit_backup_root(root_dir: Path) -> Dict[str, Any]:
 
     if summary["errors"]:
         summary["overall_residual_privacy_risk"] = "ERROR"
+    elif summary["symlinked_entries"]:
+        summary["overall_residual_privacy_risk"] = (
+            f"BLOCKED (Symlinked backup entries detected: {len(summary['symlinked_entries'])} symlink(s))"
+        )
     elif summary["total_archives_scanned"] == 0:
         summary["overall_residual_privacy_risk"] = "BLOCKED (No supported archives found in configured backup root)"
     elif summary["unsupported_archives"]:
         summary["overall_residual_privacy_risk"] = (
             f"BLOCKED (Unsupported archive format(s) detected: {len(summary['unsupported_archives'])} unscanned file(s))"
         )
-    elif summary["symlinked_entries"]:
-        summary["overall_residual_privacy_risk"] = (
-            f"BLOCKED (Symlinked backup entries detected: {len(summary['symlinked_entries'])} symlink(s))"
-        )
     elif any(a["residual_privacy_risk"].startswith("ERROR") for a in summary["archives"]):
         summary["overall_residual_privacy_risk"] = "ERROR (One or more archives failed inspection)"
+    elif any(a["residual_privacy_risk"].startswith("BLOCKED") for a in summary["archives"]):
+        summary["overall_residual_privacy_risk"] = "BLOCKED (One or more archives blocked by security policy)"
     elif total_delivered_retained > 0:
         parts: List[str] = []
         if summary["total_retained_delivered_photos"] > 0:
@@ -565,6 +729,65 @@ def _aggregate_archive_report(summary: Dict[str, Any], rep: Dict[str, Any]) -> N
         summary["errors"].extend(rep["errors"])
 
 
+def generate_purge_runbook_commands(
+    archive_dir: Path,
+    repo_root: Path,
+    delivered_files_to_remove: Optional[List[str]] = None,
+) -> List[str]:
+    """
+    Authoritative generator of the exact 7-step remediation runbook command sequence.
+    Guarantees deterministic, genuinely executable commands with explicit paths,
+    pre-purge collision detection, and zero reliance on relative caller directories.
+    """
+    arch_str = str(archive_dir)
+    repo_str = str(repo_root)
+    targets = delivered_files_to_remove or ["<approved_delivered_filename>"]
+    rm_cmds = " && ".join([f'rm -f "${{WORK_DIR}}/rebuild/uploads/{f}"' for f in targets])
+
+    return [
+        f'ARCHIVE_DIR="{arch_str}"',
+        f'REPO_ROOT="{repo_str}"',
+        'test ! -e "${ARCHIVE_DIR}/uploads.tar.gz.pre-purge" || { echo "ERROR: uploads.tar.gz.pre-purge already exists; aborting to prevent overwrite" >&2; exit 1; }',
+        '(cd "${ARCHIVE_DIR}" && sha256sum -c manifest.sha256)',
+        'tar -ztvf "${ARCHIVE_DIR}/uploads.tar.gz" > "${ARCHIVE_DIR}/original_manifest.txt"',
+        'ORIG_SHA=$(sha256sum "${ARCHIVE_DIR}/uploads.tar.gz" | awk \'{print $1}\')',
+        'WORK_DIR=$(mktemp -d -t photodoc_rebuild_XXXXXX)',
+        'mkdir -p "${WORK_DIR}/rebuild" "${WORK_DIR}/candidate"',
+        'cp "${ARCHIVE_DIR}/uploads.tar.gz" "${WORK_DIR}/uploads.tar.gz.orig"',
+        'cp "${ARCHIVE_DIR}/orders.db" "${WORK_DIR}/candidate/orders.db"',
+        'cp -n "${ARCHIVE_DIR}/uploads.tar.gz" "${ARCHIVE_DIR}/uploads.tar.gz.pre-purge" || { echo "ERROR: Pre-purge copy failed or file exists" >&2; exit 1; }',
+        'tar -xzf "${WORK_DIR}/uploads.tar.gz.orig" -C "${WORK_DIR}/rebuild"',
+        rm_cmds,
+        'tar --numeric-owner -czvf "${WORK_DIR}/candidate/uploads.tar.gz" -C "${WORK_DIR}/rebuild" uploads',
+        'tar -ztvf "${WORK_DIR}/candidate/uploads.tar.gz" >/dev/null',
+        '(cd "${WORK_DIR}/candidate" && sha256sum orders.db uploads.tar.gz > manifest.sha256)',
+        'python3 "${REPO_ROOT}/scripts/verify_backup_integrity.py" --db "${WORK_DIR}/candidate/orders.db" --uploads "${WORK_DIR}/rebuild/uploads"',
+        'python3 "${REPO_ROOT}/scripts/audit_backup_archives.py" --archive-dir "${WORK_DIR}/candidate"',
+        '# OWNER AUTHORIZATION REQUIRED BEFORE PROCEEDING TO REPLACEMENT',
+        'cp "${WORK_DIR}/candidate/uploads.tar.gz" "${ARCHIVE_DIR}/uploads.tar.gz"',
+        'cp "${WORK_DIR}/candidate/manifest.sha256" "${ARCHIVE_DIR}/manifest.sha256"',
+        'rm -rf "${WORK_DIR}"',
+    ]
+
+
+def generate_purge_runbook_script(
+    archive_dir: Path,
+    repo_root: Path,
+    delivered_files_to_remove: Optional[List[str]] = None,
+) -> str:
+    """
+    Renders an executable shell script of the authoritative remediation runbook.
+    """
+    commands = generate_purge_runbook_commands(archive_dir, repo_root, delivered_files_to_remove)
+    header = [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        "# PhotoDoc AI — Safe Owner-Controlled Archive Remediation Runbook",
+        "",
+    ]
+    return "\n".join(header + commands) + "\n"
+
+
 def print_audit_report(summary: Dict[str, Any], *, as_json: bool = False, show_details: bool = False) -> None:
     if as_json:
         if not show_details:
@@ -594,8 +817,14 @@ def print_audit_report(summary: Dict[str, Any], *, as_json: bool = False, show_d
     print(f"Unfinished Recovery Photos:{summary.get('total_unfinished_recovery_photos', len(summary.get('retained_unfinished_photos', [])))}")
     print(f"Untracked/Legacy Files:   {summary.get('total_untracked_files', len(summary.get('untracked_archived_files', [])) + len(summary.get('unclassified_legacy_files', [])))}")
     print(f"Unsupported Formats:      {len(summary.get('unsupported_archives', []))}")
+    print(f"Symlinked Entries:        {len(summary.get('symlinked_entries', []))}")
     print(f"Residual Privacy Risk:    {summary.get('overall_residual_privacy_risk') or summary.get('residual_privacy_risk')}")
     print("--------------------------------------------------")
+
+    if summary.get("symlinked_entries"):
+        print("\n[SECURITY WARNING: SYMBOLIC LINKS DETECTED]")
+        for se in summary["symlinked_entries"]:
+            print(f"  - {se} (symlink rejected)")
 
     if summary.get("unsupported_archives"):
         print("\n[WARNING: UNSUPPORTED ARCHIVE FORMATS DETECTED]")
@@ -628,6 +857,8 @@ def print_audit_report(summary: Dict[str, Any], *, as_json: bool = False, show_d
         elif not show_details and retained_items:
             print("  (Sensitive filenames withheld. Pass --show-details to inspect specific items for remediation)")
 
+    target_archive = Path(summary.get("backup_dir") or "<archive_dir>")
+    repo_root = REPO_DIR
     print("\n==================================================")
     print("      OWNER-CONTROLLED PURGE PROCEDURE RUNBOOK     ")
     print("==================================================")
@@ -635,46 +866,28 @@ def print_audit_report(summary: Dict[str, Any], *, as_json: bool = False, show_d
     print("if they contain customer photos or metadata from orders that were already delivered.")
     print("This audit tool NEVER deletes or modifies backup files automatically.")
     print("GNU tar does not support in-place deletion on compressed archives (.tar.gz).")
-    print("\nSafe 7-Step Owner-Controlled Remediation Workflow:")
-    print("1. Inventory exact archive and verify its cryptographic checksum:")
-    print("   cd <archive_dir> && sha256sum -c manifest.sha256")
-    print("   tar -ztvf uploads.tar.gz > original_manifest.txt")
-    print("2. Create an isolated temporary working directory:")
-    print("   WORK_DIR=$(mktemp -d -t photodoc_rebuild_XXXXXX)")
-    print("   mkdir -p \"${WORK_DIR}/rebuild\" \"${WORK_DIR}/candidate\"")
-    print("   cp uploads.tar.gz \"${WORK_DIR}/uploads.tar.gz.orig\"")
-    print("   cp orders.db \"${WORK_DIR}/candidate/orders.db\"")
-    print("3. Preserve the original archive:")
-    print("   cp uploads.tar.gz uploads.tar.gz.pre-purge")
-    print("4. Rebuild candidate archive without explicitly approved delivered files:")
-    print("   tar -xzf \"${WORK_DIR}/uploads.tar.gz.orig\" -C \"${WORK_DIR}/rebuild\"")
-    print("   rm -f \"${WORK_DIR}/rebuild/uploads/<approved_delivered_filename>\"")
-    print("   tar --numeric-owner -czvf \"${WORK_DIR}/candidate/uploads.tar.gz\" -C \"${WORK_DIR}/rebuild\" uploads")
-    print("5. Place candidate under exact filenames expected by integrity verifier and privacy auditor:")
-    print("   # ${WORK_DIR}/candidate contains exact expected filenames: orders.db and uploads.tar.gz")
-    print("   # ${WORK_DIR}/rebuild/uploads contains uncompressed tree for integrity verifier")
-    print("6. Run archive readability checks, checksum validation, backup integrity verification, privacy auditing and unfinished-delivery recovery checks:")
-    print("   tar -ztvf \"${WORK_DIR}/candidate/uploads.tar.gz\"")
-    print("   cd \"${WORK_DIR}/candidate\" && sha256sum orders.db uploads.tar.gz > manifest.sha256")
-    print("   python3 scripts/verify_backup_integrity.py --db \"${WORK_DIR}/candidate/orders.db\" --uploads \"${WORK_DIR}/rebuild/uploads\"")
-    print("   python3 scripts/audit_backup_archives.py --archive-dir \"${WORK_DIR}/candidate\"")
-    print("7. Require explicit owner authorization before replacing or purging any historical archive:")
-    print("   # OWNER AUTHORIZATION REQUIRED BEFORE PROCEEDING")
-    print("   # Once all verification checks above PASS cleanly, owner executes replacement:")
-    print("   cp \"${WORK_DIR}/candidate/uploads.tar.gz\" <archive_dir>/uploads.tar.gz")
-    print("   cp \"${WORK_DIR}/candidate/manifest.sha256\" <archive_dir>/manifest.sha256")
-    print("   rm -rf \"${WORK_DIR}\"")
+    print("\nAuthoritative Executable Remediation Script:")
+    print(generate_purge_runbook_script(target_archive, repo_root))
     print("==================================================")
 
 
-def get_cli_exit_code(overall_risk: str) -> int:
+def get_cli_exit_code(risk_or_summary: Any) -> int:
     """
     Deterministic CLI Exit Code Contract:
     0: Valid, complete inventory with ZERO confirmed retained delivered photos/metadata and ZERO untracked files.
     1: Confirmed privacy risk (HIGH).
-    2: Unclassified, untracked, empty inventory, or unsupported archive formats (UNKNOWN / BLOCKED).
+    2: Unclassified, untracked, empty inventory, unsupported formats, or symlinks (UNKNOWN / BLOCKED).
     3: Read or integrity error (ERROR).
     """
+    if isinstance(risk_or_summary, dict):
+        overall_risk = str(
+            risk_or_summary.get("overall_residual_privacy_risk")
+            or risk_or_summary.get("residual_privacy_risk")
+            or "UNKNOWN"
+        )
+    else:
+        overall_risk = str(risk_or_summary or "UNKNOWN")
+
     if overall_risk.startswith("ZERO"):
         return 0
     elif overall_risk.startswith("HIGH"):
@@ -698,7 +911,9 @@ def main_cli() -> int:
     )
     group.add_argument(
         "--archive-dir",
+        "--backup-dir",
         type=Path,
+        dest="archive_dir",
         help="Specific backup directory containing orders.db and uploads.tar.gz",
     )
     group.add_argument(

@@ -53,6 +53,17 @@ except ImportError:
     APPLICATION_ID_TAG = "PDAI"
     APPLICATION_ID = 1346650441
 
+try:
+    from audit_backup_archives import (
+        MAX_ARCHIVE_MEMBERS,
+        MAX_SINGLE_FILE_SIZE_BYTES,
+        MAX_TOTAL_UNCOMPRESSED_SIZE_BYTES,
+    )
+except ImportError:
+    MAX_ARCHIVE_MEMBERS = 100_000
+    MAX_SINGLE_FILE_SIZE_BYTES = 1024 * 1024 * 1024
+    MAX_TOTAL_UNCOMPRESSED_SIZE_BYTES = 10 * 1024 * 1024 * 1024
+
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -310,6 +321,14 @@ def generate_backup(
         "errors": [],
     }
 
+    if db_path.is_symlink():
+        report["errors"].append(f"Database cannot be a symbolic link: {db_path}")
+        return False, report
+
+    if uploads_dir.is_symlink():
+        report["errors"].append(f"Uploads directory cannot be a symbolic link: {uploads_dir}")
+        return False, report
+
     if not db_path.is_file():
         report["errors"].append(f"Database not found: {db_path}")
         return False, report
@@ -449,18 +468,35 @@ def generate_backup(
     }
     manifest_json.write_text(json.dumps(manifest_data, indent=2), encoding="utf-8")
 
-    # 8. Post-creation verification using safe extraction
+    # 8. Post-creation verification using safe extraction and resource limit enforcement
     if not skip_verification:
         with tempfile.TemporaryDirectory() as tmp_restore:
             tmp_restore_path = Path(tmp_restore).resolve()
             restore_uploads = tmp_restore_path / "uploads"
             with tarfile.open(dst_tar, "r:gz") as tar:
-                for member in tar.getmembers():
+                members = tar.getmembers()
+                if len(members) > MAX_ARCHIVE_MEMBERS:
+                    report["errors"].append(
+                        f"Post-creation archive member count exceeds limit ({len(members)} > {MAX_ARCHIVE_MEMBERS})"
+                    )
+                    return False, report
+
+                total_uncompressed = 0
+                for member in members:
+                    if not isinstance(member.size, int) or member.size < 0:
+                        report["errors"].append(f"Malformed member size in backup archive: {member.name}")
+                        return False, report
+
                     if member.issym() or member.islnk():
                         report["errors"].append(f"Unsafe symlink/hardlink member in backup archive: {member.name}")
                         return False, report
+
                     if ".." in Path(member.name).parts or member.name.startswith("/") or Path(member.name).is_absolute():
                         report["errors"].append(f"Path traversal detected in backup archive member: {member.name}")
+                        return False, report
+
+                    if not (member.isreg() or member.isdir()):
+                        report["errors"].append(f"Disallowed member type in backup archive: {member.name}")
                         return False, report
 
                     target_dest = (tmp_restore_path / member.name).resolve()
@@ -471,6 +507,15 @@ def generate_backup(
                     if member.isdir():
                         target_dest.mkdir(parents=True, exist_ok=True)
                     elif member.isreg():
+                        if member.size > MAX_SINGLE_FILE_SIZE_BYTES:
+                            report["errors"].append(f"Member exceeds single-file size limit: {member.name}")
+                            return False, report
+
+                        total_uncompressed += member.size
+                        if total_uncompressed > MAX_TOTAL_UNCOMPRESSED_SIZE_BYTES:
+                            report["errors"].append("Total uncompressed size exceeds limit in post-creation restore")
+                            return False, report
+
                         target_dest.parent.mkdir(parents=True, exist_ok=True)
                         f_in = tar.extractfile(member)
                         if f_in:

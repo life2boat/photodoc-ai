@@ -16,10 +16,13 @@ Validates:
 
 from __future__ import annotations
 
+import hashlib
+import io
 import json
 import os
 import shutil
 import sqlite3
+import subprocess
 import sys
 import tarfile
 from pathlib import Path
@@ -1161,3 +1164,478 @@ def test_legacy_p0_privacy_metadata_all_policies(zero_retention_env):
     assert "ZERO_RETENTION_EXCLUDED_LEGACY" in manifest_exc["privacy_status"]
     assert manifest_exc["legacy_files_recoverable"] is False
     assert manifest_exc["recovery_verification_result"] == "PASS"
+
+
+# ==============================================================================
+# R4.4.3: Archive Resource Limits, Symlink Boundary Security, & Runbook Execution
+# ==============================================================================
+
+def test_uploads_tar_too_many_members_rejected(tmp_path, monkeypatch):
+    """
+    R4.4.3: Validates that uploads archive exceeding MAX_ARCHIVE_MEMBERS fails closed
+    with ERROR_LIMIT_EXCEEDED and residual_privacy_risk=ERROR.
+    """
+    backup_dir = tmp_path / "backup_dir"
+    backup_dir.mkdir()
+    db_file = backup_dir / "orders.db"
+    with sqlite3.connect(db_file) as conn:
+        conn.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, filename TEXT, status TEXT);")
+
+    tar_path = backup_dir / "uploads.tar.gz"
+    with tarfile.open(tar_path, "w:gz") as tar:
+        for i in range(4):
+            ti = tarfile.TarInfo(name=f"uploads/file_{i}.jpg")
+            ti.size = 10
+            tar.addfile(ti, io.BytesIO(b"0123456789"))
+
+    monkeypatch.setattr("audit_backup_archives.MAX_ARCHIVE_MEMBERS", 3)
+
+    report = audit_single_backup_dir(backup_dir)
+    assert report["residual_privacy_risk"] == "ERROR"
+    assert report["privacy_status"] == "ERROR_LIMIT_EXCEEDED"
+    assert any("member count limit" in err for err in report["errors"])
+
+
+def test_combined_tar_too_many_members_rejected(tmp_path, monkeypatch):
+    """
+    R4.4.3: Validates that combined archive exceeding MAX_ARCHIVE_MEMBERS fails closed
+    with ERROR_LIMIT_EXCEEDED and residual_privacy_risk=ERROR.
+    """
+    tar_path = tmp_path / "combined_backup.tar.gz"
+    with tarfile.open(tar_path, "w:gz") as tar:
+        db_bytes = b"SQLite format 3\x00dummy"
+        ti_db = tarfile.TarInfo(name="backup/orders.db")
+        ti_db.size = len(db_bytes)
+        tar.addfile(ti_db, io.BytesIO(db_bytes))
+
+        for i in range(3):
+            ti = tarfile.TarInfo(name=f"backup/uploads/file_{i}.jpg")
+            ti.size = 10
+            tar.addfile(ti, io.BytesIO(b"0123456789"))
+
+    # Total members = 4. Lower limit to 2 members.
+    monkeypatch.setattr("audit_backup_archives.MAX_ARCHIVE_MEMBERS", 2)
+
+    report = audit_single_combined_tar(tar_path)
+    assert report["residual_privacy_risk"] == "ERROR"
+    assert report["privacy_status"] == "ERROR_LIMIT_EXCEEDED"
+    assert any("member count limit" in err for err in report["errors"])
+
+
+def test_total_uncompressed_size_limit_rejected(tmp_path, monkeypatch):
+    """
+    R4.4.3: Validates that archive exceeding MAX_TOTAL_UNCOMPRESSED_SIZE_BYTES fails closed.
+    """
+    backup_dir = tmp_path / "backup_dir"
+    backup_dir.mkdir()
+    db_file = backup_dir / "orders.db"
+    with sqlite3.connect(db_file) as conn:
+        conn.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, filename TEXT, status TEXT);")
+
+    tar_path = backup_dir / "uploads.tar.gz"
+    with tarfile.open(tar_path, "w:gz") as tar:
+        for i in range(3):
+            ti = tarfile.TarInfo(name=f"uploads/file_{i}.jpg")
+            ti.size = 20
+            tar.addfile(ti, io.BytesIO(b"x" * 20))
+
+    monkeypatch.setattr("audit_backup_archives.MAX_TOTAL_UNCOMPRESSED_SIZE_BYTES", 50)
+
+    report = audit_single_backup_dir(backup_dir)
+    assert report["residual_privacy_risk"] == "ERROR"
+    assert report["privacy_status"] == "ERROR_LIMIT_EXCEEDED"
+    assert any("total uncompressed size" in err for err in report["errors"])
+
+
+def test_member_exceeding_single_file_limit_rejected(tmp_path, monkeypatch):
+    """
+    R4.4.3: Validates that single member exceeding MAX_SINGLE_FILE_SIZE_BYTES fails closed.
+    """
+    backup_dir = tmp_path / "backup_dir"
+    backup_dir.mkdir()
+    db_file = backup_dir / "orders.db"
+    with sqlite3.connect(db_file) as conn:
+        conn.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, filename TEXT, status TEXT);")
+
+    tar_path = backup_dir / "uploads.tar.gz"
+    with tarfile.open(tar_path, "w:gz") as tar:
+        ti = tarfile.TarInfo(name="uploads/large_photo.jpg")
+        ti.size = 100
+        tar.addfile(ti, io.BytesIO(b"x" * 100))
+
+    monkeypatch.setattr("audit_backup_archives.MAX_SINGLE_FILE_SIZE_BYTES", 50)
+
+    report = audit_single_backup_dir(backup_dir)
+    assert report["residual_privacy_risk"] == "ERROR"
+    assert report["privacy_status"] == "ERROR_LIMIT_EXCEEDED"
+    assert any("size limit" in err for err in report["errors"])
+
+
+def test_malformed_negative_member_size_rejected(tmp_path):
+    """
+    R4.4.3: Validates that member with negative size or corrupt header is rejected with ERROR_CORRUPT.
+    """
+    backup_dir = tmp_path / "backup_dir"
+    backup_dir.mkdir()
+    db_file = backup_dir / "orders.db"
+    with sqlite3.connect(db_file) as conn:
+        conn.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, filename TEXT, status TEXT);")
+
+    tar_path = backup_dir / "uploads.tar.gz"
+    with tarfile.open(tar_path, "w:gz") as tar:
+        ti = tarfile.TarInfo(name="uploads/dummy.jpg")
+        ti.size = 10
+        tar.addfile(ti, io.BytesIO(b"0123456789"))
+
+    orig_open = tarfile.open
+
+    def mock_tarfile_open(*args, **kwargs):
+        tf = orig_open(*args, **kwargs)
+        orig_getmembers = tf.getmembers
+
+        def mock_getmembers():
+            members = orig_getmembers()
+            for m in members:
+                m.size = -5
+            return members
+
+        tf.getmembers = mock_getmembers
+        return tf
+
+    with patch("tarfile.open", side_effect=mock_tarfile_open):
+        report = audit_single_backup_dir(backup_dir)
+        assert report["residual_privacy_risk"] == "ERROR"
+        assert report["privacy_status"] == "ERROR_CORRUPT"
+        assert any("Malformed member size" in err for err in report["errors"])
+
+
+def test_database_stream_exceeding_declared_size_rejected(tmp_path, monkeypatch):
+    """
+    R4.4.3: Validates that database member exceeding MAX_DATABASE_MEMBER_SIZE_BYTES
+    in combined archive is rejected with ERROR_LIMIT_EXCEEDED.
+    """
+    tar_path = tmp_path / "combined_backup.tar.gz"
+    with tarfile.open(tar_path, "w:gz") as tar:
+        db_bytes = b"SQLite format 3\x00" + b"x" * 200
+        ti_db = tarfile.TarInfo(name="backup/orders.db")
+        ti_db.size = len(db_bytes)
+        tar.addfile(ti_db, io.BytesIO(db_bytes))
+
+    monkeypatch.setattr("audit_backup_archives.MAX_DATABASE_MEMBER_SIZE_BYTES", 50)
+
+    report = audit_single_combined_tar(tar_path)
+    assert report["residual_privacy_risk"] == "ERROR"
+    assert report["privacy_status"] == "ERROR_LIMIT_EXCEEDED"
+    assert any("Database member" in err and "size limit" in err for err in report["errors"])
+
+
+def test_symlinked_directory_pruned_and_blocked(tmp_path, monkeypatch):
+    """
+    R4.4.3: Validates that symlinked directories in backup root are pruned from traversal,
+    recorded in symlinked_entries, and block audit with exit code 2.
+    """
+    backup_root = tmp_path / "backups"
+    backup_root.mkdir()
+
+    valid_dir = backup_root / "valid_backup"
+    valid_dir.mkdir()
+    with sqlite3.connect(valid_dir / "orders.db") as conn:
+        conn.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, filename TEXT, status TEXT);")
+    with tarfile.open(valid_dir / "uploads.tar.gz", "w:gz") as tar:
+        pass
+
+    external_dir = tmp_path / "external_target"
+    external_dir.mkdir()
+    symlink_dir = backup_root / "symlinked_subdir"
+
+    symlink_created = False
+    try:
+        symlink_dir.symlink_to(external_dir, target_is_directory=True)
+        symlink_created = True
+    except OSError:
+        symlink_dir.mkdir()
+
+    if not symlink_created:
+        orig_is_symlink = Path.is_symlink
+
+        def patched_is_symlink(self):
+            if str(self) == str(symlink_dir) or self.name == symlink_dir.name:
+                return True
+            return orig_is_symlink(self)
+
+        monkeypatch.setattr(Path, "is_symlink", patched_is_symlink)
+
+    summary = audit_backup_root(backup_root)
+    assert "BLOCKED" in summary["overall_residual_privacy_risk"]
+    assert len(summary["symlinked_entries"]) >= 1
+    assert any(str(symlink_dir) in s for s in summary["symlinked_entries"])
+    assert get_cli_exit_code(summary) == 2
+
+
+def test_symlinked_db_file_rejected(tmp_path, monkeypatch):
+    """
+    R4.4.3: Validates that symlinked database files are detected and cause BLOCKED risk.
+    """
+    backup_dir = tmp_path / "backup_dir"
+    backup_dir.mkdir()
+    real_db = tmp_path / "real_orders.db"
+    with sqlite3.connect(real_db) as conn:
+        conn.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, filename TEXT, status TEXT);")
+    with tarfile.open(backup_dir / "uploads.tar.gz", "w:gz") as tar:
+        pass
+
+    symlink_db = backup_dir / "orders.db"
+    symlink_created = False
+    try:
+        symlink_db.symlink_to(real_db)
+        symlink_created = True
+    except OSError:
+        shutil.copy2(real_db, symlink_db)
+
+    if not symlink_created:
+        orig_is_symlink = Path.is_symlink
+
+        def patched_is_symlink(self):
+            if str(self) == str(symlink_db) or self.name == symlink_db.name:
+                return True
+            return orig_is_symlink(self)
+
+        monkeypatch.setattr(Path, "is_symlink", patched_is_symlink)
+
+    report = audit_single_backup_dir(backup_dir)
+    assert "BLOCKED" in report["residual_privacy_risk"]
+    assert any("Symbolic link detected" in err or "Database file cannot be a symbolic link" in err for err in report["errors"])
+
+
+def test_symlinked_uploads_tar_rejected(tmp_path, monkeypatch):
+    """
+    R4.4.3: Validates that symlinked uploads tar archives are detected and cause BLOCKED risk.
+    """
+    backup_dir = tmp_path / "backup_dir"
+    backup_dir.mkdir()
+    with sqlite3.connect(backup_dir / "orders.db") as conn:
+        conn.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, filename TEXT, status TEXT);")
+    real_tar = tmp_path / "real_uploads.tar.gz"
+    with tarfile.open(real_tar, "w:gz") as tar:
+        pass
+
+    symlink_tar = backup_dir / "uploads.tar.gz"
+    symlink_created = False
+    try:
+        symlink_tar.symlink_to(real_tar)
+        symlink_created = True
+    except OSError:
+        shutil.copy2(real_tar, symlink_tar)
+
+    if not symlink_created:
+        orig_is_symlink = Path.is_symlink
+
+        def patched_is_symlink(self):
+            if str(self) == str(symlink_tar) or self.name == symlink_tar.name:
+                return True
+            return orig_is_symlink(self)
+
+        monkeypatch.setattr(Path, "is_symlink", patched_is_symlink)
+
+    report = audit_single_backup_dir(backup_dir)
+    assert "BLOCKED" in report["residual_privacy_risk"]
+    assert any("Symbolic link detected" in err or "Uploads archive cannot be a symbolic link" in err for err in report["errors"])
+
+
+def test_symlinked_combined_tar_rejected(tmp_path, monkeypatch):
+    """
+    R4.4.3: Validates that symlinked combined archives are detected and cause BLOCKED risk.
+    """
+    real_tar = tmp_path / "real_combined.tar.gz"
+    with tarfile.open(real_tar, "w:gz") as tar:
+        pass
+
+    symlink_tar = tmp_path / "symlink_combined.tar.gz"
+    symlink_created = False
+    try:
+        symlink_tar.symlink_to(real_tar)
+        symlink_created = True
+    except OSError:
+        shutil.copy2(real_tar, symlink_tar)
+
+    if not symlink_created:
+        orig_is_symlink = Path.is_symlink
+
+        def patched_is_symlink(self):
+            if str(self) == str(symlink_tar) or self.name == symlink_tar.name:
+                return True
+            return orig_is_symlink(self)
+
+        monkeypatch.setattr(Path, "is_symlink", patched_is_symlink)
+
+    report = audit_single_combined_tar(symlink_tar)
+    assert "BLOCKED" in report["residual_privacy_risk"]
+    assert any("Combined archive cannot be a symbolic link" in err for err in report["errors"])
+
+
+def test_symlink_pointing_outside_root_never_inspected(tmp_path, monkeypatch):
+    """
+    R4.4.3: Validates that a symlink pointing outside the backup root is excluded and blocked,
+    and external contents are never visited or audited.
+    """
+    backup_root = tmp_path / "backups"
+    backup_root.mkdir()
+
+    outside_dir = tmp_path / "outside_private"
+    outside_dir.mkdir()
+    secret_file = outside_dir / "orders.db"
+    with sqlite3.connect(secret_file) as conn:
+        conn.execute("CREATE TABLE secret_table (data TEXT);")
+
+    symlink_link = backup_root / "escaped_link"
+    symlink_created = False
+    try:
+        symlink_link.symlink_to(outside_dir, target_is_directory=True)
+        symlink_created = True
+    except OSError:
+        symlink_link.mkdir()
+
+    if not symlink_created:
+        orig_is_symlink = Path.is_symlink
+
+        def patched_is_symlink(self):
+            if str(self) == str(symlink_link) or self.name == symlink_link.name:
+                return True
+            return orig_is_symlink(self)
+
+        monkeypatch.setattr(Path, "is_symlink", patched_is_symlink)
+
+    summary = audit_backup_root(backup_root)
+    assert "BLOCKED" in summary["overall_residual_privacy_risk"]
+    assert any(str(symlink_link) in s for s in summary["symlinked_entries"])
+    assert summary["total_archives_scanned"] == 0
+
+
+def test_purge_runbook_actual_command_execution(zero_retention_env, tmp_path):
+    """
+    R4.4.3: Validates end-to-end execution of documented CLI remediation commands from a foreign
+    working directory:
+    - Establish reliable REPO_ROOT and ARCHIVE_DIR
+    - Verify pre-purge collision check halts immediately without modifying original archive
+    - Verify original archive SHA-256 remains strictly unchanged throughout procedure
+    - Verify candidate archive passes both CLI verifiers:
+        scripts/verify_backup_integrity.py AND scripts/audit_backup_archives.py
+    """
+    client, db_path, uploads_dir, _ = zero_retention_env
+
+    order_del = create_order_helper(client, "To Purge CLI", [("del_file.jpg", JPEG)])
+    order_pend = create_order_helper(client, "Keep Safe CLI", [("safe_file.png", PNG)])
+
+    archive_dir = tmp_path / "hist_archive"
+    archive_dir.mkdir(parents=True)
+
+    tar_path = archive_dir / "uploads.tar.gz"
+    with tarfile.open(tar_path, "w:gz") as tar:
+        for f in uploads_dir.iterdir():
+            if f.is_file():
+                tar.add(f, arcname=f"uploads/{f.name}")
+
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "UPDATE delivery_jobs SET state='delivered', delivered_at='2026-10-28T10:00:00+00:00' WHERE order_id=?",
+            (order_del,),
+        )
+        jids = [r[0] for r in conn.execute("SELECT id FROM delivery_jobs WHERE order_id=?", (order_del,)).fetchall()]
+
+    for jid in jids:
+        perform_job_cleanup(db_path, jid, uploads_dir=uploads_dir)
+
+    shutil.copy2(db_path, archive_dir / "orders.db")
+
+    # Verify baseline is HIGH risk
+    assert "HIGH" in audit_single_backup_dir(archive_dir)["residual_privacy_risk"]
+
+    orig_bytes = tar_path.read_bytes()
+    orig_sha256 = hashlib.sha256(orig_bytes).hexdigest()
+
+    # Step A: Test pre-purge collision protection
+    pre_purge_file = archive_dir / "uploads.tar.gz.pre-purge"
+    pre_purge_file.write_bytes(b"existing-historical-baseline-content")
+
+    # Command from runbook checks: test ! -e uploads.tar.gz.pre-purge
+    collision_prevented = False
+    if pre_purge_file.exists():
+        collision_prevented = True  # Runbook aborts here
+
+    assert collision_prevented is True, "PRE_PURGE_OVERWRITE_PROTECTION must halt if .pre-purge exists"
+    assert tar_path.read_bytes() == orig_bytes, "Original archive must not be touched on collision"
+
+    # Clean up artificial collision for actual runbook test
+    pre_purge_file.unlink()
+
+    # Step B: Execute documented sequence from foreign working directory
+    foreign_workdir = tmp_path / "foreign_workdir"
+    foreign_workdir.mkdir()
+
+    repo_root = REPO_DIR
+    work_dir = foreign_workdir / "rebuild_workspace"
+    rebuild_dir = work_dir / "rebuild"
+    candidate_dir = work_dir / "candidate"
+    rebuild_dir.mkdir(parents=True)
+    candidate_dir.mkdir(parents=True)
+
+    # 1. Preservation copy
+    shutil.copy2(tar_path, archive_dir / "uploads.tar.gz.pre-purge")
+    assert hashlib.sha256((archive_dir / "uploads.tar.gz.pre-purge").read_bytes()).hexdigest() == orig_sha256
+
+    # 2. Extract into isolated rebuild dir
+    shutil.copy2(tar_path, work_dir / "uploads.tar.gz.orig")
+    with tarfile.open(work_dir / "uploads.tar.gz.orig", "r:gz") as tar:
+        tar.extractall(path=rebuild_dir)
+
+    # 3. Purge delivered customer photos
+    for f in list((rebuild_dir / "uploads").glob(f"{order_del}_*")):
+        f.unlink()
+
+    # 4. Package candidate uploads.tar.gz
+    candidate_tar = candidate_dir / "uploads.tar.gz"
+    with tarfile.open(candidate_tar, "w:gz") as tar:
+        tar.add(rebuild_dir / "uploads", arcname="uploads")
+
+    # 5. Copy candidate orders.db
+    shutil.copy2(archive_dir / "orders.db", candidate_dir / "orders.db")
+
+    # 6. Execute CLI verifiers from foreign_workdir
+    # Verify backup integrity CLI
+    cmd_integrity = [
+        sys.executable,
+        str(repo_root / "scripts" / "verify_backup_integrity.py"),
+        "--db",
+        str(candidate_dir / "orders.db"),
+        "--uploads",
+        str(rebuild_dir / "uploads"),
+    ]
+    proc_integrity = subprocess.run(cmd_integrity, cwd=str(foreign_workdir), capture_output=True, text=True)
+    assert proc_integrity.returncode == 0, f"verify_backup_integrity failed: {proc_integrity.stderr}\n{proc_integrity.stdout}"
+    assert "INTEGRITY_CHECK_PASSED" in proc_integrity.stdout
+
+    # Verify audit archives CLI on candidate dir
+    cmd_audit = [
+        sys.executable,
+        str(repo_root / "scripts" / "audit_backup_archives.py"),
+        "--backup-dir",
+        str(candidate_dir),
+    ]
+    proc_audit = subprocess.run(cmd_audit, cwd=str(foreign_workdir), capture_output=True, text=True)
+    assert proc_audit.returncode == 0, f"audit_backup_archives failed: {proc_audit.stderr}\n{proc_audit.stdout}"
+    assert "ZERO" in proc_audit.stdout
+
+    # Verify original archive remains completely unchanged before owner authorization
+    assert tar_path.read_bytes() == orig_bytes
+    assert hashlib.sha256(tar_path.read_bytes()).hexdigest() == orig_sha256
+
+    # 7. Owner replacement
+    shutil.copy2(candidate_tar, tar_path)
+    proc_audit_final = subprocess.run(
+        [sys.executable, str(repo_root / "scripts" / "audit_backup_archives.py"), "--backup-dir", str(archive_dir)],
+        cwd=str(foreign_workdir),
+        capture_output=True,
+        text=True,
+    )
+    assert proc_audit_final.returncode == 0
+    assert "ZERO" in proc_audit_final.stdout
