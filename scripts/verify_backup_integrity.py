@@ -106,6 +106,14 @@ def verify_backup(
         "errors": [],
     }
 
+    if db_path.is_symlink():
+        report["errors"].append(f"Database cannot be a symbolic link: {db_path}")
+        return False, report
+
+    if uploads_dir.is_symlink():
+        report["errors"].append(f"Uploads directory cannot be a symbolic link: {uploads_dir}")
+        return False, report
+
     if not db_path.is_file():
         report["errors"].append(f"Database file not found: {db_path}")
         return False, report

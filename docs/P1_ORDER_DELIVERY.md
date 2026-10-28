@@ -155,22 +155,33 @@ The audit tool inspects `orders.db` and `uploads.tar.gz` in-memory, cross-refere
 > [!IMPORTANT]
 > GNU tar does not support in-place deletion (`tar --delete`) on compressed archives (`.tar.gz`). Attempting to run `tar --delete` on a `.tar.gz` file fails with `tar: Cannot update compressed archives`. Use the following safe, verified reconstruction workflow instead:
 
-1. **Inventory and Verify Original Checksum:**
+1. **Inventory, Conflict Check, and Original Checksum:**
    ```bash
-   cd /var/backups/photodoc/release_YYYYMMDD_HHMMSS
+   ARCHIVE_DIR="/var/backups/photodoc/release_YYYYMMDD_HHMMSS"
+   REPO_ROOT="/opt/photodoc"
+   cd "${ARCHIVE_DIR}"
+   # Conflict check: never overwrite an existing pre-purge snapshot
+   test ! -e "${ARCHIVE_DIR}/uploads.tar.gz.pre-purge" || {
+     echo "ERROR: uploads.tar.gz.pre-purge already exists; aborting to prevent overwrite" >&2
+     exit 1
+   }
    sha256sum -c manifest.sha256
    tar -ztvf uploads.tar.gz > original_manifest.txt
+   ORIG_SHA=$(sha256sum uploads.tar.gz | awk '{print $1}')
    ```
 2. **Create Isolated Temporary Working Copy:**
    ```bash
    WORK_DIR=$(mktemp -d -t photodoc_rebuild_XXXXXX)
    mkdir -p "${WORK_DIR}/rebuild" "${WORK_DIR}/candidate"
-   cp uploads.tar.gz "${WORK_DIR}/uploads.tar.gz.orig"
-   cp orders.db "${WORK_DIR}/candidate/orders.db"
+   cp "${ARCHIVE_DIR}/uploads.tar.gz" "${WORK_DIR}/uploads.tar.gz.orig"
+   cp "${ARCHIVE_DIR}/orders.db" "${WORK_DIR}/candidate/orders.db"
    ```
-3. **Preserve Original Archive:**
+3. **Preserve Original Archive (Safe Non-Overwriting Copy):**
    ```bash
-   cp uploads.tar.gz uploads.tar.gz.pre-purge
+   cp -n "${ARCHIVE_DIR}/uploads.tar.gz" "${ARCHIVE_DIR}/uploads.tar.gz.pre-purge" || {
+     echo "ERROR: Pre-purge copy failed or file exists" >&2
+     exit 1
+   }
    ```
 4. **Rebuild Candidate Archive (Excluding Only Approved Delivered Targets):**
    ```bash
@@ -184,17 +195,17 @@ The audit tool inspects `orders.db` and `uploads.tar.gz` in-memory, cross-refere
    `${WORK_DIR}/rebuild/uploads` contains the uncompressed tree for filesystem verification.
 6. **Run Integrity Verification, Privacy Audit, and Checksums on Candidate:**
    ```bash
-   tar -ztvf "${WORK_DIR}/candidate/uploads.tar.gz"
-   cd "${WORK_DIR}/candidate" && sha256sum orders.db uploads.tar.gz > manifest.sha256
-   python3 /candidate/scripts/verify_backup_integrity.py --db "${WORK_DIR}/candidate/orders.db" --uploads "${WORK_DIR}/rebuild/uploads"
-   python3 /candidate/scripts/audit_backup_archives.py --archive-dir "${WORK_DIR}/candidate"
+   tar -ztvf "${WORK_DIR}/candidate/uploads.tar.gz" >/dev/null
+   (cd "${WORK_DIR}/candidate" && sha256sum orders.db uploads.tar.gz > manifest.sha256)
+   python3 "${REPO_ROOT}/scripts/verify_backup_integrity.py" --db "${WORK_DIR}/candidate/orders.db" --uploads "${WORK_DIR}/rebuild/uploads"
+   python3 "${REPO_ROOT}/scripts/audit_backup_archives.py" --archive-dir "${WORK_DIR}/candidate"
    ```
 7. **Require Explicit Owner Authorization Before Replacing Historical Archive:**
    ```bash
    # OWNER AUTHORIZATION REQUIRED BEFORE PROCEEDING
    # Once all verification checks above PASS cleanly, owner executes replacement:
-   cp "${WORK_DIR}/candidate/uploads.tar.gz" uploads.tar.gz
-   cp "${WORK_DIR}/candidate/manifest.sha256" manifest.sha256
+   cp "${WORK_DIR}/candidate/uploads.tar.gz" "${ARCHIVE_DIR}/uploads.tar.gz"
+   cp "${WORK_DIR}/candidate/manifest.sha256" "${ARCHIVE_DIR}/manifest.sha256"
    rm -rf "${WORK_DIR}"
    ```
 

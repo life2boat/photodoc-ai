@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [ main, master, fix/p1-order-delivery-hardening, feat/p1-auto-photo-cleanup, infra/r4-prebuilt-staging-images, infra/r4-safe-staging-bootstrap, audit/r4-integrated-privacy-retention, fix/r4-backup-privacy-audit, fix/r4-archive-audit-hardening ]
+    branches: [ main, master, fix/p1-order-delivery-hardening, feat/p1-auto-photo-cleanup, infra/r4-prebuilt-staging-images, infra/r4-safe-staging-bootstrap, audit/r4-integrated-privacy-retention, fix/r4-backup-privacy-audit, fix/r4-archive-audit-hardening, fix/r4-audit-boundary-hardening ]
   pull_request:
-    branches: [ main, master, fix/p0-production-readiness, infra/r2-public-https-preflight, feat/p1-auto-photo-cleanup, infra/r4-prebuilt-staging-images, infra/r4-safe-staging-bootstrap, audit/r4-integrated-privacy-retention, fix/r4-backup-privacy-audit ]
+    branches: [ main, master, fix/p0-production-readiness, infra/r2-public-https-preflight, feat/p1-auto-photo-cleanup, infra/r4-prebuilt-staging-images, infra/r4-safe-staging-bootstrap, audit/r4-integrated-privacy-retention, fix/r4-backup-privacy-audit, fix/r4-archive-audit-hardening, fix/r4-audit-boundary-hardening ]
   workflow_dispatch:
 
 jobs:
