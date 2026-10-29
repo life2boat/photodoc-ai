@@ -1,9 +1,9 @@
 # PhotoDoc AI — R4.3 Safe Staging Bootstrap and Deployment Gate Protocol
 
-**Document Version:** 1.0.0 (Release R4.3)  
-**Target Environment:** Staging VPS (1 vCPU, 2 GB RAM, 25–30 GB NVMe, Ubuntu 24.04 LTS)  
-**Base Branch:** `infra/r4-prebuilt-staging-images` (PR #13 HEAD `7c60fe08cadefd8943cfaae269f114814ea3979a`)  
-**Deployment Tooling:** `scripts/staging_deploy_preflight.py`, `scripts/deploy_staging_prebuilt.sh`  
+**Document Version:** 1.0.0 (Release R4.3)<br>
+**Target Environment:** Staging VPS (1 vCPU, 2 GB RAM, 25–30 GB NVMe, Ubuntu 24.04 LTS)<br>
+**Base Branch:** `infra/r4-prebuilt-staging-images` (PR #13 HEAD `7c60fe08cadefd8943cfaae269f114814ea3979a`)<br>
+**Deployment Tooling:** `scripts/staging_deploy_preflight.py`, `scripts/deploy_staging_prebuilt.sh`<br>
 
 ---
 

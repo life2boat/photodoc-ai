@@ -1,9 +1,9 @@
 # PhotoDoc AI — R4.2 Prebuilt Docker Images & Low-Memory VPS Deployment Runbook
 
-**Document Version:** 1.0.0 (Release R4.2)  
-**Target Environment:** Staging VPS (1 vCPU, 2 GB RAM, 25–30 GB NVMe, Debian 12 / Ubuntu 24.04 LTS)  
-**Base Repository:** `life2boat/photodoc-ai`  
-**Container Registry:** GitHub Container Registry (`ghcr.io/life2boat/photodoc-backend`, `ghcr.io/life2boat/photodoc-frontend`)  
+**Document Version:** 1.0.0 (Release R4.2)<br>
+**Target Environment:** Staging VPS (1 vCPU, 2 GB RAM, 25–30 GB NVMe, Debian 12 / Ubuntu 24.04 LTS)<br>
+**Base Repository:** `life2boat/photodoc-ai`<br>
+**Container Registry:** GitHub Container Registry (`ghcr.io/life2boat/photodoc-backend`, `ghcr.io/life2boat/photodoc-frontend`)<br>
 
 ---
 
