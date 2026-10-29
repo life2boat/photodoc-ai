@@ -2,6 +2,7 @@ photos/
 .env
 .env.*
 !.env.example
+!.env.staging.example
 logs.txt
 venv/
 temp_uploads/

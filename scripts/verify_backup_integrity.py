@@ -88,6 +88,11 @@ def verify_backup(
         "p1_orders_count": 0,
         "p1_verified_files": 0,
         "p1_verified_info": 0,
+        "p1_cleaned_files": 0,
+        "p1_cleaned_info": 0,
+        "p1_residual_uncleaned_files": [],
+        "p1_delivered_uncleaned_anomalies": [],
+        "p1_unexplained_missing_sources": [],
         "p1_missing_files": [],
         "p1_size_mismatches": [],
         "p1_checksum_mismatches": [],
@@ -100,6 +105,14 @@ def verify_backup(
         "path_traversal_violations": [],
         "errors": [],
     }
+
+    if db_path.is_symlink():
+        report["errors"].append(f"Database cannot be a symbolic link: {db_path}")
+        return False, report
+
+    if uploads_dir.is_symlink():
+        report["errors"].append(f"Uploads directory cannot be a symbolic link: {uploads_dir}")
+        return False, report
 
     if not db_path.is_file():
         report["errors"].append(f"Database file not found: {db_path}")
@@ -244,10 +257,25 @@ def verify_backup(
                         )
 
             # 4.3 Mandatory Integrity Metadata and file presence for all file/info delivery jobs
-            file_and_info_jobs = conn.execute(
-                "SELECT id, order_id, kind, local_path, original_name, content_sha256, content_size "
-                "FROM delivery_jobs WHERE kind IN ('file', 'info') ORDER BY order_id, id;"
-            ).fetchall()
+            dj_cols = {row[1] for row in conn.execute("PRAGMA table_info(delivery_jobs);").fetchall()}
+            has_cleanup_state = "cleanup_state" in dj_cols
+            has_cleanup_phase = "cleanup_phase" in dj_cols
+            has_local_deleted_at = "local_deleted_at" in dj_cols
+            has_cleanup_error = "cleanup_error" in dj_cols
+            has_delivered_at = "delivered_at" in dj_cols
+            has_state = "state" in dj_cols
+
+            query = (
+                "SELECT id, order_id, kind, local_path, original_name, content_sha256, content_size"
+                + (", state" if has_state else ", 'pending' AS state")
+                + (", cleanup_state" if has_cleanup_state else ", 'pending' AS cleanup_state")
+                + (", cleanup_phase" if has_cleanup_phase else ", 'none' AS cleanup_phase")
+                + (", local_deleted_at" if has_local_deleted_at else ", NULL AS local_deleted_at")
+                + (", cleanup_error" if has_cleanup_error else ", NULL AS cleanup_error")
+                + (", delivered_at" if has_delivered_at else ", NULL AS delivered_at")
+                + " FROM delivery_jobs WHERE kind IN ('file', 'info') ORDER BY order_id, id;"
+            )
+            file_and_info_jobs = conn.execute(query).fetchall()
 
             for job in file_and_info_jobs:
                 job_id = job["id"]
@@ -256,6 +284,12 @@ def verify_backup(
                 local_path_raw = job["local_path"] or ""
                 raw_sha256 = job["content_sha256"]
                 raw_size = job["content_size"]
+                job_state = job["state"]
+                cleanup_state = job["cleanup_state"]
+                cleanup_phase = job["cleanup_phase"]
+                local_deleted_at = job["local_deleted_at"]
+                cleanup_error = job["cleanup_error"]
+                delivered_at = job["delivered_at"]
 
                 # Mandatory SHA-256 validation
                 if not is_valid_sha256(raw_sha256):
@@ -290,6 +324,15 @@ def verify_backup(
 
                 if not local_path_raw:
                     report["errors"].append(f"Order #{order_id} job #{job_id} ({kind}) has empty local_path")
+                    report["p1_unexplained_missing_sources"].append(
+                        {
+                            "order_id": order_id,
+                            "job_id": job_id,
+                            "kind": kind,
+                            "filename": "",
+                            "error": "MissingLocalPath",
+                        }
+                    )
                     continue
 
                 # Path traversal check: reject any traversal in path components or filename
@@ -307,11 +350,96 @@ def verify_backup(
                     )
                     continue
 
-                if not candidate_file.is_file():
-                    report["p1_missing_files"].append(
-                        {"order_id": order_id, "job_id": job_id, "kind": kind, "filename": filename}
+                file_exists = candidate_file.is_file()
+
+                # Flag explicit missing source anomalies:
+                if cleanup_error in ("HistoricalMissingSource", "MissingSourceBeforeCleanup", "MissingLocalPath"):
+                    report["p1_unexplained_missing_sources"].append(
+                        {
+                            "order_id": order_id,
+                            "job_id": job_id,
+                            "kind": kind,
+                            "filename": filename,
+                            "error": cleanup_error,
+                        }
+                    )
+                    report["errors"].append(
+                        f"Order #{order_id} job #{job_id} ({kind}) has unexplained missing source ({cleanup_error})"
                     )
                     continue
+
+                # Privacy-by-design & cleanup contract:
+                # 1. pending, processing, failed -> local source file is strictly required
+                # 2. delivered, cleanup completed -> absence of local file is valid ONLY with durable deletion evidence
+                # 3. delivered, cleanup pending/failed/processing -> missing file is an anomaly
+                if job_state in ("pending", "processing", "failed"):
+                    if not file_exists:
+                        report["p1_missing_files"].append(
+                            {"order_id": order_id, "job_id": job_id, "kind": kind, "filename": filename, "state": job_state}
+                        )
+                        continue
+                elif job_state == "delivered":
+                    if cleanup_state == "completed":
+                        if not file_exists:
+                            has_durable_evidence = (
+                                cleanup_phase in ("deleted", "deleting")
+                                and local_deleted_at is not None
+                                and local_deleted_at != delivered_at
+                            )
+                            if not has_durable_evidence:
+                                report["p1_unexplained_missing_sources"].append(
+                                    {
+                                        "order_id": order_id,
+                                        "job_id": job_id,
+                                        "kind": kind,
+                                        "filename": filename,
+                                        "error": f"MissingDurableEvidence(phase={cleanup_phase}, local_deleted_at={local_deleted_at})",
+                                    }
+                                )
+                                report["errors"].append(
+                                    f"Order #{order_id} job #{job_id} ({kind}) marked cleanup completed but lacks durable deletion evidence"
+                                )
+                                continue
+
+                            if kind == "file":
+                                report["p1_cleaned_files"] += 1
+                            elif kind == "info":
+                                report["p1_cleaned_info"] += 1
+                            continue
+                        else:
+                            report["p1_residual_uncleaned_files"].append(
+                                {
+                                    "order_id": order_id,
+                                    "job_id": job_id,
+                                    "kind": kind,
+                                    "filename": filename,
+                                }
+                            )
+                            report["errors"].append(
+                                f"Order #{order_id} job #{job_id} ({kind}) marked cleanup completed but residual file still exists on disk"
+                            )
+                            continue
+                    else:
+                        if not file_exists:
+                            report["p1_delivered_uncleaned_anomalies"].append(
+                                {
+                                    "order_id": order_id,
+                                    "job_id": job_id,
+                                    "kind": kind,
+                                    "filename": filename,
+                                    "cleanup_state": cleanup_state,
+                                }
+                            )
+                            report["errors"].append(
+                                f"Order #{order_id} job #{job_id} ({kind}) is delivered but cleanup is '{cleanup_state}', yet local file is missing"
+                            )
+                            continue
+                else:
+                    if not file_exists:
+                        report["p1_missing_files"].append(
+                            {"order_id": order_id, "job_id": job_id, "kind": kind, "filename": filename, "state": job_state}
+                        )
+                        continue
 
                 actual_size = candidate_file.stat().st_size
                 if actual_size != expected_size:
@@ -385,12 +513,15 @@ def verify_backup(
         report["sqlite_integrity"] == "ok"
         and report["application_id_valid"]
         and len(report["p1_missing_files"]) == 0
+        and len(report["p1_residual_uncleaned_files"]) == 0
+        and len(report["p1_unexplained_missing_sources"]) == 0
         and len(report["p1_size_mismatches"]) == 0
         and len(report["p1_checksum_mismatches"]) == 0
         and len(report["path_traversal_violations"]) == 0
         and len(report["orphan_delivery_jobs"]) == 0
         and len(report["p1_metadata_errors"]) == 0
         and len(report["p1_completeness_errors"]) == 0
+        and len(report["p1_delivered_uncleaned_anomalies"]) == 0
         and len(report["errors"]) == 0
     )
 
@@ -413,6 +544,11 @@ def print_report(is_valid: bool, report: Dict[str, Any], *, as_json: bool = Fals
     print(f"P1 Orders:                {report['p1_orders_count']}")
     print(f"P1 Verified Photos:       {report['p1_verified_files']}")
     print(f"P1 Verified Info Files:   {report['p1_verified_info']}")
+    print(f"P1 Cleaned Photos:        {report['p1_cleaned_files']}")
+    print(f"P1 Cleaned Info Files:    {report['p1_cleaned_info']}")
+    print(f"P1 Residual Uncleaned:    {len(report['p1_residual_uncleaned_files'])}")
+    print(f"P1 Delivered Missing:     {len(report['p1_delivered_uncleaned_anomalies'])}")
+    print(f"P1 Unexplained Missing:   {len(report['p1_unexplained_missing_sources'])}")
     print(f"P1 Completeness Errors:   {len(report['p1_completeness_errors'])}")
     print(f"P1 Metadata Errors:       {len(report['p1_metadata_errors'])}")
     print(f"P1 Missing Files:         {len(report['p1_missing_files'])}")
@@ -443,6 +579,16 @@ def print_report(is_valid: bool, report: Dict[str, Any], *, as_json: bool = Fals
         print("\nOrphan Delivery Jobs:")
         for item in report["orphan_delivery_jobs"][:10]:
             print(f"  - Job #{item['job_id']} references non-existent order #{item['order_id']} ({item['kind']})")
+
+    if report["p1_unexplained_missing_sources"]:
+        print("\nP1 Unexplained Missing Sources (Anomaly):")
+        for item in report["p1_unexplained_missing_sources"][:10]:
+            print(f"  - Order #{item['order_id']} job #{item['job_id']}: {item['filename']} ({item.get('error', 'MissingEvidence')})")
+
+    if report["p1_residual_uncleaned_files"]:
+        print("\nP1 Residual Uncleaned Files (Privacy Violation):")
+        for item in report["p1_residual_uncleaned_files"][:10]:
+            print(f"  - Order #{item['order_id']} job #{item['job_id']}: {item['filename']} ({item['kind']})")
 
     if report["p1_missing_files"]:
         print("\nMissing P1 Files:")

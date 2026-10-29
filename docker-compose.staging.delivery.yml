@@ -1,0 +1,23 @@
+# PhotoDoc AI - Opt-in Staging Delivery Acceptance Override
+# Project: photodoc-staging
+#
+# IMPORTANT: For authorized staging acceptance testing ONLY.
+# Enables the background delivery worker against an isolated staging Yandex Disk root.
+#
+# Usage:
+#   docker compose -p photodoc-staging -f docker-compose.staging.yml -f docker-compose.staging.delivery.yml config
+#   docker compose -p photodoc-staging -f docker-compose.staging.yml -f docker-compose.staging.delivery.yml up -d
+#
+# Safety Guarantees:
+# - DELIVERY_WORKER_ENABLED is set to "1" ONLY when this override is explicitly applied.
+# - Requires an explicit, non-placeholder YANDEX_DISK_STAGING_TOKEN.
+# - Forces remote root to dedicated staging directory 'PhotoDoc_Staging_R4' (strictly rejecting PhotoDoc_Orders).
+# - Retains isolated staging named volumes (photodoc_staging_backend-data, photodoc_staging_uploads).
+# - Never loads production .env or mounts production assets.
+
+services:
+  backend:
+    environment:
+      DELIVERY_WORKER_ENABLED: "1"
+      YANDEX_DISK_TOKEN: "${YANDEX_DISK_STAGING_TOKEN:?Error: YANDEX_DISK_STAGING_TOKEN is required for staging delivery acceptance}"
+      YANDEX_DISK_ROOT_DIR: "${YANDEX_DISK_STAGING_ROOT:-PhotoDoc_Staging_R4}"
