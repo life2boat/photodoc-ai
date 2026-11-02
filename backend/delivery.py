@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -439,8 +440,17 @@ def perform_job_cleanup(
         _mark_cleanup_failed(db_path, job_id, token, "NotARegularFile")
         return False
 
-    # Pre-delete identity verification: size
+    # Historical/incomplete jobs must not authorize deletion without an identity
+    # that can be compared with the verified remote delivery.
     expected_size = job["content_size"]
+    expected_sha256 = job["content_sha256"]
+    if (not isinstance(expected_size, int) or expected_size < 0
+            or not isinstance(expected_sha256, str)
+            or re.fullmatch(r"[0-9a-fA-F]{64}", expected_sha256) is None):
+        _mark_cleanup_failed(db_path, job_id, token, "MissingDeliveryIdentity")
+        return False
+
+    # Pre-delete identity verification: size
     try:
         actual_size = path_obj.stat().st_size
     except Exception as exc:
@@ -454,7 +464,6 @@ def perform_job_cleanup(
         return False
 
     # Pre-delete identity verification: SHA-256
-    expected_sha256 = job["content_sha256"]
     if expected_sha256:
         try:
             actual_sha256 = sha256_file(path_obj).lower()
@@ -525,7 +534,8 @@ def perform_job_cleanup(
     try:
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
-            "SELECT cleanup_lease_until, cleanup_state, cleanup_attempts FROM delivery_jobs WHERE id=?",
+            "SELECT cleanup_lease_until, cleanup_state, cleanup_attempts, state, local_path, "
+            "content_sha256, content_size, kind, order_id FROM delivery_jobs WHERE id=?",
             (job_id,),
         ).fetchone()
         if not row:
@@ -543,6 +553,43 @@ def perform_job_cleanup(
         if lease_ts_check <= now_check:
             # Lease expired; abort without unlinking
             conn.rollback()
+            return False
+
+        # Earlier checks and the durable intent are not a deletion authorization:
+        # another worker may have changed delivery or added a consumer since then.
+        # BEGIN IMMEDIATE fences these checks against enqueue/state transitions.
+        if tuple(row[3:]) != (
+            "delivered", raw_local_path, expected_sha256, expected_size, job["kind"], job["order_id"]
+        ):
+            conn.rollback()
+            _mark_cleanup_failed(db_path, job_id, token, "DeliveryChangedBeforeDelete")
+            return False
+        if conn.execute(
+            "SELECT 1 FROM delivery_jobs WHERE local_path=? AND id!=? AND state!='delivered' LIMIT 1",
+            (raw_local_path, job_id),
+        ).fetchone():
+            conn.execute(
+                "UPDATE delivery_jobs SET cleanup_state='pending', cleanup_phase='pending', "
+                "cleanup_lease_until=NULL, cleanup_error='FileStillReferencedByUnfinishedJob' "
+                "WHERE id=? AND cleanup_lease_until=?", (job_id, token),
+            )
+            conn.commit()
+            return False
+
+        # Recheck the actual bytes at the filesystem boundary, including a
+        # same-size substitution. Application uploads use immutable UUID paths.
+        # An absent source after durable deleting intent follows crash recovery.
+        try:
+            source_changed = path_obj.is_symlink() or path_obj.resolve() != target_resolved
+            if path_obj.exists():
+                source_changed = (source_changed or not path_obj.is_file()
+                                  or path_obj.stat().st_size != expected_size
+                                  or sha256_file(path_obj).lower() != expected_sha256.lower())
+        except OSError:
+            source_changed = True
+        if source_changed:
+            conn.rollback()
+            _mark_cleanup_failed(db_path, job_id, token, "SourceChangedBeforeDelete")
             return False
 
         # Worker still owns valid lease. Unlink local file:
