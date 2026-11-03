@@ -36,6 +36,8 @@ def test_yandex_upload_checks_put_and_metadata_without_overwrite(tmp_path, monke
     state = {"uploaded": False, "puts": []}
 
     def fake_get(url, **kwargs):
+        if kwargs["params"].get("fields") == "type":
+            return Response(data={"type": "dir"})
         if url.endswith("/upload"):
             assert kwargs["params"]["overwrite"] == "false"
             return Response(data={"href": "https://upload.example.invalid/file"})
@@ -61,12 +63,17 @@ def test_yandex_timeout_and_wrong_remote_file_preserve_local_source(tmp_path, mo
     source = tmp_path / "photo.jpg"
     source.write_bytes(b"synthetic-photo")
     monkeypatch.setenv("YANDEX_DISK_TOKEN", "synthetic-oauth")
-    with patch.object(main.httpx, "put", side_effect=TimeoutError("synthetic timeout")):
+    with patch.object(main.httpx, "get", return_value=Response(status=404)), \
+         patch.object(main.httpx, "put", side_effect=TimeoutError("synthetic timeout")):
         with pytest.raises(TimeoutError):
             main.upload_to_yandex_disk(str(source), "PhotoDoc_Orders/Заказ_1_Test/settings", "unique.jpg")
     assert source.is_file()
+    def wrong_file_get(url, **kwargs):
+        if kwargs["params"].get("fields") == "type":
+            return Response(data={"type": "dir"})
+        return Response(data={"type": "file", "sha256": "wrong", "size": 15})
     with patch.object(main.httpx, "put", return_value=Response(status=201)), \
-         patch.object(main.httpx, "get", return_value=Response(data={"type": "file", "sha256": "wrong", "size": 15})):
+         patch.object(main.httpx, "get", side_effect=wrong_file_get):
         with pytest.raises(RuntimeError, match="does not match"):
             main.upload_to_yandex_disk(str(source), "PhotoDoc_Orders/Заказ_1_Test/settings", "unique.jpg")
     assert source.is_file()

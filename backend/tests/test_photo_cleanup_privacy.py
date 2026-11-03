@@ -230,7 +230,8 @@ def test_yandex_disk_error_preserves_local_file(isolated_env):
     assert photo_path.is_file()
 
     # Yandex Disk raises an unhandled network error
-    with patch.object(main.httpx, "put", side_effect=RuntimeError("Yandex Cloud Outage")):
+    with patch.object(main.httpx, "get", return_value=MockYandexResponse(status=404)), \
+         patch.object(main.httpx, "put", side_effect=RuntimeError("Yandex Cloud Outage")):
         process_due(db, main.deliver_job, uploads_dir=uploads)
 
     # File MUST still exist on VPS
