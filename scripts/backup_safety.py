@@ -644,8 +644,30 @@ def _check_upload_archive(backup_dir: Path, report: Dict[str, Any]) -> List[str]
         valid, verify_report = verify_backup(backup_dir / "orders.db", uploads_dir)
         report["upload_archive_verified"] = valid
         if not valid:
-            errors.extend(f"upload archive verification: {err}"
-                          for err in verify_report.get("errors", [])[:10])
+            # A failed verification is fatal regardless of *where* the verifier
+            # recorded the problem. Some failures (a missing source for an
+            # unfinished delivery, a size or digest mismatch) are reported in
+            # dedicated lists and leave `errors` empty — copying only `errors`
+            # made the deep check pass on an archive that could not restore an
+            # order, which is precisely what it exists to prevent.
+            detail_keys = (
+                "errors",
+                "p1_missing_files",
+                "p1_size_mismatches",
+                "p1_checksum_mismatches",
+                "p1_metadata_errors",
+                "p1_completeness_errors",
+                "p1_unexplained_missing_sources",
+                "orphan_delivery_jobs",
+            )
+            details = []
+            for key in detail_keys:
+                items = verify_report.get(key) or []
+                if items:
+                    details.append(f"{key}: {len(items)} issue(s) {items[:3]}")
+            if not details:
+                details.append("verification reported invalid without detail")
+            errors.append("upload archive verification failed — " + " | ".join(details))
     return errors
 
 

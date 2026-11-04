@@ -286,6 +286,56 @@ def test_previous_sets_are_pruned_under_the_plan(tmp_path, capsys):
     assert len(remaining) == 1, f"expected one .previous to remain, got {remaining}"
 
 
+# ------------------------------------------------------- deep archive verification
+def test_deep_check_rejects_an_archive_missing_a_required_upload(tmp_path):
+    """A failed archive verification must be fatal wherever the verifier records it.
+
+    ``verify_backup`` reports a missing source for an unfinished delivery in
+    ``p1_missing_files`` and leaves ``errors`` empty. When the deep check copied
+    only ``errors``, the gate passed an archive that could not restore an
+    unfinished order — found by the isolated VPS acceptance run (T4).
+    """
+    import hashlib
+    import io
+    import tarfile
+
+    backup_dir, _ = make_backup_set(tmp_path, created=NOW)
+    tar_path = backup_dir / "uploads.tar.gz"
+    with tarfile.open(tar_path, "r:gz") as tar:
+        members = [(m, tar.extractfile(m).read() if m.isreg() else None)
+                   for m in tar.getmembers()]
+    victim = [m for m, _ in members if m.isreg() and m.name.endswith(".jpg")][0]
+    with tarfile.open(tar_path, "w:gz") as tar:
+        for member, data in members:
+            if member.name == victim.name:
+                continue
+            tar.addfile(member, io.BytesIO(data) if data is not None else None)
+
+    # Keep the manifest self-consistent so only the deep check can catch this.
+    tar_sha = hashlib.sha256(tar_path.read_bytes()).hexdigest()
+    db_sha = hashlib.sha256((backup_dir / "orders.db").read_bytes()).hexdigest()
+    (backup_dir / "manifest.sha256").write_text(
+        f"{db_sha}  orders.db\n{tar_sha}  uploads.tar.gz\n", encoding="utf-8")
+    manifest = json.loads((backup_dir / "backup_manifest.json").read_text(encoding="utf-8"))
+    manifest["uploads_tar_sha256"] = tar_sha
+    (backup_dir / "backup_manifest.json").write_text(
+        json.dumps(manifest, indent=2), encoding="utf-8")
+
+    ok, report = safety.verify_backup_set(
+        backup_dir, require_outbox=True, now=NOW, check_upload_archive=True)
+    assert report.get("upload_archive_verified") is False
+    assert ok is False, "a set missing a required upload must not pass the deep check"
+    assert any("missing" in error for error in report["errors"])
+
+
+def test_deep_check_accepts_a_healthy_set(tmp_path):
+    backup_dir, _ = make_backup_set(tmp_path, created=NOW)
+    ok, report = safety.verify_backup_set(
+        backup_dir, require_outbox=True, now=NOW, check_upload_archive=True)
+    assert ok, report["errors"]
+    assert report.get("upload_archive_verified") is True
+
+
 # ------------------------------------------------------------------ H1 static
 def _gate_invocation(text: str) -> str:
     """The ``docker run`` block that invokes backup_gate.py (not the host-mode one)."""
