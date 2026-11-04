@@ -92,6 +92,9 @@ def create_order_helper(client, name: str, filenames_and_data: list[tuple[str, b
         files=files,
     )
     assert resp.status_code == 200
+    # These are backup/retention fixtures for legitimate paid delivery.
+    with sqlite3.connect(main.DB_PATH) as conn:
+        conn.execute("UPDATE orders SET payment_status='paid' WHERE id=?", (resp.json()["order_id"],))
     return resp.json()["order_id"]
 
 
@@ -1641,6 +1644,7 @@ def create_synthetic_archive_fixture(tmp_path):
 
         # Complete delivery and cleanup for order 1 on the server
         with sqlite3.connect(db_path) as conn:
+            conn.execute("UPDATE orders SET payment_status='paid' WHERE id=?", (order_del,))
             conn.execute(
                 "UPDATE delivery_jobs SET state='delivered', delivered_at='2026-10-28T10:00:00+00:00' WHERE order_id=?",
                 (order_del,),

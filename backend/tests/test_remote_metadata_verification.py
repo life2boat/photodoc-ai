@@ -255,6 +255,6 @@ def test_cross_order_file_manipulation_rejected(tmp_path, monkeypatch):
         "content_size": len(b"order-1-exclusive-photo"),
     }
 
-    with patch.object(main, "get_order_by_id", return_value={"id": 2, "name": "Eve"}):
+    with patch.object(main, "get_order_by_id", return_value={"id": 2, "name": "Eve", "payment_status": "paid"}):
         with pytest.raises(RuntimeError, match="does not match order ID"):
             main.deliver_job(malicious_job)

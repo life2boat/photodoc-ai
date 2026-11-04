@@ -848,6 +848,7 @@ def test_crash_recovery_durable_intent_source_present_retry_cleans_safely(test_e
     with sqlite3.connect(db_path) as conn:
         job_id = conn.execute("SELECT id FROM delivery_jobs WHERE order_id=? AND kind='file'", (order_id,)).fetchone()[0]
         # Simulate state: delivered, phase='deleting' recorded, but process crashed before unlink
+        conn.execute("UPDATE orders SET payment_status='paid' WHERE id=?", (order_id,))
         conn.execute(
             "UPDATE delivery_jobs SET state='delivered', cleanup_state='failed', cleanup_phase='deleting', "
             "cleanup_lease_until=NULL, delivered_at='2026-10-27T12:00:00+00:00' WHERE id=?",
@@ -905,6 +906,7 @@ def test_crash_recovery_source_removed_transaction_interrupted_reconciles(test_e
 
     with sqlite3.connect(db_path) as conn:
         job_id1 = conn.execute("SELECT id FROM delivery_jobs WHERE order_id=? AND kind='file'", (order_id1,)).fetchone()[0]
+        conn.execute("UPDATE orders SET payment_status='paid' WHERE id=?", (order_id1,))
         conn.execute(
             "UPDATE delivery_jobs SET state='delivered', cleanup_state='failed', cleanup_phase='deleting', "
             "cleanup_lease_until=NULL, delivered_at='2026-10-27T12:00:00+00:00' WHERE id=?",

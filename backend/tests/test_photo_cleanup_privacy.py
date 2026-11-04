@@ -94,7 +94,7 @@ def isolated_env(tmp_path, monkeypatch):
     yield client, db, uploads
 
 
-def create_test_order(client, filenames=("photo1.jpg",), content=JPEG):
+def create_test_order(client, filenames=("photo1.jpg",), content=JPEG, *, paid=True):
     files = [("files", (fn, content, "image/jpeg")) for fn in filenames]
     resp = client.post(
         "/api/order",
@@ -110,6 +110,10 @@ def create_test_order(client, filenames=("photo1.jpg",), content=JPEG):
         files=files,
     )
     assert resp.status_code == 200, resp.text
+    if paid:
+        # Cleanup/transport regressions exercise legitimate paid fulfilment.
+        with sqlite3.connect(main.DB_PATH) as conn:
+            conn.execute("UPDATE orders SET payment_status='paid',paid_at='2026-01-01' WHERE id=?", (resp.json()["order_id"],))
     return resp.json()
 
 
@@ -433,6 +437,7 @@ def test_path_outside_uploads_rejected(isolated_env, tmp_path):
     # Manually inject malicious delivery job pointing outside uploads
     job_id = "malicious-job-1"
     with sqlite3.connect(db) as conn:
+        conn.execute("INSERT INTO orders(id,payment_status) VALUES(1,'paid')")
         conn.execute(
             "INSERT INTO delivery_jobs (id, order_id, kind, local_path, content_sha256, content_size, "
             "state, cleanup_state, next_attempt_at, created_at) "
@@ -466,6 +471,7 @@ def test_symlink_rejected(isolated_env, tmp_path):
 
     job_id = "symlink-job-1"
     with sqlite3.connect(db) as conn:
+        conn.execute("INSERT INTO orders(id,payment_status) VALUES(1,'paid')")
         conn.execute(
             "INSERT INTO delivery_jobs (id, order_id, kind, local_path, content_sha256, content_size, "
             "state, cleanup_state, next_attempt_at, created_at) "
@@ -590,7 +596,9 @@ def test_backup_verifier_rejects_missing_file_when_cleanup_not_completed(isolate
 # -----------------------------------------------------------------------------
 def test_payments_and_emails_work_without_local_photos(isolated_env):
     client, db, uploads = isolated_env
-    order_data = create_test_order(client, ("photo1.jpg", "photo2.jpg"))
+    # Model historical missing sources; new cleanup cannot produce this unpaid
+    # condition. Payment reconciliation must still work for a legacy order.
+    order_data = create_test_order(client, ("photo1.jpg", "photo2.jpg"), paid=False)
     order_id = order_data["order_id"]
     order_token = order_data["order_token"]
 

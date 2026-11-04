@@ -18,8 +18,8 @@ def delivered(tmp_path):
     source = uploads / "1_photo.jpg"
     source.write_bytes(b"original retained photo")
     with sqlite3.connect(db) as conn:
-        conn.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY)")
-        conn.execute("INSERT INTO orders VALUES (1)")
+        conn.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, payment_status TEXT)")
+        conn.execute("INSERT INTO orders VALUES (1,'paid')")
         conn.executescript(DELIVERY_SCHEMA)
         job = enqueue(conn, order_id=1, kind="file", local_path=str(source),
                       remote_path="orders/1/photo.jpg", size=source.stat().st_size,

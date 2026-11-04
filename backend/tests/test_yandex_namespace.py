@@ -256,7 +256,7 @@ def test_interrupted_upload_retains_source_and_native_retry_verifies_before_clea
     source.write_bytes(content)
     target = "app:/Stage/Order/1_photo.jpg"
     with sqlite3.connect(main.DB_PATH) as c:
-        c.execute("INSERT INTO orders(id,name) VALUES(1,'Synthetic')")
+        c.execute("INSERT INTO orders(id,name,payment_status) VALUES(1,'Synthetic','paid')")
         delivery.enqueue(c, order_id=1, kind="file", local_path=str(source), remote_path=target,
             sha256=hashlib.sha256(content).hexdigest(), size=len(content))
     disk = Disk({"app:/", "app:/Stage"})

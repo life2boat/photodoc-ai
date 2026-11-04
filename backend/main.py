@@ -1,5 +1,6 @@
 import os
 import logging
+import math
 import sqlite3
 import hashlib
 import hmac
@@ -31,6 +32,8 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 
 from db_contract import APPLICATION_ID, inspect_database, read_application_id
+from sqlite_busy import BUSY_TIMEOUT, retry_busy
+import paid_email_outbox
 from yandex_paths import (
     is_production_disk_path,
     is_within as _within_yandex_root,
@@ -160,6 +163,7 @@ def init_db():
                 "Existing database does not satisfy the PhotoDoc identity/schema contract; "
                 "run the controlled reconciliation migration"
             )
+        paid_email_outbox.initialize(DB_PATH)
         return
 
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -255,6 +259,7 @@ def ensure_database_state():
 
     if not database_readiness_ok():
         raise RuntimeError("Production database identity/readiness verification failed")
+    paid_email_outbox.initialize(DB_PATH)
 
 
 ensure_database_state()
@@ -401,7 +406,7 @@ def format_robokassa_amount(amount: float | str | int) -> str:
     """Приводит сумму к стандартному формату с двумя знаками после запятой (например: '300.00')."""
     try:
         val = float(str(amount).replace(",", ".").strip())
-        if val <= 0:
+        if not math.isfinite(val) or val <= 0:
             raise ValueError("Amount must be positive")
         return f"{val:.2f}"
     except (ValueError, TypeError) as err:
@@ -490,13 +495,14 @@ def update_order_payment_pending(order_id: int, amount: str) -> str:
         conn.close()
 
 
+@retry_busy
 def mark_order_paid(order_id: int, amount: str) -> bool:
     """
     Atomically transitions order to 'paid' status using a conditional UPDATE.
     Returns True if THIS call performed the transition (rowcount == 1).
     Returns False if order was already paid by a concurrent request (idempotent, no side-effects).
     """
-    conn = sqlite3.connect(DB_PATH, timeout=10.0)
+    conn = sqlite3.connect(DB_PATH, timeout=BUSY_TIMEOUT)
     try:
         cursor = conn.cursor()
         paid_timestamp = datetime.utcnow().isoformat()
@@ -623,13 +629,9 @@ def send_order_email(order_id: int, name: str, phone: str, comment: str, format:
 
 
 def send_paid_order_email(order_id: int):
-    """
-    Sends payment confirmation email exactly once per order.
-    payment_email_sent_at is recorded ONLY after a successful SMTP send,
-    so failed sends leave the timestamp NULL and remain retryable.
-    """
+    """Durable SMTP attempt; ambiguous outcomes require manual reconciliation."""
     order = get_order_by_id(order_id)
-    if not order:
+    if not order or order.get("payment_status") != "paid":
         return False
 
     # Idempotency guard: skip if email was already successfully sent
@@ -666,24 +668,44 @@ def send_paid_order_email(order_id: int):
     )
     msg.attach(MIMEText(body, "plain"))
 
+    paid_email_outbox.initialize(DB_PATH)
+    action, attempt = paid_email_outbox.claim(DB_PATH, order_id)
+    if action != "send":
+        return action == "sent"
+    data_started = False
+    accepted = False
+    acknowledged = False
     try:
-        with smtplib.SMTP_SSL(smtp_server, smtp_port) as server:
+        with smtplib.SMTP_SSL(smtp_server, smtp_port, timeout=30) as server:
             server.login(smtp_user, smtp_password)
-            server.send_message(msg)
-        # Record timestamp ONLY after successful send
-        now_iso = datetime.utcnow().isoformat()
-        conn = sqlite3.connect(DB_PATH)
-        conn.cursor().execute(
-            "UPDATE orders SET payment_email_sent_at = ? WHERE id = ?", (now_iso, order_id)
-        )
-        conn.commit()
-        conn.close()
-        logging.info("Email об оплате заказа #%s успешно отправлен.", order_id)
-        return True
-    except Exception as e:
-        # SMTP failure: payment_email_sent_at stays NULL → retry remains possible
-        logging.error("Ошибка при отправке email об оплате заказа #%s: %s", order_id, e)
+            require_paid_order(order_id)
+            data_started = True
+            refused = server.send_message(msg)
+            if isinstance(refused, dict) and refused:
+                raise RuntimeError("Some email recipients were refused")
+            accepted = True
+            # QUIT failure must not undo a successful DATA acknowledgment.
+            paid_email_outbox.record(DB_PATH, order_id, attempt, "sent")
+            acknowledged = True
+    except Exception as error:
+        if accepted:
+            # record() retries SQL only. Durable 'sending' blocks retransmission
+            # if acknowledgment still cannot be committed after bounded retries.
+            logging.warning("Paid email %s acknowledgment: %s", order_id, type(error).__name__)
+            return acknowledged
+        proven_rejection = isinstance(error, (
+            smtplib.SMTPRecipientsRefused, smtplib.SMTPSenderRefused, smtplib.SMTPDataError,
+        ))
+        state = "uncertain" if data_started and not proven_rejection else "retry"
+        paid_email_outbox.record(DB_PATH, order_id, attempt, state, type(error).__name__)
         return False
+    return True
+
+
+def require_paid_order(order_id: int) -> None:
+    order = get_order_by_id(order_id)
+    if not order or order.get("payment_status") != "paid":
+        raise RuntimeError("Delivery requires a paid order")
 
 
 def _validated_yandex_destination(path: str) -> str:
@@ -790,7 +812,10 @@ def upload_to_yandex_disk(
     expected_sha256: str | None = None,
     expected_size: int | None = None,
     uploads_dir: Path | None = None,
+    order_id: int | None = None,
 ):
+    if order_id is not None:
+        require_paid_order(order_id)
     token = os.getenv("YANDEX_DISK_TOKEN")
     if not token:
         raise RuntimeError("Yandex Disk OAuth token is unavailable")
@@ -884,6 +909,8 @@ def upload_to_yandex_disk(
         def chunks():
             for chunk in iter(lambda: source.read(65536), b""):
                 yield chunk
+        if order_id is not None:
+            require_paid_order(order_id)
         put_response = httpx.put(
             href,
             content=chunks(),
@@ -928,6 +955,7 @@ def upload_info_to_yandex_disk(
             expected_sha256=expected_sha256,
             expected_size=expected_size,
             uploads_dir=uploads_dir,
+            order_id=order_id,
         )
     with tempfile.TemporaryDirectory() as directory:
         source = Path(directory) / "info.txt"
@@ -939,6 +967,7 @@ def upload_info_to_yandex_disk(
             "info.txt",
             expected_sha256=expected_sha256 or hashlib.sha256(info_bytes).hexdigest(),
             expected_size=expected_size or len(info_bytes),
+            order_id=order_id,
         )
 
 
@@ -947,6 +976,7 @@ def deliver_job(job: dict) -> None:
     if not order:
         raise RuntimeError("Order for delivery job is missing")
     if job["kind"] in ("file", "info"):
+        require_paid_order(job["order_id"])
         raw_path = job.get("local_path")
         if not raw_path:
             raise RuntimeError("Delivery job is missing local_path")
@@ -991,6 +1021,7 @@ def deliver_job(job: dict) -> None:
                 expected_sha256=expected_sha256,
                 expected_size=expected_size,
                 uploads_dir=UPLOAD_DIR,
+                order_id=job["order_id"],
             )
     elif job["kind"] == "admin_email":
         ok = send_order_email(order["id"], order["name"], order["phone"], order["comment"],
@@ -1228,7 +1259,11 @@ async def robokassa_result(request: Request, background_tasks: BackgroundTasks):
 
     # 3. Сверка суммы платежа с авторитетной суммой заказа
     expected_amount = get_authoritative_order_amount(order)
-    if format_robokassa_amount(out_sum) != expected_amount:
+    try:
+        received_amount = format_robokassa_amount(out_sum)
+    except (ValueError, OverflowError):
+        raise HTTPException(status_code=400, detail="Invalid OutSum") from None
+    if received_amount != expected_amount:
         logging.error(
             "Result URL: Несовпадение суммы для заказа #%s: получено=%s, ожидалось=%s",
             order_id,

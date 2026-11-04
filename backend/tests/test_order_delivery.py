@@ -106,6 +106,8 @@ def test_failed_partial_delivery_and_restart_retry_keep_sources(isolated):
     client, db, _ = isolated
     result = create(client, names=("a.jpg", "b.jpg")).json()
     order_id = result["order_id"]
+    with sqlite3.connect(db) as conn:
+        conn.execute("UPDATE orders SET payment_status='paid' WHERE id=?", (order_id,))
     initial = jobs(db, order_id)
     file_jobs = [job for job in initial if job["kind"] == "file"]
     first_file = file_jobs[0]["id"]
@@ -135,6 +137,8 @@ def test_failed_partial_delivery_and_restart_retry_keep_sources(isolated):
 def test_expired_lease_recovered_after_crash(isolated):
     client, db, _ = isolated
     order_id = create(client).json()["order_id"]
+    with sqlite3.connect(db) as conn:
+        conn.execute("UPDATE orders SET payment_status='paid' WHERE id=?", (order_id,))
     claimed = claim_due(db)
     assert claimed is not None
     with sqlite3.connect(db) as conn:
@@ -148,6 +152,8 @@ def test_expired_lease_recovered_after_crash(isolated):
 def test_backend_startup_worker_resumes_persisted_jobs(isolated, monkeypatch):
     client, db, _ = isolated
     order_id = create(client).json()["order_id"]
+    with sqlite3.connect(db) as conn:
+        conn.execute("UPDATE orders SET payment_status='paid' WHERE id=?", (order_id,))
     seen = []
     monkeypatch.setenv("DELIVERY_WORKER_ENABLED", "1")
     with patch.object(main, "deliver_job", side_effect=lambda job: seen.append(job["id"])):
