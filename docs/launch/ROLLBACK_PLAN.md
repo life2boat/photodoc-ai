@@ -250,3 +250,34 @@ docker exec <backend> curl -fsS http://127.0.0.1:8000/api/health
 and confirm that no `sending`/`uncertain` row is reachable by the running version,
 and that every `delivered` `file`/`info` job of an unpaid order still has its local
 source present.
+
+### 6.5 The three-minute lease — why a "stuck" job is usually not stuck
+
+`claim_due` acquires the job with a **3-minute lease** (`backend/delivery.py:113`) and leaves
+it in `processing` until the worker finishes or crashes. Consequences that matter during a
+rollback or an incident:
+
+* After a worker is killed, its job is **not** immediately reclaimable. Any replacement
+  worker will correctly decline it until `lease_until` passes. Recovery is therefore
+  lease-bound at up to three minutes — this is the deliberate trade that prevents two
+  workers from acting on the same job.
+* Do **not** interpret `processing` as corruption, and do not reset the job's state. Either
+  wait, or expire the lease explicitly and let a healthy worker pick it up:
+  ```sql
+  -- inspect
+  SELECT id, kind, order_id, state, attempts, lease_until
+  FROM delivery_jobs WHERE state='processing' ORDER BY lease_until;
+  -- supported recovery: let the current lease expire early (no state invention)
+  UPDATE delivery_jobs SET lease_until='2000-01-01T00:00:00+00:00'
+  WHERE id='<job-id>' AND state='processing';
+  ```
+* An expired lease on a job whose order is **unpaid** does not become work: the paid-state
+  predicate in `claim_due` keeps it parked until payment arrives. That is expected.
+* Across a code rollback, expiring leases is safe; **resetting `paid_email_outbox` rows is
+  not** — see §6.3. The two must not be treated as the same kind of repair.
+
+### 6.6 What rollback of PR #24 / PR #25 does *not* affect
+
+Neither PR touches the outbox, the delivery schema or any application code: PR #24 is nginx
+and systemd configuration, PR #25 is documentation. Reverting either one therefore leaves
+§6.1–§6.5 untouched. Only a revert of **PR #26** itself requires the outbox procedure above.

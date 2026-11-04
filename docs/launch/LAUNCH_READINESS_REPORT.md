@@ -99,11 +99,22 @@ Core invariants hold and are test-backed (23/23 payment tests pass):
 - A single conditional writer for `paid`, with the paid-email outbox row enqueued in the **same transaction**; concurrent and duplicate callbacks are idempotent.
 - No merchant credentials anywhere in the repo or the staging runtime (`ROBOKASSA_IS_TEST=1`); staging cannot take real money.
 
-HIGH findings:
+HIGH findings (open at `main@57fede5`):
 
-- **H1 — fulfilment is not payment-gated.** `file`/`info` delivery jobs are enqueued at order creation while the order is `unpaid`, and the worker defaults to enabled. An abandoned unpaid order's photos are uploaded to Yandex.Disk and the local originals deleted. **Owner decision required** — this may be intentional (files reaching the print operator early), but it should be a decision, not an accident.
 - **H2 — MD5 only.** The launch register claims MD5 *or* SHA-256. If the cabinet is switched to SHA-256 every callback returns 400 and no order is ever confirmed — silently.
 - **H3 — dead return URLs.** The documented SuccessURL/FailURL (`/order-status?payment=…`) do not exist: there is no frontend router and nothing calls the SuccessURL handler.
+
+**H1 — payment-gated fulfilment — is now fixed in `main` by PR #26.** It was reported here
+as an open HIGH defect and is retained in the audit trail (`SECURITY_AUDIT.md` §1.1). The
+fix gates `file`/`info`/`paid_email` at claim time (`delivery.py:126-129`), in the
+dispatcher (`main.py:1054`), immediately before the file PUT (`main.py:893, 988`) and again
+inside the cleanup claim and unlink transaction (`delivery.py:332, 593`, candidate filter at
+`:686-687`). No owner decision is pending: unpaid orders now retain their sources, receive
+zero uploads and are never marked delivered.
+
+**M13 and M14 are also fixed** (durable `paid_email_outbox` with attempt fencing; bounded
+`BUSY`/`LOCKED` retry in `sqlite_busy.py`), as is **L12** (malformed `OutSum` → HTTP 400).
+Evidence per finding: `SECURITY_AUDIT.md` §1.1.
 
 ---
 
@@ -117,7 +128,7 @@ HIGH findings:
 - Header injection from user-controlled fields is **not** possible (verified with CRLF payloads in `name`, `format`, `comment`); the client is not an open relay.
 - `paid_email` is gated on the paid transition. But `admin_email` **is** sent for an unpaid order at creation.
 
-Gaps: no customer-facing email at all (both notifications go to `EMAIL_TO`); `Message-ID` hardcodes the unregistered `@photodoc-ai.ru`; no socket timeout; TLS certificate verification disabled (a self-signed certificate was accepted); attempt 10 is terminal with no requeue (≈43 min to permanent silent loss); customer email is unvalidated and forwarded to the PSP.
+Gaps: no customer-facing email at all (both notifications go to `EMAIL_TO`); `Message-ID` hardcodes the unregistered `@photodoc-ai.ru` (still open — L6); the **admin-notification** path still has no socket timeout (the paid-email path gained `timeout=30` in PR #26); TLS certificate verification disabled on both paths (a self-signed certificate was accepted); attempt 10 is terminal with no requeue (≈43 min to permanent silent loss); customer email is unvalidated and forwarded to the PSP.
 
 ---
 
@@ -144,16 +155,16 @@ Additional scenarios:
 | Mobile layout | **FAIL (coverage gap)** — `frontend/playwright.config.ts` has a single `Desktop Chrome` project; no mobile viewport is tested |
 | Invalid uploads | **PASS** (8 tests) |
 | Interrupted connections | **PASS** — `.incoming-*` staging + single `BEGIN IMMEDIATE`; crash-before-commit cannot produce an order without jobs |
-| Repeated submissions | **PASS** — `test_repeated_order_submission_creates_distinct_orders` |
+| Repeated submissions | **PASS** — scratch suite `test_repeated_order_submission_creates_distinct_orders` (not a repo test) |
 | Payment callback retries | **PASS** — duplicate signed callback: one state change, one email, one upload |
-| Server restarts | **PASS** — `test_state_persists_across_process_restart`: fresh process on the same DB, paid state and all four job states intact, no re-upload |
-| Delivery retries | **PASS** — live `timeout_before`, `ack_timeout`, `crash_commit`, `crash_cleanup`, plus `test_delivery_retry_after_transport_failure_uploads_once` |
-| Concurrent orders | **FAIL (product defect M13)** — cross-contamination held (one upload per order, distinct paths, matching digests, one paid email per order) but finalisation failed under lock contention and the paid email will be re-sent |
+| Server restarts | **PASS** — repo `test_payment_delivery_concurrency_e2e.py::test_mixed_paid_unpaid_four_workers_lock_contention_and_restart`; real-process crash tests `test_payment_delivery_reliability.py::test_actual_process_crash_after_smtp_acceptance_requires_reconciliation` (child exits 73) and `test_delivery_lifecycle_safety.py` subprocess cases; plus a scratch-suite fresh-process check |
+| Delivery retries | **PASS** — live `timeout_before`, `ack_timeout`, `crash_commit`, `crash_cleanup`, plus scratch `test_delivery_retry_after_transport_failure_uploads_once` |
+| Concurrent orders | **PASS (fixed by PR #26)** — `M13` was the defect: cross-contamination held, but finalisation under lock contention could re-send the paid email. PR #26's durable outbox + attempt fencing (`paid_email_outbox.py:63, 89`) and bounded busy retry remove it. Verified by repo `test_payment_delivery_concurrency_e2e.py::test_mixed_paid_unpaid_four_workers_lock_contention_and_restart` and independently with **real OS processes** (2/4/6/8 workers, 20 scenarios): one upload and one paid email per order, no lost jobs, no stuck `processing` rows |
 
-Two structural notes rather than test results:
+Two structural notes:
 
-- **H1** means an unpaid order can reach delivery. Any "no unpaid order reaches delivery" guarantee is **not** met by the current design.
-- **H3** means the customer's browser is redirected to a route that does not exist after paying.
+- **H1 is resolved.** Unpaid orders no longer reach delivery: zero uploads and zero source deletions, verified at claim, dispatch, pre-PUT and cleanup. The only remaining unpaid-path behaviour is the intentional **admin new-order notification**.
+- **H3 remains open.** The customer's browser is still redirected to a route that does not exist after paying. This is a launch blocker for real payments, not a staging blocker.
 
 Captured operator notification (real message from the local implicit-TLS capture server, decoded):
 
@@ -170,12 +181,13 @@ Body: plain text, base64, contains the order fields and a Yandex.Disk deep link
 
 Verified across the nine journey steps plus seven robustness cases: order creation with a real multipart upload and server-computed `20.00`; upload limits (413 / 400 / 422 / 400 / 400, zero orphans); price locking rejecting `0.01 / 1.00 / 300.00 / 19.99`; the exact invoice signature `md5(login:OutSum:InvId:password1)`; a correctly signed callback marking the order paid; exactly one photo and one `info.txt` PUT with matching size and SHA-256; remote metadata matching the pre-deletion digest (with a negative control proving the verifier is not a no-op); exactly one captured paid email with sane headers; duplicate-callback idempotence; invalid-signature rejection; repeated submission creating distinct orders; **process-restart persistence**; delivery retry after a transport failure; and header-injection prevention.
 
-The two failures:
+The two failures — **both now fixed in `main` by PR #26**, kept as the historical record of
+what the suite proved at `8bfecde`:
 
-| Failure | What it establishes |
-|---|---|
-| `test_unpaid_order_must_not_be_fulfilled_before_payment` | **H1 is now empirically proven, not merely read from code.** For a never-paid order, after a single drain: the photo **and** `info.txt` were uploaded to Yandex.Disk and the local source was deleted (`cleanup_phase='deleted'`), while the order still read `payment_status='unpaid'`, `paid_at=NULL`. `POST /api/order` enqueues `file`/`info`/`admin_email` (`main.py:1056, 1067, 1070`) and no part of the delivery path consults `payment_status`. |
-| `test_concurrent_orders_deliver_without_cross_contamination` | **New finding M13.** With 4 concurrent workers the paid email was *sent*, then its `payment_email_sent_at` UPDATE (`main.py:675-680`; default 5 s SQLite timeout, no busy retry) hit `database is locked`, so the job was marked `failed` and will retry and **re-send** → duplicate paid notifications. Cross-contamination itself held. Environment-amplified (this host measures ~88 ms per write transaction), so it is a contention risk rather than a certainty, but the at-least-once window is real. |
+| Failure (at `8bfecde`) | What it established | Status at `main@57fede5` |
+|---|---|---|
+| `test_unpaid_order_must_not_be_fulfilled_before_payment` | **H1 proven empirically, not merely read from code.** For a never-paid order, after a single drain: the photo **and** `info.txt` were uploaded to Yandex.Disk and the local source was deleted (`cleanup_phase='deleted'`), while the order still read `payment_status='unpaid'`, `paid_at=NULL`. `POST /api/order` enqueued `file`/`info`/`admin_email` and no part of the delivery path consulted `payment_status`. | **RESOLVED.** `delivery.py:126-129, 332, 593, 686-687`; `main.py:780, 893, 988, 1054`. The same scenario now leaves the source in place with `attempts=0`. Repo evidence: `test_unpaid_never_claims_uploads_or_deletes_even_legacy_delivered`. |
+| `test_concurrent_orders_deliver_without_cross_contamination` | **M13.** With 4 concurrent workers the paid email was *sent*, then its `payment_email_sent_at` UPDATE (`main.py:675-680`; default 5 s SQLite timeout, no busy retry) hit `database is locked`, so the job was marked `failed` and would retry and **re-send**. Cross-contamination itself held. | **RESOLVED.** Durable `paid_email_outbox` (`paid_email_outbox.py:15, 63, 89`) records the attempt before SMTP and excludes `sending`/`uncertain` from claims; `sqlite_busy.py` bounds `BUSY`/`LOCKED` retries around SQL only. Repo evidence: `test_mixed_paid_unpaid_four_workers_lock_contention_and_restart`. |
 
 ---
 
@@ -249,9 +261,14 @@ Everything is prepared and validated as far as authorization allows. No public a
 | Severity | Count | IDs |
 |---|---|---|
 | CRITICAL | **0** | — |
-| HIGH | **5** | H1 (unpaid fulfilment), H2 (MD5-only), H3 (dead return URLs), S6-01 (unsafe cutover backup), S6-02 (no scheduled backup / undefined RPO) |
-| MEDIUM | 15 | M1–M15 — see `SECURITY_AUDIT.md` (includes M13 duplicate paid notification under write contention and M14 unmanaged SQLite lock contention) |
-| LOW | 13 | L1–L13 — see `SECURITY_AUDIT.md` |
+| HIGH | **4** | H2 (MD5-only), H3 (dead return URLs), S6-01 (unsafe cutover backup), S6-02 (no scheduled backup / undefined RPO) |
+| MEDIUM | 13 | M1–M12, M15 — see `SECURITY_AUDIT.md` |
+| LOW | 12 | L1–L11, L13 — see `SECURITY_AUDIT.md` |
+
+Closed since the original audit by **PR #26** (details and evidence in `SECURITY_AUDIT.md` §1.1):
+**H1** (HIGH, payment-gated fulfilment), **M13** (MEDIUM, duplicate paid notification),
+**M14** (MEDIUM, unmanaged SQLite lock contention), **L12** (LOW, malformed `OutSum` → 500).
+Counts above exclude them deliberately.
 
 ---
 
@@ -264,10 +281,13 @@ Everything is prepared and validated as far as authorization allows. No public a
 | PR #24 not merged | owner approval | Edge config still targets the unregistered domain in `main` |
 | No Robokassa merchant credentials | external (owner) | Real payments cannot be validated |
 | No SMTP credentials; no DKIM/DMARC on the owned domain | external (owner) | No email can be sent legitimately |
-| H1/H2/H3 are product decisions | owner approval | Payment/fulfilment correctness and a working post-payment page |
+| H2 / H3 are product decisions | owner approval | Payment signature algorithm pinning, and a working post-payment page |
 | No scheduled off-host backup | owner approval | RPO undefined; not launch-blocking for a soft launch but should precede real traffic |
 | Mobile layout not automatically tested | engineering | Responsive regressions would go undetected |
 | Staging Yandex token belongs to a real personal account | owner confirmation | Provenance should be confirmed; containment is enforced by app-folder scope |
+
+**No longer blockers:** payment-gated fulfilment (H1) and paid-email reliability (M13/M14) are
+implemented in `main` by PR #26. Nothing about H1 needs an owner decision any more.
 
 ---
 
@@ -275,13 +295,19 @@ Everything is prepared and validated as far as authorization allows. No public a
 
 | PR | Title | State |
 |---|---|---|
-| #24 | `infra(tls): align edge config to the owned domain and close provisioning gaps` | **OPEN — not merged, not deployed** |
-| #25 | `docs(launch): launch-readiness deliverables for stages 1-7` | **OPEN** (this document set) |
+| #24 | `infra(tls): align edge config to the owned domain and close provisioning gaps` | **OPEN — merge first** (no dependency on #25) |
+| #25 | `docs(launch): launch-readiness deliverables for stages 1-7` | **OPEN** (this document set) — merge after #24 |
 
 - https://github.com/life2boat/photodoc-ai/pull/24
 - https://github.com/life2boat/photodoc-ai/pull/25
 
-Neither PR was merged; `main` is still `8bfecdee756e11972cbb68ec3f7c0e009a1cba60` (verified after the work). No production source code was changed — #24 is edge/infra configuration and #25 is documentation only. All verification artefacts (harnesses, evidence, transcripts) live under `scratch/` in the verification worktree and are intentionally **not** committed.
+PR #26 is **merged** into `main` (`57fede5a84fc07eb24e2b6bb6defd294d6ead923`) and is the change
+that closed H1, M13, M14 and L12. PR #24 is edge/infra configuration and changes no
+production source code; PR #25 is documentation only. **Merge order matters**: the
+activation plan below calls `scripts/provision_tls_webroot.sh` and installs the
+`photodoc-certbot-renew` units, and those files exist only after PR #24 merges. All
+verification artefacts (harnesses, evidence, transcripts) live under `scratch/` in the
+verification worktrees and are intentionally **not** committed.
 
 ---
 
@@ -290,20 +316,22 @@ Neither PR was merged; `main` is still `8bfecdee756e11972cbb68ec3f7c0e009a1cba60
 ```
 MODEL_ID=deepseek-flash (harness-reported; no model selection available in-session)
 HARNESS_VERSION=DeepSeek Harness 0.2.0-rc.2
+BASELINE=main@57fede5a84fc07eb24e2b6bb6defd294d6ead923 (PR #26 merged)
 PR23_STAGING_ACCEPTANCE=PASS
 YANDEX_DISK_LIVE_TEST=PASS (5/5 cases; synthetic only; dedicated namespace; guard removed)
 ROBOKASSA_TESTS=PASS (23/23; no CRITICAL; real payments NOT activated)
 EMAIL_TESTS=PASS (local implicit-TLS capture; 0 real customers contacted)
 HTTPS_READINESS=READY_FOR_APPROVAL (config fixed + validated in PR #24; BLOCKED on DNS A records)
-END_TO_END_TESTS=PARTIAL (integrated suite 16/18 passed; the 2 failures are product defects: H1 confirmed empirically, and M13 duplicate paid email under write contention; mobile layout still untested)
-SECURITY_AUDIT=PASS_NO_CRITICAL (5 HIGH, 15 MEDIUM, 13 LOW)
-BACKUP_RESTORE=PASS (restore rehearsal verified: logically identical + boots)
+END_TO_END_TESTS=PASS_WITH_GAPS (H1 and M13 resolved in main by PR #26; remaining gaps: mobile layout untested, H3 post-payment route missing)
+SECURITY_AUDIT=PASS_NO_CRITICAL (4 HIGH, 13 MEDIUM, 12 LOW open; H1/M13/M14/L12 resolved by PR #26)
+BACKUP_RESTORE=PASS (restore rehearsal verified for the pre-PR #26 schema; PR #26's paid_email_outbox travels via whole-database copy but is not itself covered by that rehearsal)
 PRODUCTION_READINESS=READY_FOR_OWNER_APPROVAL
 CRITICAL_FINDINGS=0
-HIGH_FINDINGS=5 (H1 unpaid fulfilment; H2 MD5-only; H3 dead SuccessURL/FailURL; S6-01 unsafe cutover backup; S6-02 no scheduled backup)
+HIGH_FINDINGS=4 (H2 MD5-only; H3 dead SuccessURL/FailURL; S6-01 unsafe cutover backup; S6-02 no scheduled backup)
+RESOLVED_BY_PR26=H1 (payment-gated fulfilment), M13 (duplicate paid email under contention), M14 (unmanaged SQLite lock contention), L12 (malformed OutSum -> 500)
 BLOCKERS=no DNS A record for photo1storage.ru or www; no Robokassa credentials; no SMTP credentials/DKIM/DMARC; DERIVED: PR #24 unmerged
-PULL_REQUESTS=#24 (infra/tls, open, not merged), #25 (docs/launch, open)
-OWNER_APPROVAL_REQUIRED=DNS records; certificate issuance; merge PR #24; Robokassa credentials + ROBOKASSA_IS_TEST=0; SMTP credentials + DNS mail records; delivery worker enablement; H1/H2/H3 decisions; scheduled off-host backup; accept residual synthetic Yandex namespaces
+PULL_REQUESTS=#24 (infra/tls, open, merge first), #25 (docs/launch, open, merge after #24)
+OWNER_APPROVAL_REQUIRED=DNS records; certificate issuance; merge PR #24 then #25; Robokassa credentials + ROBOKASSA_IS_TEST=0; SMTP credentials + DNS mail records; delivery worker enablement; H2/H3 decisions; scheduled off-host backup; accept residual synthetic Yandex namespaces
 VERDICT=READY_FOR_OWNER_APPROVAL
 ```
 

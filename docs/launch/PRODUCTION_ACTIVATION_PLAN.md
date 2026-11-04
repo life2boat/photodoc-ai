@@ -24,11 +24,12 @@ Web VPS: **`95.181.154.251`** (`photodoc-vps`). The historic VPN host `79.137.19
 | P10 | `ROBOKASSA_IS_TEST=0` decision | ❌ staging is `1` | **Decide** |
 | P11 | SMTP credentials + sending domain verified | ❌ none | **Provide** |
 | P12 | SPF / DKIM / DMARC on the owned domain | ⚠️ only `v=spf1 include:_spf.spaceweb.ru ~all`; no DKIM, no DMARC | **Configure** |
-| P13 | HIGH finding H1 (unpaid fulfilment) resolved or accepted | ❌ open | **Decide** |
+| P13 | HIGH finding H1 (unpaid fulfilment) **resolved** | ✅ **fixed in `main` by PR #26** | — |
 | P14 | HIGH finding H3 (`/order-status` route) resolved | ❌ open | **Approve fix** |
 | P15 | Scheduled off-host backup | ❌ none | **Approve + provision** |
 | P16 | Production `docker-compose` hardened like staging | ❌ no hardening | **Approve fix** |
-| P17 | Owner authorization to activate | ❌ | **Grant** |
+| P17 | `nginx` + `certbot` installed on the target host | ❌ neither installed; `/var/www/certbot` absent | **Install** (read-only probe, 2026-11-04) |
+| P18 | Owner authorization to activate | ❌ | **Grant** |
 
 **Do not proceed past a red row.** P6/P7 are hard blockers: without an A record, no certificate can be issued and no callback can reach the site.
 
@@ -36,8 +37,14 @@ Web VPS: **`95.181.154.251`** (`photodoc-vps`). The historic VPN host `79.137.19
 
 ## 1. Pre-activation: release candidate
 
-1. Merge PR #24 (domain alignment) — or apply its changes by hand.
-2. Decide H1 (`docs/launch/SECURITY_AUDIT.md`) and H3. H3 is required for a working customer payment flow: without it SuccessURL/FailURL land on a route that does not exist.
+1. Merge **PR #24** (domain alignment) — it is independent and must land before this plan is
+   executable, because the steps in §4 call `scripts/provision_tls_webroot.sh` and install
+   `infra/systemd/photodoc-certbot-renew.{service,timer}`. Merge **PR #25** (this document
+   set) after it.
+2. Decide **H3** only. H1 no longer needs a decision: payment-gated fulfilment is implemented
+   in `main` by PR #26, so unpaid orders keep their sources and are never delivered. H3 is
+   still a blocker for a working customer payment flow — without it SuccessURL/FailURL land
+   on a route that does not exist.
 3. Tag the release candidate and record the digests:
    ```bash
    git tag -a v1.0.0-rc1 -m "PhotoDoc AI release candidate 1" <commit>
@@ -197,7 +204,12 @@ Expected config validation from PR #24 (already executed in an isolated containe
 
 2. **Decide H2** before touching the cabinet: either pin MD5 and record that decision, or implement algorithm selection first. If the cabinet is set to SHA-256 the code rejects every callback with 400 and no order is ever confirmed — silently.
 3. **Decide H3**: implement `/order-status` (frontend route that reads `?payment=` and calls the SuccessURL handler) or point SuccessURL/FailURL at the backend. Without this, paying customers see a dead page.
-4. **Confirm H1 decision**: whether unpaid orders may upload to Yandex.Disk. If not, gate the `file`/`info` jobs on `payment_status='paid'`.
+4. **Payment-gated delivery is already active** (PR #26, merged): `file`/`info`/`paid_email`
+   are only claimed when `orders.payment_status='paid'`, rechecked before the file PUT and
+   again in the cleanup transaction. Nothing to decide. Verify it rather than configure it:
+   place a synthetic **unpaid** order and confirm its source file is still on disk with
+   `delivery_jobs.state='pending'` and `attempts=0`. Note the intended exception: the
+   **admin new-order notification** is still sent for unpaid orders.
 5. **Set credentials** in `.env` and `ROBOKASSA_IS_TEST=0`; restart the worker; confirm startup does not raise.
 6. **Configure 54-ФЗ** receipt data in the cabinet (no `Receipt` block is sent by the code).
 7. **Verify with a real minimum-value payment**, then refund it (see §10).
@@ -213,14 +225,14 @@ Signature verification that must hold (already proven by 23 automated tests):
 
 ## 6. SMTP activation checklist
 
-1. Provision the mailbox on `photo1storage.ru`. Existing docs referencing `notifications@photodoc-ai.ru` are wrong and must be corrected — that domain is unregistered, and `main.py:600,659` hardcodes it in `Message-ID`.
+1. Provision the mailbox on `photo1storage.ru`. Existing docs referencing `notifications@photodoc-ai.ru` are wrong and must be corrected — that domain is unregistered, and `main.py:606,731` hardcodes it in `Message-ID`.
 2. Publish SPF, DKIM and DMARC (§3).
 3. Set `SMTP_SERVER=smtp.yandex.ru`, `SMTP_PORT=465`, `SMTP_USER`, `SMTP_PASSWORD` (app password), `EMAIL_TO`.
 4. **Decide whether customers receive mail.** As implemented, **both** notifications go to `EMAIL_TO`; the customer receives nothing. `docs/LAUNCH_PROCUREMENT_REGISTER.md` describes customer transactional mail, so this is a gap needing a decision.
 5. Send one test order to a controlled mailbox and confirm delivery, then check the received headers for `spf=pass`, `dkim=pass`, `dmarc=pass`.
 6. Validate the customer email field (currently unvalidated and forwarded to the PSP — L5).
 
-Known limitations to accept consciously: no socket timeout (a silent SMTP peer blocks the single worker thread), no TLS certificate verification, attempt 10 is terminal with no requeue.
+Known limitations to accept consciously: **the admin-notification path has no socket timeout** (a silent SMTP peer blocks the single worker thread; the paid-email path gained `timeout=30` in PR #26), no TLS certificate verification on either path, and attempt 10 is terminal with no automatic requeue for ordinary retries — while ambiguous outcomes are held in `paid_email_outbox` as `sending`/`uncertain` and require reconciliation.
 
 ---
 
@@ -234,8 +246,21 @@ Known limitations to accept consciously: no socket timeout (a silent SMTP peer b
    SELECT remote_path, state, attempts FROM delivery_jobs WHERE state IN ('pending','failed');
    ```
    Rows outside the new root will never succeed — resolve them before enabling the worker.
-5. Enable and watch the first deliveries (§10).
-6. Keep `docker logs -f` on the backend for the first hour.
+5. **Know the lease semantics before you see them in production.** `claim_due` takes a
+   **3-minute** lease (`delivery.py:113`) and marks the job `processing`. A killed or
+   crashed worker therefore leaves its job unreclaimable until that lease expires — recovery
+   is correct but deliberately **not instant**. Do not "fix" an apparent stuck job by resetting
+   its state: wait for the lease, or expire it explicitly
+   (`UPDATE delivery_jobs SET lease_until='2000-01-01T00:00:00+00:00' WHERE id=…`), and never
+   reset `paid_email_outbox` rows without reconciling them (§8 of this plan and
+   `ROLLBACK_PLAN.md` §6).
+6. **Inspect the email outbox** before enabling:
+   ```sql
+   SELECT state, COUNT(*) FROM paid_email_outbox GROUP BY state;
+   ```
+   `sending`/`uncertain` rows are held by design and need reconciliation, not a reset.
+7. Enable and watch the first deliveries (§10).
+8. Keep `docker logs -f` on the backend for the first hour.
 
 ---
 
@@ -248,6 +273,8 @@ Known limitations to accept consciously: no socket timeout (a silent SMTP peer b
 | External uptime check on `https://photo1storage.ru/api/health` | Detects a dead backend before customers do |
 | Alert on ResultURL 4xx rate | The only way to catch an H2-style signature misconfiguration (currently silent) |
 | Alert on `/api/order` error rate and queue depth | Detects intake spam and stuck delivery |
+| Alert on `delivery_jobs.state='processing'` older than 5 minutes | A processing row past its 3-minute lease usually means a dead worker or an expired lease; this is the signal that replaces guesswork |
+| Alert on `paid_email_outbox.state IN ('sending','uncertain')` count | These rows are held deliberately and will never resend; someone must reconcile them |
 | Alert on disk usage > 80% | No disk guard exists in the app |
 | Alert on backup age > 24 h | No scheduled backup exists yet (S6-02) |
 | Certificate expiry check (< 21 days) | Renewal timer is new and unproven in production |
@@ -259,8 +286,10 @@ Known limitations to accept consciously: no socket timeout (a silent SMTP peer b
 |---|---|
 | Site unreachable | `curl -fsS https://photo1storage.ru/api/health` → if nginx answers 502, check containers; if no TCP, check nginx + ufw |
 | Payments confirmed but orders unpaid | Check ResultURL reachability, then the cabinet's signature algorithm (H2) and `ROBOKASSA_PASSWORD2` |
-| Orders paid but no delivery | Check `delivery_jobs.last_error`; verify the token and root; worker flag |
+| Orders paid but no delivery | Check `delivery_jobs.last_error`; verify the token and root; worker flag. If the row is `processing`, check whether its 3-minute lease has expired before assuming a fault |
 | Delivery duplicating | Stop the worker immediately (`DELIVERY_WORKER_ENABLED=0`), inspect `delivery_jobs` leases |
+| Paid email not sent, outbox `retry` | Ordinary bounded retry — check SMTP reachability and credentials; the job retries with backoff |
+| Paid email not sent, outbox `sending`/`uncertain` | **Do not reset.** This is the deliberate at-most-once hold. Stop the worker, check provider delivery logs by order id and `Message-ID`, then follow `ROLLBACK_PLAN.md` §6.3 |
 | Disk full | Stop intake, prune logs; the app has no guard and will 500 |
 | Suspected secret leak | Rotate the Yandex token / Robokassa passwords / SMTP app password; the token lives only in `/etc/photodoc/...` or `.env`, never in Git |
 

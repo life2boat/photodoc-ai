@@ -130,12 +130,16 @@ Honest record: five runs were needed. Earlier attempts failed on defects in **my
 | S2-5c | Replay | **PASS (bounded)** / **NOT_VERIFIED** as a distinct scenario | No freshness control exists; impact bounded by idempotency + `InvId` inside the digest. No stale/cross-order replay test exists. |
 | S2-5d | Concurrent requests | **PASS** | `test_payment_create_racing_result_url_cannot_revert_paid`, `test_concurrent_duplicate_callback_one_owner_only` (note: the latter does not actually assert a single transition owner) |
 | S2-6 | Unpaid order cannot enter *paid* state | **PASS** | Single writer `mark_order_paid` `main.py:503-514`, conditional `WHERE payment_status IN ('unpaid','pending')`, gated on Password2 + stored-amount match |
-| S2-6b | Unpaid order cannot be *fulfilled* | **FAIL (finding H1)** | `file`/`info` delivery jobs are enqueued at order creation (`main.py:1056-1069`) while `payment_status='unpaid'`, and the worker defaults to enabled (`main.py:121`). An abandoned unpaid order's photos are still uploaded and the local originals deleted. **Confirmed empirically** by the Stage 5 integrated suite (a never-paid order's photo and `info.txt` were delivered and the local source unlinked, order still `unpaid`) and independently by the Stage 3 audit. |
-| S2-7 | Payment state survives restart | **PASS (offline)** / NOT_VERIFIED (process restart on staging) | Paid UPDATE + outbox INSERT commit in one transaction (`main.py:513`) into SQLite at `DB_PATH`. No test restarts the app; the Stage 5 restart case exercises it. |
+| S2-6b | Unpaid order cannot be *fulfilled* | **PASS at `main@57fede5` (was FAIL: H1, fixed by PR #26)** | Paid state is now enforced at claim (`delivery.py:126-129`), dispatch (`main.py:1054`), immediately before the file PUT (`main.py:893`, `:988`) and in cleanup (`delivery.py:332`, `:593`), with a paid-filtered cleanup candidate query (`:686-687`). Repository evidence: `test_unpaid_never_claims_uploads_or_deletes_even_legacy_delivered` (parametrised over `unpaid/pending/failed/cancelled/None` × `file/info`), `test_claim_execution_and_cleanup_recheck_payment`, `test_unpaid_api_order_keeps_both_sources_after_restarts_and_failed_payment`. Independently re-verified with real OS processes (2/4/6/8 workers): zero uploads, zero deletions, `attempts` untouched for unpaid jobs. Historical defect detail: `SECURITY_AUDIT.md` §1.1. |
+| S2-7 | Payment state and delivery state survive a process restart | **PASS** | Paid UPDATE + outbox INSERT commit in one transaction into SQLite at `DB_PATH`. Repository evidence: `test_payment_delivery_concurrency_e2e.py::test_mixed_paid_unpaid_four_workers_lock_contention_and_restart` (repeat drain after restart), and real child-process crash tests `test_payment_delivery_reliability.py::test_actual_process_crash_after_smtp_acceptance_requires_reconciliation` (child exits 73) and `test_delivery_lifecycle_safety.py`. Note that a crashed worker's job is lease-bound for up to 3 minutes before it is reclaimable — see `ROLLBACK_PLAN.md` §6.5. |
 | S2-8 | Test-only payment environment configured | **PASS** | Staging runs `ROBOKASSA_IS_TEST=1`; no merchant credentials present anywhere in the container env |
 | S2-9 | Production configuration documented | **PASS** | `PRODUCTION_ACTIVATION_PLAN.md` §5 |
 
-Automated result: **23/23 payment tests pass.** No CRITICAL finding. HIGH: H1 (unpaid fulfilment), H2 (MD5-only while docs claim SHA256 support), H3 (dead SuccessURL/FailURL routes).
+Automated result: **23/23 payment tests pass.** No CRITICAL finding. Open HIGH at
+`main@57fede5`: H2 (MD5-only while docs claim SHA256 support), H3 (dead SuccessURL/FailURL
+routes). **H1 (unpaid fulfilment), M13 (duplicate paid email under contention), M14
+(unmanaged SQLite lock contention) and L12 (malformed `OutSum` → 500) are fixed in `main` by
+PR #26** — see `SECURITY_AUDIT.md` §1.1 for the mechanism and the tests that enforce each one.
 
 ---
 
@@ -154,7 +158,7 @@ Automated result: **23/23 payment tests pass.** No CRITICAL finding. HIGH: H1 (u
 | S3-6 | Email failure cannot destroy orders or files | **PASS** | Sender swallows the error → `deliver_job` raises → outbox marks `failed` with backoff. Order row, uploads and other jobs verified untouched |
 | S3-7 | Production SMTP configuration prepared | **PASS** | `PRODUCTION_ACTIVATION_PLAN.md` §6 |
 
-Gaps: no customer-facing email at all (both notifications go to `EMAIL_TO`); `Message-ID` hardcodes `@photodoc-ai.ru` (`main.py:600,659`); no socket timeout (a silent peer blocks the single worker thread indefinitely — measured still blocked after 8 s); TLS certificate verification disabled (`CERT_NONE`, `check_hostname=False` — a self-signed cert was accepted); attempt 10 is terminal with no requeue (≈43 min to permanent silent loss).
+Gaps: no customer-facing email at all (both notifications go to `EMAIL_TO`); `Message-ID` hardcodes `@photodoc-ai.ru` (`main.py:606,731` — still open, L6); the **admin-notification** path still has no socket timeout (the paid-email path gained `timeout=30` in PR #26; a silent peer can still block the single worker thread — measured still blocked after 8 s at `8bfecde`); TLS certificate verification disabled on both paths (`CERT_NONE`, `check_hostname=False` — a self-signed cert was accepted); attempt 10 is terminal with no requeue (≈43 min to permanent silent loss).
 
 ---
 
@@ -191,16 +195,16 @@ python -m pytest ..\scratch\s5\test_journey.py -v -p no:cacheprovider
 Pop-Location
 ```
 
-**Result: 16 passed, 2 failed in 144.62s.** The two failures are deliberate assertions about required behaviour that the product does not meet — i.e. **product defects, not harness defects**. Log: `scratch/s5/_run_final.txt`; artifacts: `scratch/s5/_run/{orders.db,uploads,mail/msg-*.eml}`.
+**Result: 16 passed, 2 failed in 144.62s.** The two failures were deliberate assertions about required behaviour that the product did not meet at `8bfecde` — i.e. **product defects, not harness defects**. Log: `scratch/s5/_run_final.txt`; artifacts: `scratch/s5/_run/{orders.db,uploads,mail/msg-*.eml}`. **This suite is a scratch artefact, not a repository test module**; the repo tests that now enforce the same behaviour are named in §7.1 and in `SECURITY_AUDIT.md` §1.1.
 
-Passing (16): `test_step1_order_creation_with_real_upload`, `test_step2_upload_restrictions`, `test_step3_price_locking_rejects_tampered_client_amount`, `test_step4_payment_request_url_and_signature`, `test_step5_result_callback_marks_order_paid`, `test_step6_delivery_uploads_photo_exactly_once`, `test_step7_remote_metadata_matches_predeletion_digest`, `test_step8_paid_email_captured_with_sane_headers`, `test_step9_final_order_state`, `test_duplicate_result_callback_is_idempotent`, `test_invalid_signature_callback_rejected_and_order_stays_unpaid`, `test_unpaid_order_fulfilment_observed_behaviour`, `test_repeated_order_submission_creates_distinct_orders`, `test_state_persists_across_process_restart`, `test_delivery_retry_after_transport_failure_uploads_once`, `test_email_header_injection_is_prevented`.
+Passing (16, scratch suite): `test_step1_order_creation_with_real_upload`, `test_step2_upload_restrictions`, `test_step3_price_locking_rejects_tampered_client_amount`, `test_step4_payment_request_url_and_signature`, `test_step5_result_callback_marks_order_paid`, `test_step6_delivery_uploads_photo_exactly_once`, `test_step7_remote_metadata_matches_predeletion_digest`, `test_step8_paid_email_captured_with_sane_headers`, `test_step9_final_order_state`, `test_duplicate_result_callback_is_idempotent`, `test_invalid_signature_callback_rejected_and_order_stays_unpaid`, `test_unpaid_order_fulfilment_observed_behaviour`, `test_repeated_order_submission_creates_distinct_orders`, `test_state_persists_across_process_restart`, `test_delivery_retry_after_transport_failure_uploads_once`, `test_email_header_injection_is_prevented`.
 
-Failing (2), both real product defects:
+Failing (2) at `8bfecde`, **both resolved in `main` by PR #26**:
 
-| Test | Failure | Finding |
-|---|---|---|
-| `test_unpaid_order_must_not_be_fulfilled_before_payment` | `AssertionError: DEFECT: an unpaid order was delivered to Yandex.Disk before payment (order #5, uploads=['…/5_….jpg', '…/info.txt'])` | **H1 confirmed empirically.** `POST /api/order` enqueues `file`, `info` and `admin_email` (`main.py:1056, 1067, 1070`) and neither `delivery.process_due` nor `main.deliver_job` (`main.py:945-1003`) nor `worker_loop` (`delivery.py:775-793`) consults `payment_status`. Observed rows for a never-paid order after one drain: `orders {payment_status:'unpaid', paid_at:None}`, `delivery_jobs` `file delivered/attempts=1/cleanup completed`, `info delivered`, `admin_email delivered` — the photo **and** `info.txt` were uploaded and the local source deleted (`cleanup_phase='deleted'`). |
-| `test_concurrent_orders_deliver_without_cross_contamination` | `assert {'delivered','failed'} == {'delivered'}` | **New finding (M13).** With 4 concurrent `process_due` workers the paid email was *sent*, then its `payment_email_sent_at` UPDATE (`main.py:675-680`, `sqlite3.connect` default 5 s timeout, no busy retry) raised `database is locked` → `send_paid_order_email` returned False → `deliver_job` raised → the `paid_email` job was marked `failed` → it will retry and **re-send**, producing duplicate paid notifications. Cross-contamination assertions (1 upload per order, distinct paths, matching digests, 1 paid-email row per order) **all held**; only finalisation failed. |
+| Test | Failure at `8bfecde` | Finding | Status at `main@57fede5` |
+|---|---|---|---|
+| `test_unpaid_order_must_not_be_fulfilled_before_payment` | `AssertionError: DEFECT: an unpaid order was delivered to Yandex.Disk before payment (order #5, uploads=['…/5_….jpg', '…/info.txt'])` | **H1 confirmed empirically.** `POST /api/order` enqueued `file`, `info` and `admin_email`, and no part of the delivery path consulted `payment_status`. Observed rows after one drain: order still `unpaid`, yet `file`/`info` delivered and the local source deleted. | **RESOLVED.** Same scenario now leaves the source in place with `attempts=0`; gates at `delivery.py:126-129, 332, 593, 686-687` and `main.py:780, 893, 988, 1054`. |
+| `test_concurrent_orders_deliver_without_cross_contamination` | `assert {'delivered','failed'} == {'delivered'}` | **M13.** With 4 concurrent `process_due` workers the paid email was *sent*, then its `payment_email_sent_at` UPDATE hit `database is locked`, so the job was marked `failed` and would retry and **re-send**. Cross-contamination itself held. | **RESOLVED.** Durable `paid_email_outbox` + attempt fencing + SQL-only retry (`paid_email_outbox.py:15, 63, 89`; `sqlite_busy.py`). Repo evidence: `test_mixed_paid_unpaid_four_workers_lock_contention_and_restart`. |
 
 The SMTP capture that makes this work is a separate subprocess implementing SMTP **over implicit TLS** with a self-signed certificate, because `main.py:615/670` uses `smtplib.SMTP_SSL` and Python 3.10's `SMTP_SSL` does not verify certificates. It must support `EHLO/AUTH PLAIN/MAIL/RCPT/DATA/QUIT`. Note: offline, `smtplib` calls `socket.getfqdn()` on connect which blocks ~13 s per connection, so the suite stubs it to `localhost` (test plumbing, not product logic).
 
@@ -216,7 +220,7 @@ Message-ID: <photodoc-order-1-paid@photodoc-ai.ru>
 ### 7.2 Additional observations from this suite
 
 - The uploads directory is **not configurable**: `main.py:146` hardcodes `BASE_DIR / "uploads"`. The suite must monkeypatch `main.UPLOAD_DIR` and `delivery.set_uploads_dir` (L13).
-- `main.py:1231` calls `format_robokassa_amount(out_sum)` without guarding non-numeric input, so a malformed `OutSum` raises `ValueError` → HTTP 500 instead of a 400 (L12; read from code, not exercised).
+- `main.py:1231` called `format_robokassa_amount(out_sum)` without guarding non-numeric input, so a malformed `OutSum` raised `ValueError` → HTTP 500 instead of 400 (**L12 — fixed in `main`**: non-finite rejection at `main.py:409`, `HTTPException(400, "Invalid OutSum")` at `:1340`; repo test `test_signed_malformed_outsum_is_controlled_400`).
 - Four defects in the harness itself were found and fixed, and are disclosed rather than hidden: a stale re-read of a file deleted by cleanup, a folder-PUT marker filter, `get_content()` on `multipart/mixed`, and a lock-retry wrapper around the concurrency worker (mirroring `worker_loop`'s own per-iteration `try/except`; no product assertion was weakened).
 
 | # | Journey step | Result |
@@ -226,11 +230,11 @@ Message-ID: <photodoc-order-1-paid@photodoc-ai.ru>
 | S5-14 | Mobile layout | **FAIL (coverage gap)** — `frontend/playwright.config.ts` declares a **single** project, `Desktop Chrome`. There is no mobile viewport or device project, so responsive behaviour is **not** automatically verified at any mobile width. |
 | S5-15 | Invalid uploads | **PASS** — `test_step2_upload_restrictions` exercised all limits: 20 MiB+1 → **413**, `application/pdf` → **400**, no file → **422**, bad magic → **400**, 11 files → **400**, with zero orphan rows/files. Plus `test_upload_limits.py` 8 passed. |
 | S5-16 | Interrupted connections | **PASS (offline)** — `.incoming-*` staging + single `BEGIN IMMEDIATE` commit; crash-before-commit leaves an orphan file but never an order without jobs |
-| S5-17 | Repeated submissions | **PASS** — `test_repeated_order_submission_creates_distinct_orders` produced two independent orders |
+| S5-17 | Repeated submissions | **PASS** — scratch suite `test_repeated_order_submission_creates_distinct_orders` produced two independent orders (scratch artefact, not a repo test) |
 | S5-18 | Payment callback retries | **PASS** — `test_duplicate_result_callback_is_idempotent`: second signed callback returns `OK{n}`, `paid_at`/`payment_email_sent_at` unchanged, one `paid_email` row, one captured email, one upload |
-| S5-19 | Server restarts | **PASS** — `test_state_persists_across_process_restart`: a fresh process on the same `DATABASE_PATH` serves health 200 with `payment_status='paid'`, `paid_at` and `payment_email_sent_at` unchanged, all four jobs `delivered/attempts=1`, and no re-upload on further drains |
-| S5-20 | Delivery retries | **PASS** — live Stage 1 `timeout_before`/`ack_timeout`/`crash_*`, plus `test_delivery_retry_after_transport_failure_uploads_once` |
-| S5-21 | Concurrent orders | **FAIL (product defect)** — `test_concurrent_orders_deliver_without_cross_contamination` with 4 concurrent workers: cross-contamination invariants held (one upload per order, distinct paths, matching digests, one paid email per order) but finalisation failed — `assert {'delivered','failed'} == {'delivered'}` because a `payment_email_sent_at` UPDATE lost the SQLite lock **after** the email had already been sent, marking the job `failed` for a retry that will re-send. See finding **M13**. |
+| S5-19 | Server restarts | **PASS** — scratch `test_state_persists_across_process_restart` (fresh process on the same `DATABASE_PATH`, health 200, all four jobs intact) **plus repo evidence**: `test_payment_delivery_concurrency_e2e.py::test_mixed_paid_unpaid_four_workers_lock_contention_and_restart` and the real child-process crash tests in `test_payment_delivery_reliability.py` / `test_delivery_lifecycle_safety.py`. Recovery latency is lease-bound (≤3 min) — see `ROLLBACK_PLAN.md` §6.5. |
+| S5-20 | Delivery retries | **PASS** — live Stage 1 `timeout_before`/`ack_timeout`/`crash_*`, plus scratch `test_delivery_retry_after_transport_failure_uploads_once` |
+| S5-21 | Concurrent orders | **PASS at `main@57fede5` (was FAIL: M13, fixed by PR #26)** — the original defect was finalisation under lock contention causing a paid-email re-send, not cross-contamination (which held). Fixed by the durable outbox + attempt fencing and bounded busy retry. Verified by repo `test_mixed_paid_unpaid_four_workers_lock_contention_and_restart` and independently with **real OS processes** (2/4/6/8 workers, 20 scenarios): one upload and one paid email per order, no lost jobs, no stuck `processing` rows after lease expiry. |
 
 ---
 
@@ -257,12 +261,18 @@ No CRITICAL finding. Two HIGH: S6-01 (cutover runbook backs up the live DB with 
 
 ## 9. Verdict summary
 
+Re-baselined against `main@57fede5` (PR #26 merged).
+
 | Area | Verdict |
 |---|---|
 | Stage 1 Yandex.Disk staging acceptance | **PASS** (live, 5/5 cases) |
-| Stage 2 Robokassa (test mode) | **PASS with HIGH findings**, no CRITICAL, real payments not activated |
-| Stage 3 Email delivery | **PASS with gaps**, no customer-facing email, production activation ready |
+| Stage 2 Robokassa (test mode) | **PASS**; H2 and H3 remain open HIGH, no CRITICAL, real payments not activated. H1/M13/M14/L12 resolved by PR #26 |
+| Stage 3 Email delivery | **PASS with gaps** — no customer-facing email; M13 fixed; the admin-notification path still lacks a socket timeout and neither path verifies TLS certificates (M12) |
 | Stage 4 Domain/HTTPS | **BLOCKED on DNS + certificate**; configuration validated and fixed in PR #24 |
-| Stage 5 End-to-end journey | see `LAUNCH_READINESS_REPORT.md` §5 |
-| Stage 6 Security/backup/recovery | **PASS with 2 HIGH process findings**, restore rehearsal verified |
+| Stage 5 End-to-end journey | **PASS with gaps** — concurrency and unpaid fulfilment resolved (PR #26); mobile layout untested; H3 post-payment route missing |
+| Stage 6 Security/backup/recovery | **PASS with 2 HIGH process findings**, restore rehearsal verified for the pre-PR #26 schema (outbox not itself rehearsed) |
 | Stage 7 Public launch preparation | **READY_FOR_OWNER_APPROVAL**, not `PUBLIC_LIVE` |
+
+**Resolved since the original audit, by PR #26:** H1 (payment-gated fulfilment), M13
+(duplicate paid notification), M14 (unmanaged SQLite lock contention), L12 (malformed `OutSum`
+→ 500). Mechanism and enforcing tests per finding: `SECURITY_AUDIT.md` §1.1.

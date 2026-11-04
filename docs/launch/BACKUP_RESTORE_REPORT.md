@@ -1,8 +1,22 @@
 # PhotoDoc AI — Backup and Restore Report
 
-Date: 2026-11-04. Commit: `8bfecdee756e11972cbb68ec3f7c0e009a1cba60`.
+Date: 2026-11-04. Rehearsal executed at commit `8bfecdee756e11972cbb68ec3f7c0e009a1cba60`
+(pre-PR #26). **Re-baselined against `main` = `57fede5a84fc07eb24e2b6bb6defd294d6ead923`**,
+which adds the `paid_email_outbox` table.
 
-**Result: restore rehearsal PASSED (executed, not asserted). Backup tooling is sound; the documented cutover procedure is not, and no scheduled backup exists.**
+**Result: restore rehearsal PASSED (executed, not asserted) for the schema as it stood at
+`8bfecde` — `orders`, `delivery_jobs`, `sqlite_sequence`. Backup tooling is sound; the
+documented cutover procedure is not, and no scheduled backup exists.**
+
+> **Scope caveat (added when re-based on `main`).** The rehearsal predates PR #26, so it did
+> **not** include `paid_email_outbox`. That table is nevertheless backed up, because
+> `scripts/create_backup.py` copies the **whole database** through SQLite's backup API
+> (`src_conn.backup(dst_conn)`, `scripts/create_backup.py:86-90`) rather than exporting
+> selected tables — a new table travels automatically and cannot be silently omitted.
+> What is **not** covered is *verification* of the new table: `scripts/verify_backup_integrity.py`
+> has no outbox-specific consistency checks (for example `state='sent'` ⇒ `accepted_at IS NOT
+> NULL`, or orphaned outbox rows). Treat "restore rehearsal passed" as covering the three
+> original tables until a rehearsal is re-run on `main`.
 
 ---
 
@@ -73,10 +87,11 @@ Executed in `scratch/s6/` on the local host. Every step below actually ran; comm
 |---|---|
 | Backup created by the project's own tool | **PASS** |
 | Integrity verification passes | **PASS** (`INTEGRITY_CHECK_PASSED`) |
-| Restored DB logically identical to source | **PASS** (per-table row-dump SHA-256 equal, DDL/indexes equal) |
+| Restored DB logically identical to source | **PASS** (per-table row-dump SHA-256 equal for `orders`, `delivery_jobs`, `sqlite_sequence`; DDL/indexes equal) |
 | Restored DB passes `PRAGMA integrity_check` | **PASS** |
 | Restored DB boots the application | **PASS** (`PHOTODOC_REQUIRE_DB_IDENTITY=1`, `/api/health` 200) |
 | Tamper detection actually detects | **PASS** (byte flip and deletion both fail closed) |
+| `paid_email_outbox` covered by this rehearsal | **NOT_VERIFIED** — the table did not exist at `8bfecde`. It is included in a whole-database backup, but is not covered by row-dump comparison or by an outbox-specific integrity check. Re-run the rehearsal on `main` before relying on it for the email outbox. |
 
 ---
 
