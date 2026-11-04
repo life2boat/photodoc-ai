@@ -114,6 +114,8 @@ def test_stage5_full_lifecycle_sequence(tmp_path, monkeypatch):
         assert all(j["state"] == "pending" for j in pending_jobs)
 
     # 6. Delivery worker processes recovered jobs
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("UPDATE orders SET payment_status='paid' WHERE id=?", (new_order_id,))
     delivered_jobs = []
     processed_count = process_due(db_path, lambda job: delivered_jobs.append(job["id"]))
     assert processed_count == 3

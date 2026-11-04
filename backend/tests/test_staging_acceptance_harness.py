@@ -249,6 +249,9 @@ def create_acceptance_order(
         files=[("files", (filename, content, "image/jpeg"))],
     )
     assert resp.status_code == 200, resp.text
+    # Native transport/cleanup rehearsal starts from a paid synthetic order.
+    with sqlite3.connect(main.DB_PATH) as conn:
+        conn.execute("UPDATE orders SET payment_status='paid' WHERE id=?", (resp.json()["order_id"],))
     return resp.json()
 
 

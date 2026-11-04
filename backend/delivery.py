@@ -12,6 +12,9 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from sqlite_busy import BUSY_TIMEOUT, retry_busy
+from paid_email_outbox import EMAIL_SCHEMA
+
 DEFAULT_MAX_ATTEMPTS = int(os.getenv("DELIVERY_MAX_ATTEMPTS", "10"))
 DEFAULT_UPLOADS_DIR = Path(os.getenv("UPLOAD_DIR", "/app/uploads"))
 _UPLOADS_DIR = DEFAULT_UPLOADS_DIR
@@ -55,7 +58,7 @@ CREATE INDEX IF NOT EXISTS idx_delivery_due ON delivery_jobs(state, next_attempt
 CREATE INDEX IF NOT EXISTS idx_cleanup_due ON delivery_jobs(state, cleanup_state, cleanup_lease_until);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_paid_email_once ON delivery_jobs(order_id) WHERE kind = 'paid_email';
 CREATE UNIQUE INDEX IF NOT EXISTS idx_admin_email_once ON delivery_jobs(order_id) WHERE kind = 'admin_email';
-"""
+""" + EMAIL_SCHEMA
 
 
 def utc_now() -> str:
@@ -89,6 +92,8 @@ def enqueue(conn: sqlite3.Connection, *, order_id: int, kind: str,
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (job_id, order_id, kind, local_path, original_name, remote_path, sha256, size, now, now, cleanup_state, cleanup_phase),
     )
+    if kind == "paid_email":
+        conn.execute("INSERT OR IGNORE INTO paid_email_outbox(order_id,state,updated_at) VALUES(?,'pending',?)", (order_id, now))
     return job_id
 
 
@@ -102,18 +107,27 @@ def quarantine_expired(conn: sqlite3.Connection, now: str, max_attempts: int = D
     return cursor.rowcount
 
 
+@retry_busy
 def claim_due(db_path: Path, max_attempts: int = DEFAULT_MAX_ATTEMPTS) -> dict | None:
     now = utc_now()
     lease = (datetime.now(timezone.utc) + timedelta(minutes=3)).isoformat()
-    conn = sqlite3.connect(db_path, timeout=10)
+    conn = sqlite3.connect(db_path, timeout=BUSY_TIMEOUT)
     conn.row_factory = sqlite3.Row
     try:
         conn.execute("BEGIN IMMEDIATE")
         quarantine_expired(conn, now, max_attempts)
+        conn.execute("""UPDATE paid_email_outbox SET state='uncertain',last_error='WorkerInterrupted',updated_at=?
+            WHERE state='sending' AND EXISTS (SELECT 1 FROM delivery_jobs j
+                WHERE j.kind='paid_email' AND j.order_id=paid_email_outbox.order_id
+                AND (j.lease_until IS NULL OR j.lease_until<=?))""", (now, now))
         row = conn.execute(
             "SELECT * FROM delivery_jobs WHERE "
             "((state IN ('pending', 'failed') AND attempts < ? AND next_attempt_at <= ?) OR "
             "(state = 'processing' AND attempts < ? AND lease_until <= ?)) "
+            "AND (kind NOT IN ('file','info','paid_email') OR EXISTS "
+            "(SELECT 1 FROM orders o WHERE o.id=delivery_jobs.order_id AND o.payment_status='paid')) "
+            "AND (kind!='paid_email' OR NOT EXISTS (SELECT 1 FROM paid_email_outbox e "
+            "WHERE e.order_id=delivery_jobs.order_id AND e.state IN ('sending','uncertain'))) "
             "ORDER BY created_at, id LIMIT 1", (max_attempts, now, max_attempts, now),
         ).fetchone()
         if row is None:
@@ -136,16 +150,23 @@ def claim_due(db_path: Path, max_attempts: int = DEFAULT_MAX_ATTEMPTS) -> dict |
         conn.close()
 
 
+@retry_busy
 def finish(db_path: Path, job_id: str, error: Exception | None = None, lease_until: str | None = None) -> bool:
     """
     Finalizes delivery attempt in SQLite.
     Returns True if delivery succeeded and was committed under the active lease.
     Returns False if delivery failed or if the lease expired / was stolen by another worker.
     """
-    conn = sqlite3.connect(db_path, timeout=10)
+    conn = sqlite3.connect(db_path, timeout=BUSY_TIMEOUT)
     committed = False
     try:
+        conn.execute("BEGIN IMMEDIATE")
         if error is None:
+            row = conn.execute("SELECT kind,order_id FROM delivery_jobs WHERE id=?", (job_id,)).fetchone()
+            if row and row[0] in ("file", "info", "paid_email"):
+                paid = conn.execute("SELECT payment_status FROM orders WHERE id=?", (row[1],)).fetchone()
+                if not paid or paid[0] != "paid":
+                    return False
             if lease_until is not None:
                 cursor = conn.execute(
                     "UPDATE delivery_jobs SET state='delivered', lease_until=NULL, delivered_at=?, last_error=NULL "
@@ -305,6 +326,11 @@ def perform_job_cleanup(
 
         # Only delivered jobs can have their local files cleaned up
         if job["state"] != "delivered":
+            conn.commit()
+            return False
+
+        paid = conn.execute("SELECT payment_status FROM orders WHERE id=?", (job["order_id"],)).fetchone()
+        if job["kind"] in ("file", "info") and (not paid or paid[0] != "paid"):
             conn.commit()
             return False
 
@@ -564,6 +590,10 @@ def perform_job_cleanup(
             conn.rollback()
             _mark_cleanup_failed(db_path, job_id, token, "DeliveryChangedBeforeDelete")
             return False
+        paid = conn.execute("SELECT payment_status FROM orders WHERE id=?", (job["order_id"],)).fetchone()
+        if not paid or paid[0] != "paid":
+            conn.rollback()
+            return False
         if conn.execute(
             "SELECT 1 FROM delivery_jobs WHERE local_path=? AND id!=? AND state!='delivered' LIMIT 1",
             (raw_local_path, job_id),
@@ -648,6 +678,13 @@ def process_due_cleanups(
         rows = conn.execute(
             "SELECT id FROM delivery_jobs "
             "WHERE state='delivered' AND kind IN ('file', 'info') "
+            # Eligibility, not just permission: an unpaid order's source must be
+            # retained, so it must never occupy a slot in the sweep window.
+            # Without this predicate a backlog of older unpaid jobs keeps
+            # re-entering every sweep and starves newer paid cleanups, and each
+            # futile attempt still takes a write lock in perform_job_cleanup.
+            "AND EXISTS (SELECT 1 FROM orders o "
+            "            WHERE o.id=delivery_jobs.order_id AND o.payment_status='paid') "
             "AND ("
             "  cleanup_state = 'pending' "
             "  OR (cleanup_state = 'failed' AND cleanup_attempts < 10 "

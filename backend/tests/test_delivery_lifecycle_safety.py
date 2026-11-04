@@ -82,6 +82,10 @@ def lifecycle(tmp_path, monkeypatch):
                            "format": "10x15", "paper": "Матовая", "crop": "Без полей"},
                            files={"files": ("photo.jpg", PHOTO, "image/jpeg")})
     assert response.status_code == 200, response.text
+    # Delivery/recovery scenarios start after a confirmed payment. H1 unpaid
+    # coverage lives in test_payment_delivery_reliability.py.
+    with sqlite3.connect(db) as conn:
+        conn.execute("UPDATE orders SET payment_status='paid',paid_at='2026-01-01' WHERE id=?", (response.json()["order_id"],))
     yield client, db, uploads, disk, response.json()
     client.close()
 
@@ -132,7 +136,7 @@ def test_delivery_failure_retains_bytes_and_retries_without_new_order(lifecycle,
     assert list(uploads.iterdir()) == []
     with sqlite3.connect(db) as conn:
         assert conn.execute("SELECT id, payment_status, order_amount FROM orders").fetchall() == [
-            (order["order_id"], "unpaid", "20.00")]
+                (order["order_id"], "paid", "20.00")]
 
 
 def run_child(code, *args):
@@ -204,6 +208,8 @@ perform_job_cleanup(Path(sys.argv[1]), sys.argv[2], uploads_dir=Path(sys.argv[3]
 
 def test_duplicate_signed_callback_during_failed_delivery_does_not_duplicate_order(lifecycle):
     client, db, uploads, disk, order = lifecycle
+    with sqlite3.connect(db) as conn:
+        conn.execute("UPDATE orders SET payment_status='unpaid',paid_at=NULL WHERE id=?", (order["order_id"],))
     assert client.post("/api/payment/create", json={"order_id": order["order_id"],
                        "order_token": order["order_token"]}).status_code == 200
     signature = hashlib.md5(f"20.00:{order['order_id']}:synthetic-p2".encode()).hexdigest()
