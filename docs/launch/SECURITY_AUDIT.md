@@ -42,7 +42,7 @@ Nothing was exploited against a live service. Every claim below is backed by cod
 | L3 | LOW | Non-ASCII `Description=f"Заказ_{id}"` sent without `Encoding=utf-8`. | `backend/main.py:1164` |
 | L4 | LOW | No fiscal `Receipt`/`Items`/tax-system parameters; 54-ФЗ data must be configured in the cabinet. | `backend/main.py:1160-1167` |
 | L5 | LOW | Customer email is never validated and is forwarded to the PSP as `Email`. | `backend/main.py:1041, 1156-1169` |
-| L6 | LOW | `Message-ID` hardcodes `@photodoc-ai.ru` (an unregistered domain) regardless of configuration, so message identity cannot align with the served `photo1storage.ru` domain. Still open at `main@57fede5`. | `backend/main.py:606, 731` |
+| L6 | LOW | `Message-ID` hardcodes `@photodoc-ai.ru` (an unregistered domain) regardless of configuration, so message identity cannot align with the served `photo1storage.ru` domain. Present in `main@57fede5`; **fixed in PR #27 (open, not yet merged)**, which derives the domain from `PHOTODOC_MAIL_DOMAIN` → mailbox domain → `photo1storage.ru` and validates it. | `backend/main.py:606, 731` at `main@57fede5` |
 | L7 | LOW | The Result handler logs the whole callback payload at ERROR; httpx logs the pre-signed upload URL at INFO. No password/OAuth token is ever logged. | `backend/main.py:1209, 56` |
 | L8 | LOW | Legacy-order existence oracle: a 409 "Legacy order requires manual payment handling" is returned **before** the token comparison (404 otherwise). | `backend/main.py:1117-1122` |
 | L9 | LOW | `backend/templates/admin.html` is tracked but unserved; it references `/admin/orders/{id}/download` and `/status` which do not exist. Wiring it up naively would be an unauthenticated IDOR. There is also no order-lookup surface for support. | `admin.html:68,78` |
@@ -198,4 +198,4 @@ are **done in `main`** (PR #26 — see §1.1) and are no longer launch prerequis
 7. Enable TLS certificate verification on both SMTP paths, and add the missing socket timeout to the **admin-notification** path (M12).
 8. Add a disk-space guard and expose disk/backlog in `/api/health` (M8).
 9. Restrict CORS to the real origin (M6).
-10. Derive the `Message-ID` domain from configuration instead of the literal `photodoc-ai.ru` (L6) — required for DMARC alignment with the served domain.
+10. Derive the `Message-ID` domain from configuration instead of the literal `photodoc-ai.ru` (L6) — required for DMARC alignment with the served domain. **Addressed by PR #27 (open)**: derives the domain from `PHOTODOC_MAIL_DOMAIN`/`SMTP_USER`, validates it as a bare DNS name, and adds `backend/tests/test_domain_consistency.py`. Merge PR #27 before relying on this item.

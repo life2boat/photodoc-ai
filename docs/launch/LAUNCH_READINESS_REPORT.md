@@ -128,7 +128,7 @@ Evidence per finding: `SECURITY_AUDIT.md` §1.1.
 - Header injection from user-controlled fields is **not** possible (verified with CRLF payloads in `name`, `format`, `comment`); the client is not an open relay.
 - `paid_email` is gated on the paid transition. But `admin_email` **is** sent for an unpaid order at creation.
 
-Gaps: no customer-facing email at all (both notifications go to `EMAIL_TO`); `Message-ID` hardcodes the unregistered `@photodoc-ai.ru` (still open — L6); the **admin-notification** path still has no socket timeout (the paid-email path gained `timeout=30` in PR #26); TLS certificate verification disabled on both paths (a self-signed certificate was accepted); attempt 10 is terminal with no requeue (≈43 min to permanent silent loss); customer email is unvalidated and forwarded to the PSP.
+Gaps: no customer-facing email at all (both notifications go to `EMAIL_TO`); `Message-ID` hardcodes the unregistered `@photodoc-ai.ru` at `main@57fede5` (L6 — **fixed by PR #27, open**); the **admin-notification** path still has no socket timeout (the paid-email path gained `timeout=30` in PR #26); TLS certificate verification disabled on both paths (a self-signed certificate was accepted); attempt 10 is terminal with no requeue (≈43 min to permanent silent loss); customer email is unvalidated and forwarded to the PSP.
 
 ---
 
@@ -296,10 +296,17 @@ implemented in `main` by PR #26. Nothing about H1 needs an owner decision any mo
 | PR | Title | State |
 |---|---|---|
 | #24 | `infra(tls): align edge config to the owned domain and close provisioning gaps` | **OPEN — merge first** (no dependency on #25) |
-| #25 | `docs(launch): launch-readiness deliverables for stages 1-7` | **OPEN** (this document set) — merge after #24 |
+| #27 | `fix(domain): align every domain reference with the served photo1storage.ru` | **OPEN — merge second** (closes L6 and the I1–I3 domain leftovers) |
+| #25 | `docs(launch): launch-readiness deliverables for stages 1-7` | **OPEN** (this document set) — merge last, after #24 and #27 |
 
 - https://github.com/life2boat/photodoc-ai/pull/24
+- https://github.com/life2boat/photodoc-ai/pull/27
 - https://github.com/life2boat/photodoc-ai/pull/25
+
+**Order matters for review, not for conflicts:** all three touch disjoint files and merge
+cleanly in any order. #25 goes last so its statements of what is still open match the code
+that #27 lands — otherwise the document set would immediately describe L6 as open while the
+merged code has already fixed it.
 
 PR #26 is **merged** into `main` (`57fede5a84fc07eb24e2b6bb6defd294d6ead923`) and is the change
 that closed H1, M13, M14 and L12. PR #24 is edge/infra configuration and changes no

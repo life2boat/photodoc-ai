@@ -158,7 +158,7 @@ PR #26** — see `SECURITY_AUDIT.md` §1.1 for the mechanism and the tests that 
 | S3-6 | Email failure cannot destroy orders or files | **PASS** | Sender swallows the error → `deliver_job` raises → outbox marks `failed` with backoff. Order row, uploads and other jobs verified untouched |
 | S3-7 | Production SMTP configuration prepared | **PASS** | `PRODUCTION_ACTIVATION_PLAN.md` §6 |
 
-Gaps: no customer-facing email at all (both notifications go to `EMAIL_TO`); `Message-ID` hardcodes `@photodoc-ai.ru` (`main.py:606,731` — still open, L6); the **admin-notification** path still has no socket timeout (the paid-email path gained `timeout=30` in PR #26; a silent peer can still block the single worker thread — measured still blocked after 8 s at `8bfecde`); TLS certificate verification disabled on both paths (`CERT_NONE`, `check_hostname=False` — a self-signed cert was accepted); attempt 10 is terminal with no requeue (≈43 min to permanent silent loss).
+Gaps: no customer-facing email at all (both notifications go to `EMAIL_TO`); `Message-ID` hardcodes `@photodoc-ai.ru` at `main@57fede5` (`main.py:606,731` — L6, **fixed by PR #27, open**); the **admin-notification** path still has no socket timeout (the paid-email path gained `timeout=30` in PR #26; a silent peer can still block the single worker thread — measured still blocked after 8 s at `8bfecde`); TLS certificate verification disabled on both paths (`CERT_NONE`, `check_hostname=False` — a self-signed cert was accepted); attempt 10 is terminal with no requeue (≈43 min to permanent silent loss).
 
 ---
 

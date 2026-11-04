@@ -226,7 +226,9 @@ ORDER BY o.id;
 ```
 
 Then, per order, after checking the mail provider's delivery log by order id and
-`Message-ID <photodoc-order-{id}-paid@photodoc-ai.ru>`:
+`Message-ID <photodoc-order-{id}-paid@{mail-domain}>`, where `{mail-domain}` is
+`PHOTODOC_MAIL_DOMAIN`, else the domain of `SMTP_USER`, else `photo1storage.ru` (before
+PR #27 the literal was always `photodoc-ai.ru`; check both when reconciling history):
 
 - **Provider shows the message accepted** → record it as sent without sending again
   (`state='sent'` with `accepted_at`, and set `orders.payment_email_sent_at` to the
