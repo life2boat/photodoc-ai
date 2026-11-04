@@ -128,6 +128,13 @@ docker run --rm \
 
 ### 4.1 Verify with the deployment gate
 
+> **Stage 1 addition.** `scripts/evidence_gate.py` verifies a set against the live
+> database with a canonical, bidirectional comparison (schema objects and their SQL,
+> complete row identity including `WITHOUT ROWID` and shadowed rowid aliases, type-tagged
+> values, `sqlite_sequence`) and a manifest contract that binds the metadata to the
+> artifacts. See [BACKUP_EVIDENCE.md](BACKUP_EVIDENCE.md). It is read-only and does not
+> replace the deployment gate below: it does not exclude writers.
+
 ```bash
 docker run --rm \
   -v "$PWD:/repo:ro" -v "${BACKUP_ROOT}:/backups:ro" \
