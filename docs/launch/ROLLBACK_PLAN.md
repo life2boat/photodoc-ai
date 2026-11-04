@@ -127,6 +127,8 @@ If a regression is in the code rather than the image:
 
 For the PR #23 change specifically, the rollback is purely a code revert: there is **no schema migration**, so no database rollback is required. Sources and durable queue records are retained under the existing policy, so a reverted backend simply resumes the outbox.
 
+> **Exception — PR #26 (payment-gated delivery and paid-email outbox).** That change *is* additive to the schema and its evidence is not readable by pre-PR code. Reverting it without the preparation in §6 can produce duplicate paid emails and unpaid deliveries. Read §6 before reverting it.
+
 ---
 
 ## 3. Feature-flag level rollback (fastest mitigation, no redeploy)
@@ -175,3 +177,76 @@ Then recompute the database logical hash and compare with `baseline.json`.
 - Rung 3 executed against the **staging** volume (deliberately not performed — it would destroy the live staging database).
 - A production rollback, because no production deployment exists yet.
 - Rollback under real customer load.
+
+---
+
+## 6. Rolling back the paid-email outbox (PR #26)
+
+PR #26 adds an additive `paid_email_outbox` table and makes fulfilment require a
+persisted `paid` state. Reverting the code leaves the table in place — but the old
+code cannot read it, and that asymmetry is the danger.
+
+### 6.1 Why a naive revert is unsafe
+
+| Old-code behaviour | Consequence after a revert |
+|---|---|
+| `send_paid_order_email` retries whenever `orders.payment_email_sent_at` is NULL, and ignores `paid_email_outbox` | Every attempt held in `sending` or `uncertain` becomes eligible for an automatic send again. A message that was **actually accepted** during an ambiguous attempt can be delivered **twice**. |
+| `claim_due` does not require a paid order for `file`/`info` jobs | Unpaid orders are uploaded to Yandex.Disk again and their local source files are deleted. |
+
+`uncertain` means the outcome could not be established — typically a disconnect or
+timeout after the server accepted the DATA command. It must **never** be
+automatically resent, in either direction of the rollback.
+
+### 6.2 Safe rollback procedure
+
+1. **Stop the workers.** Set `DELIVERY_WORKER_ENABLED=0`, recreate the backend, and
+   stop any script or manual drain that could claim jobs. Reverting with a running
+   old worker is not a safe rollback.
+2. **Preserve the evidence.** Keep `paid_email_outbox` and the surrounding
+   `delivery_jobs` rows. Do not drop the table, do not bulk-reset states, and do
+   not restore an older database over newer order/payment records.
+3. **Make ambiguous attempts unreachable by the old retry path**, without deleting
+   anything. For each order whose outbox state is `sending` or `uncertain`, either
+   set `orders.payment_email_sent_at` from verified provider evidence, or keep the
+   workers stopped until that evidence exists. Never leave an `uncertain` row
+   reachable by an old worker.
+4. **Record the decision** privately outside the database: order id, Message-ID,
+   provider evidence, operator, timestamp.
+5. **Prefer a forward fix.** A patch that understands the durable evidence does not
+   need any of the above and cannot duplicate mail.
+
+### 6.3 Reconciliation without destroying evidence
+
+```sql
+-- inspect held attempts (read-only)
+SELECT o.id, o.payment_email_sent_at, e.state, e.attempts, e.accepted_at, e.last_error
+FROM paid_email_outbox e JOIN orders o ON o.id = e.order_id
+WHERE e.state IN ('sending','uncertain')
+ORDER BY o.id;
+```
+
+Then, per order, after checking the mail provider's delivery log by order id and
+`Message-ID <photodoc-order-{id}-paid@photodoc-ai.ru>`:
+
+- **Provider shows the message accepted** → record it as sent without sending again
+  (`state='sent'` with `accepted_at`, and set `orders.payment_email_sent_at` to the
+  same instant).
+- **Provider shows no such message** → only then may the row be returned to
+  `pending`/`retry` with the attempt token cleared, so a later authorised drain can
+  send it once.
+- **No evidence either way** → leave it `uncertain` and escalate. This is the
+  correct final state; it is not a stuck record.
+
+Never bulk-reset or delete these rows: they are the only record that an attempt
+happened.
+
+### 6.4 Verification after a rollback
+
+```bash
+docker exec <backend> printenv DELIVERY_WORKER_ENABLED          # 0 until reconciled
+docker exec <backend> curl -fsS http://127.0.0.1:8000/api/health
+```
+
+and confirm that no `sending`/`uncertain` row is reachable by the running version,
+and that every `delivered` `file`/`info` job of an unpaid order still has its local
+source present.
