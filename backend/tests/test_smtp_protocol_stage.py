@@ -10,18 +10,16 @@ source must be retained *and* must not occupy a slot that a paid cleanup needs.
 """
 import datetime
 import hashlib
+import shutil
 import socket
 import sqlite3
 import ssl
+import subprocess
 import sys
 import threading
 from pathlib import Path
 
 import pytest
-from cryptography import x509
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import rsa
-from cryptography.x509.oid import NameOID
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import delivery  # noqa: E402
@@ -31,6 +29,31 @@ import paid_email_outbox as email  # noqa: E402
 
 # --------------------------------------------------------------------- fixtures
 def _self_signed(directory):
+    """Create a throwaway self-signed certificate for the loopback test server.
+
+    The certificate only has to satisfy a client that does not verify it, so
+    neither image tool is an application dependency: `cryptography` is used when
+    installed, otherwise the openssl CLI, which CI runners provide.
+    """
+    cert_path = directory / "smtp-cert.pem"
+    key_path = directory / "smtp-key.pem"
+    try:
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from cryptography.x509.oid import NameOID
+    except ImportError:
+        openssl = shutil.which("openssl")
+        if not openssl:
+            pytest.skip("needs either the 'cryptography' package or the openssl CLI")
+        subprocess.run(
+            [openssl, "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+             "-keyout", str(key_path), "-out", str(cert_path),
+             "-days", "1", "-subj", "/CN=localhost"],
+            check=True, capture_output=True,
+        )
+        return cert_path, key_path
+
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "localhost")])
     now = datetime.datetime.now(datetime.timezone.utc)
@@ -44,8 +67,6 @@ def _self_signed(directory):
         .not_valid_after(now + datetime.timedelta(days=1))
         .sign(key, hashes.SHA256())
     )
-    cert_path = directory / "smtp-cert.pem"
-    key_path = directory / "smtp-key.pem"
     cert_path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
     key_path.write_bytes(
         key.private_bytes(
