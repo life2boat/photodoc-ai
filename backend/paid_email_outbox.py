@@ -31,6 +31,16 @@ def initialize(db):
     """Additive migration; preserve ambiguous legacy attempts instead of resending."""
     conn = sqlite3.connect(db, timeout=BUSY_TIMEOUT)
     try:
+        # Prepared databases must remain inspectable by read-only startup probes.
+        # Avoid even INSERT OR IGNORE when no migration/backfill is necessary.
+        table = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='paid_email_outbox'").fetchone()
+        jobs = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='delivery_jobs'").fetchone()
+        if table and (not jobs or not conn.execute("""
+                SELECT 1 FROM orders o JOIN delivery_jobs j ON j.order_id=o.id
+                WHERE j.kind='paid_email' AND NOT EXISTS
+                    (SELECT 1 FROM paid_email_outbox e WHERE e.order_id=o.id) LIMIT 1
+                """).fetchone()):
+            return
         conn.execute("BEGIN IMMEDIATE")
         conn.execute(EMAIL_SCHEMA)
         if conn.execute("SELECT 1 FROM sqlite_master WHERE name='delivery_jobs'").fetchone():

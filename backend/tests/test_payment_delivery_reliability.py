@@ -322,3 +322,14 @@ def test_extended_sqlite_busy_codes_are_recognized():
     assert sqlite_busy.is_busy(error)
     error.sqlite_errorcode = 19  # SQLITE_CONSTRAINT
     assert not sqlite_busy.is_busy(error)
+
+
+def test_already_initialized_outbox_allows_read_only_startup(env, monkeypatch):
+    order("paid", kind="paid_email")
+    from db_contract import readonly_database_uri
+    connect = sqlite3.connect
+    uri = readonly_database_uri(main.DB_PATH)
+    monkeypatch.setattr(sqlite3, "connect", lambda *a, **kw: connect(uri, uri=True))
+    main.ensure_database_state()
+    assert main.database_readiness_ok()
+    assert email_state() == ("pending", 0)

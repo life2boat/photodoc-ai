@@ -90,7 +90,8 @@ Startup first validates PhotoDoc DB identity/schema, then creates the additive
 email table and imports historical paid-email jobs in a short transaction. Fresh
 databases include the table in DELIVERY_SCHEMA. No existing table/column, customer
 source, queue destination or payment state is removed or rewritten. Import is
-idempotent: existing outbox evidence wins. Historical jobs with an existing sent
+idempotent: an already-prepared DB uses a read-only fast path when no rows need
+backfilling; existing outbox evidence wins. Historical jobs with an existing sent
 timestamp become sent; never-attempted pending jobs become pending; previously
 attempted, processing or delivered jobs without a sent timestamp become uncertain.
 Those held legacy notifications need reconciliation rather than automatic retry.
@@ -109,8 +110,9 @@ or destructive schema down-migration is provided.
 
 ## Verification evidence
 
-The full backend suite collected 429 tests: 427 passed and two Windows symlink
-privilege skips. The new regression modules contribute 39 cases, including real
+The initial full backend suite collected 429 tests: 427 passed and two Windows symlink
+privilege skips; Linux CI passed all 429. The final regression modules contribute
+40 cases, including a mode=ro startup regression and real
 process exits before/after SMTP DATA, post-acceptance SQLite lock contention,
 multiple workers/direct email callers, invalid signed OutSum values, unpaid
 file/info retention and legacy mail migration. An independent four-worker run
