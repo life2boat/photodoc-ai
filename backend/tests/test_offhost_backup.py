@@ -178,6 +178,10 @@ def _complete_env(tmp_path, backup_root):
     passfile = tmp_path / "pass"
     if not passfile.exists():
         passfile.write_text("synthetic-passphrase", encoding="utf-8")
+        # The component enforces 0600 on POSIX; a file created with the default
+        # umask is 0644 and is correctly rejected. Set the mode the deployment
+        # procedure requires.
+        passfile.chmod(0o600)
     return {
         "BACKUP_ROOT": str(backup_root),
         "OFFHOST_DEST": "/srv/offsite",
