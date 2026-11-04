@@ -31,6 +31,13 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 
 from db_contract import APPLICATION_ID, inspect_database, read_application_id
+from yandex_paths import (
+    is_production_disk_path,
+    is_within as _within_yandex_root,
+    join_path as _join_yandex_path,
+    normalize_path as _normalize_yandex_path,
+    split_path as _split_yandex_path,
+)
 from delivery import (
     DELIVERY_SCHEMA,
     cleanup_orphaned_temporary_files,
@@ -61,8 +68,9 @@ KNOWN_STAGING_PLACEHOLDERS = {
 
 def get_yandex_disk_root() -> str:
     root = (os.getenv("YANDEX_DISK_ROOT_DIR") or "PhotoDoc_Orders").strip()
-    clean = root.strip("/")
-    return clean or "PhotoDoc_Orders"
+    if not root.strip("/"):
+        return "PhotoDoc_Orders"  # Preserve the legacy empty/slash-only fallback.
+    return _normalize_yandex_path(root or "PhotoDoc_Orders")
 
 
 def is_staging_environment() -> bool:
@@ -83,7 +91,7 @@ def validate_staging_delivery_safety():
         return
 
     root = get_yandex_disk_root()
-    if root == "PhotoDoc_Orders" or root.startswith("PhotoDoc_Orders/"):
+    if is_production_disk_path(root):
         raise RuntimeError(
             f"Staging delivery configuration forbidden to target production root '{root}'"
         )
@@ -678,21 +686,62 @@ def send_paid_order_email(order_id: int):
         return False
 
 
+def _validated_yandex_destination(path: str) -> str:
+    path = _normalize_yandex_path(path)
+    # Explicitly configured namespaces must not be escaped by persisted jobs or
+    # callers. Legacy callers without an explicit root keep relative Disk paths.
+    if (os.getenv("YANDEX_DISK_ROOT_DIR") or "").strip():
+        if not _within_yandex_root(path, get_yandex_disk_root()):
+            raise RuntimeError("Yandex destination is outside the configured root")
+    return path
+
+
 def ensure_yandex_folder(token: str, path: str):
+    path = _validated_yandex_destination(path)
     headers = {"Authorization": f"OAuth {token}"}
-    parts = [p for p in path.strip("/").split("/") if p]
-    current_path = ""
-    for part in parts:
-        current_path = f"{current_path}/{part}" if current_path else part
+    prefix, parts = _split_yandex_path(path)
+
+    def exists(directory: str) -> bool:
+        metadata = httpx.get(
+            "https://cloud-api.yandex.net/v1/disk/resources",
+            headers=headers, params={"path": directory, "fields": "type"}, timeout=10,
+        )
+        if metadata.status_code == 404:
+            return False
+        metadata.raise_for_status()
+        if metadata.status_code != 200:
+            raise RuntimeError("Yandex directory lookup was not confirmed")
+        try:
+            resource = metadata.json()
+        except (ValueError, TypeError):
+            raise RuntimeError("Yandex directory metadata is invalid") from None
+        if not isinstance(resource, dict) or resource.get("type") != "dir":
+            raise RuntimeError("Yandex directory path is not a directory")
+        return True
+
+    # Virtual roots are lookup-only; never attempt to mkdir 'app:' or 'disk:'.
+    if prefix and not exists(prefix):
+        raise RuntimeError("Yandex namespace root is unavailable")
+    for index in range(1, len(parts) + 1):
+        current_path = prefix + "/".join(parts[:index])
+        if exists(current_path):
+            continue
         response = httpx.put(
             "https://cloud-api.yandex.net/v1/disk/resources",
             headers=headers,
             params={"path": current_path},
             timeout=10,
         )
-        if response.status_code not in (201, 409):
-            response.raise_for_status()
-            raise RuntimeError("Yandex folder creation was not confirmed")
+        if response.status_code == 201:
+            continue
+        if response.status_code == 409:
+            # Another worker may have created it after our GET. A conflict with
+            # a file (or a disappearing directory) is not successful mkdir.
+            if exists(current_path):
+                continue
+            raise RuntimeError("Conflicting Yandex directory was not confirmed")
+        response.raise_for_status()
+        raise RuntimeError("Yandex folder creation was not confirmed")
 
 
 def _remote_verified(
@@ -703,6 +752,7 @@ def _remote_verified(
 ) -> bool:
     if not token or not remote_path or not expected_sha256 or expected_size is None:
         raise RuntimeError("Missing required parameters for remote verification")
+    remote_path = _validated_yandex_destination(remote_path)
     response = httpx.get(
         "https://cloud-api.yandex.net/v1/disk/resources",
         headers={"Authorization": f"OAuth {token}"},
@@ -744,10 +794,11 @@ def upload_to_yandex_disk(
     token = os.getenv("YANDEX_DISK_TOKEN")
     if not token:
         raise RuntimeError("Yandex Disk OAuth token is unavailable")
+    remote_folder_path = _normalize_yandex_path(remote_folder_path)
+    remote_path = _join_yandex_path(remote_folder_path, remote_file_name)
 
     if is_staging_environment():
-        clean_remote = remote_folder_path.strip("/")
-        if clean_remote == "PhotoDoc_Orders" or clean_remote.startswith("PhotoDoc_Orders/"):
+        if is_production_disk_path(remote_folder_path):
             raise RuntimeError(
                 f"Staging delivery cannot upload to production destination: {remote_folder_path}"
             )
@@ -763,6 +814,7 @@ def upload_to_yandex_disk(
                     "Staging delivery requires explicit genuine staging token (placeholder rejected)"
                 )
 
+    remote_folder_path = _validated_yandex_destination(remote_folder_path)
     raw_path = str(local_file_path)
     if ".." in raw_path or any(part == ".." for part in Path(raw_path).parts):
         raise RuntimeError("Path traversal detected in upload source")
@@ -803,8 +855,6 @@ def upload_to_yandex_disk(
 
     target_sha256 = (expected_sha256 or local_sha256).lower()
     target_size = expected_size if expected_size is not None else size
-
-    remote_path = f"{remote_folder_path}/{remote_file_name}"
 
     # If authoritative expected checksum and size are known, check if already verified remotely
     if expected_sha256 and expected_size is not None:
@@ -993,8 +1043,10 @@ async def create_order(
              amount, amount, datetime.utcnow().isoformat(), token_hash),
         )
         order_id = cursor.lastrowid
-        folder = (f"{get_yandex_disk_root()}/Заказ_{order_id}_{_folder_component(name)}/"
-                  f"{_folder_component(format)}_{_folder_component(paper)}_{_folder_component(crop)}")
+        folder = _join_yandex_path(
+            get_yandex_disk_root(), f"Заказ_{order_id}_{_folder_component(name)}",
+            f"{_folder_component(format)}_{_folder_component(paper)}_{_folder_component(crop)}",
+        )
         for item in staged:
             attachment_id = uuid.uuid4().hex
             stored_name = f"{order_id}_{attachment_id}.{item['suffix']}"
