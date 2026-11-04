@@ -24,6 +24,7 @@ import re
 import sqlite3
 import sys
 from pathlib import Path
+from sqlite_uri import readonly_uri  # noqa: E402
 from typing import Any, Dict, List, Optional, Tuple
 
 APPLICATION_ID_TAG = "PDAI"
@@ -125,7 +126,7 @@ def verify_backup(
     report["uploads_exists"] = True
 
     try:
-        uri = f"file:{db_path.resolve().as_posix()}?mode=ro"
+        uri = readonly_uri(db_path)
         conn = sqlite3.connect(uri, uri=True, timeout=5.0)
         conn.row_factory = sqlite3.Row
     except Exception as exc:

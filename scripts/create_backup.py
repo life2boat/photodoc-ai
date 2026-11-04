@@ -30,6 +30,7 @@ import tarfile
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
+from sqlite_uri import readonly_uri  # noqa: E402
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 # Ensure backend and scripts are in sys.path
@@ -82,7 +83,7 @@ def snapshot_sqlite_db(src_path: Path, dst_path: Path) -> None:
     """
     Takes an online, transactionally consistent snapshot of SQLite database.
     """
-    src_uri = f"file:{src_path.resolve().as_posix()}?mode=ro"
+    src_uri = readonly_uri(src_path)
     src_conn = sqlite3.connect(src_uri, uri=True, timeout=10.0)
     dst_conn = sqlite3.connect(dst_path, timeout=10.0)
     try:
@@ -110,7 +111,7 @@ def determine_required_and_excluded_files(
     delivery_jobs tracking represent ambiguous status. Unless legacy_p0_policy is
     explicitly 'include' or 'exclude', fails closed with a clear non-sensitive diagnostic.
     """
-    conn = sqlite3.connect(f"file:{db_path.resolve().as_posix()}?mode=ro", uri=True)
+    conn = sqlite3.connect(readonly_uri(db_path), uri=True)
     conn.row_factory = sqlite3.Row
     try:
         # Check tables
@@ -348,7 +349,7 @@ def generate_backup(
 
     # 2. Check source DB integrity & Application ID
     try:
-        conn = sqlite3.connect(f"file:{db_path.resolve().as_posix()}?mode=ro", uri=True)
+        conn = sqlite3.connect(readonly_uri(db_path), uri=True)
         integrity = conn.execute("PRAGMA integrity_check;").fetchone()[0]
         app_id = conn.execute("PRAGMA application_id;").fetchone()[0]
         conn.close()

@@ -308,8 +308,24 @@ Exit code 0 is the only acceptable result; anything else means **stop the releas
 here**. Do not continue with a red gate, and do not substitute a manual
 `integrity_check` for it.
 
+What a green gate actually establishes:
+
+* every artifact matches `manifest.sha256`, the backup database passes
+  `integrity_check`, and its `application_id` matches this application;
+* `--deep` re-extracted the upload archive and the project's verifier accepted it
+  against the database — this is **not optional**: a missing verifier is a failure, not
+  a warning, because a deployment that believes an archive was checked when it was not is
+  worse than one that never checked;
+* with `--live-db`, every live order and delivery job is present in the backup with the
+  same payment, delivery and paid-email state, read from a single transaction. Equal
+  counts are not accepted as evidence of equal content;
+* with `--require-quiescent`, no delivery or cleanup writer was in flight in that same
+  snapshot.
+
 **Do not proceed past this step without a green gate.** No ownership or permission
-changes and no schema mutation are allowed before a verified backup set exists.
+changes and no schema mutation are allowed before a verified backup set exists. If the
+gate fails, the database must still be exactly as it was — the staging deployment script
+enforces this by probing presence as root, running the gate, and only then migrating.
 
 ### Step 9: Reconcile the Schema from the Staged Candidate
 

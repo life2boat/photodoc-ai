@@ -43,6 +43,11 @@ CORE_TABLES = ("orders", "delivery_jobs", "sqlite_sequence")
 OUTBOX_TABLE = "paid_email_outbox"
 OUTBOX_STATES = frozenset({"pending", "retry", "sending", "sent", "uncertain"})
 
+
+# ``readonly_uri`` lives in its own dependency-free module so every script can
+# import it without a cycle; re-exported here for existing callers.
+from sqlite_uri import readonly_uri  # noqa: E402,F401
+
 REQUIRED_FILES = ("orders.db", "uploads.tar.gz", "manifest.sha256", "backup_manifest.json")
 
 TMP_PREFIX = ".tmp-"
@@ -556,7 +561,7 @@ def verify_backup_set(
 
     # --- database
     db_path = backup_dir / "orders.db"
-    uri = f"file:{db_path.resolve().as_posix()}?mode=ro"
+    uri = readonly_uri(db_path)
     try:
         conn = sqlite3.connect(uri, uri=True, timeout=10.0)
         try:
@@ -608,9 +613,13 @@ def _check_upload_archive(backup_dir: Path, report: Dict[str, Any]) -> List[str]
     errors: List[str] = []
     try:
         from verify_backup_integrity import verify_backup
-    except ImportError:  # pragma: no cover
-        report["warnings"].append("verify_backup_integrity unavailable; archive not deep-checked")
-        return errors
+    except ImportError as exc:
+        # Fail closed. A deep check that silently degrades to "not checked" is
+        # worse than no check at all: the deployment would proceed believing the
+        # archive had been verified.
+        report["upload_archive_verified"] = False
+        return [f"deep upload verification is unavailable ({exc}); refusing to treat the "
+                "archive as verified"]
     with tempfile.TemporaryDirectory() as tmp:
         target = Path(tmp)
         try:
@@ -705,7 +714,7 @@ def check_quiescence(
         reasons.append(f"database not found: {db_path}")
         return False, report
 
-    uri = f"file:{db_path.resolve().as_posix()}?mode=ro"
+    uri = readonly_uri(db_path)
     try:
         conn = sqlite3.connect(uri, uri=True, timeout=10.0)
         try:

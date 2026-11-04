@@ -25,15 +25,18 @@ contract, and a caller that treats "the call returned" as "the file is safe to d
 ## 2. Where it actually lived — a correction
 
 The proposal describes `backend/main.py` with `upload_to_yandex_disk` at line 575 and
-`background_upload_and_cleanup` at line 616. **No commit in this repository ever
-contained `background_upload_and_cleanup`**
+`background_upload_and_cleanup` at line 616. **The symbol does not appear in any commit
+reachable from the refs available in this clone:**
 
 ```
 git log --all -S 'background_upload_and_cleanup'    -> no results
+git show 51113bc^:backend/main.py | grep unlink     -> no delete call
 ```
 
-so the proposal was written against a local working tree rather than a published
-revision. What the committed history *did* contain, immediately before PR #9
+That is evidence about reachable refs, not proof about unreachable or pruned objects, so
+the accurate conclusion is: the function was not part of any published revision this
+clone can see, and the proposal was most likely written against a local working tree.
+What the committed history *did* contain, immediately before PR #9
 (`51113bc^:backend/main.py`), is the same fault class in a different shape:
 
 ```python
@@ -73,10 +76,10 @@ is what shipped. Both are addressed by the same fix: deletion must require proof
 
 | PR | Commit | Date | What it changed |
 |---|---|---|---|
-| #9 | `51113bc` | 2026-10-26 | Removed the fire-and-forget path; introduced the durable delivery queue (`delivery_jobs`) and `require_paid_order`-style ordering. Upload failures became retryable work items instead of silent no-ops. |
+| #9 | `51113bc` | 2026-10-26 | Removed the fire-and-forget upload path and introduced the durable delivery queue (`delivery_jobs`), so a failed upload became a retryable work item instead of a silent no-op. **It did not add a payment gate**: at this point `file`/`info` jobs were still enqueued for unpaid orders. |
 | #21 | `a5cad62` | 2026-10-29 | Commit-failure recovery, full-state consistency and signal safety for the cleanup path. |
 | #22 | `febae24` | 2026-11-02 | **Deletion-boundary revalidation**: cleanup now rechecks delivery state, file identity, pending consumers, path and actual bytes inside the final SQLite write transaction. Changed files are retained. |
-| #26 | `57fede5` | 2026-11-04 | Payment gating: `file`/`info`/`paid_email` may only be claimed and cleaned for a **paid** order; also the durable paid-email outbox. |
+| #26 | `57fede5` | 2026-11-04 | **Payment gating** — `file`/`info`/`paid_email` may only be claimed, delivered and cleaned for a **paid** order — plus the durable paid-email outbox. This is where the unpaid-delivery hole was actually closed. |
 
 All four are ancestors of the target main (`git merge-base --is-ancestor`), and the
 target main is `50191b5`, which also contains the PR #28 backup safety work.
@@ -86,7 +89,7 @@ target main is `50191b5`, which also contains the PR #28 backup safety work.
 | # | Requirement | Evidence |
 |---|---|---|
 | 4 | Unpaid orders cannot trigger delivery | `delivery.py:128` — `claim_due` only selects `file`/`info`/`paid_email` when `orders.payment_status='paid'`; `main.py:1091` — `deliver_job` calls `require_paid_order(job["order_id"])` (`main.py:817`) |
-| 5 | Unpaid orders cannot trigger local deletion | `delivery.py:332-333` — the cleanup transaction rechecks payment and marks `not_applicable` instead of unlinking; `delivery.py:593-594` rechecks again at the final boundary; `delivery.py:687` filters cleanup candidates on paid |
+| 5 | Unpaid orders cannot trigger local deletion | `delivery.py:332-333` — the cleanup transaction rechecks payment and **returns `False` without unlinking** (it does not mark the job `not_applicable`; that state is used for kinds that have no local file, such as `info`/`admin_email`); `delivery.py:593-594` rechecks again at the final boundary; `delivery.py:687` filters cleanup candidates on paid |
 | 6 | Failed Yandex operations preserve retryable state | The upload path now raises rather than returning: `main.py:933` (no token), `main.py:1018` (missing href), `main.py:1036` ("Yandex upload was not confirmed by resource metadata"), plus folder/lookup failures at `:829-878`. A raise marks the job `failed`, increments `attempts` and **retains the source**; nothing deletes on an unconfirmed upload |
 | 7 | Cleanup cannot remove files required by unfinished orders | `delivery.py:289-297` documents and enforces nine preconditions: `delivered` state, fencing lease, path confinement, `order_id` prefix isolation, size+SHA-256 identity, **no other unfinished job referencing the same path**, durable `cleanup_phase='deleting'` intent committed before unlink, lease re-validation inside the write transaction, and idempotent crash recovery |
 | 8 | Worker retries cannot bypass payment validation | The paid predicate lives in the claim query (`delivery.py:128`), so every claim re-evaluates it; the dispatcher re-asserts it (`main.py:1091`), and cleanup re-asserts it twice (`delivery.py:332`, `:593`). There is no path that delivers or deletes without re-reading `payment_status` |

@@ -45,6 +45,7 @@ import tarfile
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
+from sqlite_uri import readonly_uri  # noqa: E402
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -342,7 +343,7 @@ def _audit_db_and_tar(db_path: Path, tar_path: Path, archive_report: Dict[str, A
 
     conn = None
     try:
-        conn = sqlite3.connect(f"file:{db_path.resolve().as_posix()}?mode=ro", uri=True, timeout=10.0)
+        conn = sqlite3.connect(readonly_uri(db_path), uri=True, timeout=10.0)
         conn.row_factory = sqlite3.Row
 
         integrity = conn.execute("PRAGMA integrity_check;").fetchone()[0]

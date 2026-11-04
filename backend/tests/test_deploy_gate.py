@@ -90,20 +90,80 @@ def run_gate(tmp_path: Path, **env_overrides) -> subprocess.CompletedProcess:
                           capture_output=True, text=True, timeout=180)
 
 
-def test_cold_start_passes(tmp_path):
-    result = run_gate(tmp_path, GATE_MODE="cold")
+def _quiet_live(tmp_path: Path, *, with_outbox: bool = True):
+    """A live database plus a backup taken of it, with no writer in flight."""
+    from backup_set_builder import backup_from_live
+
+    live_db = tmp_path / "live" / "orders.db"
+    uploads = tmp_path / "live" / "uploads"
+    build_database(live_db, uploads, with_outbox=with_outbox)
+    _age_live_orders(live_db, NOW - timedelta(hours=1))
+    import sqlite3
+    conn = sqlite3.connect(live_db)
+    try:
+        conn.execute("UPDATE delivery_jobs SET state='pending', lease_until=NULL "
+                     "WHERE state='processing'")
+        conn.commit()
+    finally:
+        conn.close()
+    backups = tmp_path / "backups"
+    backup, _ = backup_from_live(live_db, uploads, backups / "20260101T000000Z")
+    return backups, live_db
+
+
+def test_cold_start_passes_only_when_absence_is_proven(tmp_path):
+    result = run_gate(tmp_path, GATE_MODE="cold", DB_ABSENCE_PROVEN="1")
     assert result.returncode == 0, result.stderr
-    assert "Cold start" in result.stderr
+    assert "Cold start proven" in result.stderr
+
+
+def test_cold_start_without_proof_is_refused(tmp_path):
+    """An unproven cold start could hide an unreadable database behind 'empty'."""
+    result = run_gate(tmp_path, GATE_MODE="cold")
+    assert result.returncode == 1, result.stderr
+    assert "cold start refused" in result.stderr
+
+
+def test_auto_mode_without_any_configuration_is_refused(tmp_path):
+    """No LIVE_DB and no DB_VOLUME must be an error, never a silent cold start."""
+    result = run_gate(tmp_path, GATE_MODE="auto")
+    assert result.returncode == 1, result.stderr
+    assert "cannot determine the database" in result.stderr
+
+
+def test_host_mode_with_a_missing_live_db_is_refused(tmp_path):
+    result = run_gate(tmp_path, GATE_MODE="host", LIVE_DB=tmp_path / "absent.db")
+    assert result.returncode == 1, result.stderr
+    assert "not a readable file" in result.stderr
+
+
+def test_skip_is_resolved_before_cold_start(tmp_path):
+    """SKIP must be honoured (exit 2) even when the mode would resolve to cold."""
+    result = run_gate(tmp_path, GATE_MODE="cold", SKIP_BACKUP_GATE="1")
+    assert result.returncode == 2, result.stderr
+    assert "SKIP_BACKUP_GATE=1" in result.stderr
+
+
+@pytest.mark.parametrize("value", ["nan", "inf", "-inf", "0", "-1", "abc", "24; touch /tmp/x",
+                                   "1e999", "0.0"])
+def test_invalid_age_value_is_refused(tmp_path, value):
+    """A NaN threshold would silently disable freshness; reject it in the wrapper."""
+    result = run_gate(tmp_path, GATE_MODE="cold", DB_ABSENCE_PROVEN="1",
+                      BACKUP_MAX_AGE_HOURS=value)
+    assert result.returncode == 1, f"{value!r} should be rejected: {result.stderr}"
+    assert "BACKUP_MAX_AGE_HOURS" in result.stderr
+
+
+def test_empty_age_value_falls_back_to_the_default(tmp_path):
+    """An unset/empty variable means 'default', not 'no limit'."""
+    result = run_gate(tmp_path, GATE_MODE="cold", DB_ABSENCE_PROVEN="1",
+                      BACKUP_MAX_AGE_HOURS="")
+    assert result.returncode == 0, result.stderr
 
 
 def test_passes_with_a_current_verified_backup(tmp_path):
-    backups = tmp_path / "backups"
-    make_backup_set(backups, created=NOW)
-    live = tmp_path / "live"
-    build_database(live / "orders.db", live / "uploads", with_outbox=True)
-    _age_live_orders(live / "orders.db", NOW - timedelta(hours=1))
-
-    result = run_gate(tmp_path, BACKUP_ROOT=backups, LIVE_DB=live / "orders.db")
+    backups, live_db = _quiet_live(tmp_path)
+    result = run_gate(tmp_path, BACKUP_ROOT=backups, LIVE_DB=live_db)
     assert result.returncode == 0, result.stderr
     assert "gate passed" in result.stderr.lower()
 

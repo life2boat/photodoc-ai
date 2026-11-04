@@ -142,14 +142,52 @@ The gate is fail-closed and returns distinct exit codes:
 
 | Exit | Meaning |
 |---|---|
-| 0 | A verified, current set exists |
+| 0 | A verified, current set exists and matches the live database |
 | 2 | No complete backup set found |
-| 3 | A set exists but is not verified |
+| 3 | A set exists but is not verified, the archive cannot be re-verified, or the backup does not match the live rows |
 | 4 | Too old, or **older than the newest live order** |
 | 5 | Writers are in flight (when `--require-quiescent`) |
+| 6 | Invalid configuration (bad age value, contradictory flags, missing input) |
 
 `--require-outbox` is mandatory once the paid-email outbox exists: restoring a set
 without it loses the evidence that decides whether an ambiguous email may be resent.
+
+**`--deep` is not optional for a deployment.** `deploy_backup_gate.sh` always passes it,
+in both the host and the Docker path, and the check fails closed if the verifier module
+cannot be imported — a deep check that silently degrades to "not checked" is worse than
+none, because the deployment would proceed believing the archive was verified. Size the
+container's writable `/tmp` for the extracted archive (the wrapper uses 1 GiB).
+
+**The gate compares rows, not counts.** With `--live-db` it reads the live database in a
+single `BEGIN` transaction and compares, per row: every live order (id, `payment_status`,
+`payment_amount`, `paid_at`, `payment_email_sent_at`) and every delivery job (id, kind,
+state, attempts, cleanup state/phase, deletion timestamp, content digest), plus every
+`paid_email_outbox` row when the table exists. Equal counts with different content are
+rejected — a backup that still says `unpaid` where live says `paid`, or one that lost the
+record of an ambiguous email attempt, is not a rollback point.
+
+**Quiescence is enforced, not assumed.** `--require-quiescent` now requires `--db` or
+`--live-db`; without one the gate exits `6` instead of silently skipping the check. The
+worker check and the in-flight delivery/cleanup counts come from the same snapshot as the
+row comparison, so a writer cannot slip between the two.
+
+**Freshness values are validated.** `--max-age-hours` (and `BACKUP_MAX_AGE_HOURS`) must be
+a finite positive number below ten years. `nan`, `inf`, `-1`, `0` and non-numeric values
+are rejected: every comparison against NaN is false, so a stray `nan` would silently
+disable the age check entirely.
+
+### 4.1.0 Ordering: gate first, mutate second
+
+In `deploy_staging_prebuilt.sh` the database-presence probe (`[7a/10]`) runs as root so a
+permission error cannot masquerade as "no database"; the backup gate (`[7b/10]`) runs
+next; only then does the schema migration (`[7c/10]`) touch the live database. A failed
+gate therefore leaves the database exactly as it was, and a failed migration aborts the
+deployment instead of starting the application against a half-applied schema.
+
+A cold start is only accepted when the deployment script has positively proven that no
+database file exists (`DB_ABSENCE_PROVEN=1`). An unreachable volume, a missing
+configuration or an auto-detected mode with neither `LIVE_DB` nor `DB_VOLUME` is an error,
+never a cold start.
 
 ### 4.1.1 The one-time pre-outbox transition
 
@@ -172,10 +210,15 @@ check; on top of that the transition is refused unless:
 * the **live** database has no `paid_email_outbox` (once it does, the flag is an error —
   the transition is over and the normal requirement applies again);
 * the **backup** has no `paid_email_outbox` (if it does, use the normal gate);
-* the backup holds **no less email evidence than the live database** — comparing
-  `orders`, `delivery_jobs`, `delivery_jobs WHERE kind='paid_email'` and
-  `orders WHERE payment_email_sent_at IS NOT NULL`. Fewer of any of these in the backup
-  means attempting the transition could discard evidence, and the gate refuses.
+* the backup preserves **every live row**, compared field by field — each order's
+  payment state, amount, `paid_at` and `payment_email_sent_at`, and each delivery job's
+  kind, state, attempts, cleanup state/phase, deletion timestamp and content digest.
+  An order or job that exists only in the live database is refused, and so is any
+  material difference in a shared row: restoring such a backup would roll a payment back
+  or erase the record that an email attempt was ambiguous.
+
+Counts are never used as evidence. Both sides are read in one transaction each, so the
+comparison describes a single moment rather than a sequence of queries.
 
 It is independent of `SKIP_BACKUP_GATE` (which still aborts the deployment) and it
 cannot be enabled together with `--require-outbox`. The run prints a bordered warning

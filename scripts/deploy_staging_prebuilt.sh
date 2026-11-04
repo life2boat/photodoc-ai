@@ -283,65 +283,61 @@ fi
 echo "       Resolved Compose configuration is valid and zero-build."
 
 # ==============================================================================
-# Step 8: Safe Database Migration Check & Application
+# Step 7a: Determine whether a database exists — proven, not assumed
 # ==============================================================================
-echo "[7/10] Checking SQLite Database Schema & Migrations..."
+# Everything below depends on this answer, so an inconclusive probe is fatal.
+# The probe runs as root: under an unprivileged UID a permission error is
+# indistinguishable from "the file is not there", which is how a permission
+# problem could previously be misread as a cold start.
+echo "[7a/10] Determining whether a staging database exists..."
 
 DB_VOLUME="photodoc_staging_backend-data"
+DB_STATE="absent"     # absent | present
+DB_ABSENCE_PROVEN=0
 
-# Check if staging DB volume exists
 if docker volume inspect "${DB_VOLUME}" >/dev/null 2>&1; then
-    echo "       Found existing staging database volume '${DB_VOLUME}'. Data will be preserved."
-
-    # Run read-only schema compatibility inspection
-    echo "       Running read-only migration pre-check..."
-    docker run --rm --user 65534:65534 \
+    set +e
+    docker run --rm --user 0 \
         -v "${DB_VOLUME}:/data:ro" \
         "${PHOTODOC_BACKEND_IMAGE}" \
-        python migrations/reconcile_delivery_schema.py --db /data/orders.db --check || true
-
-    # Run additive migration if orders.db exists
-    docker run --rm --user 0 \
-        -v "${DB_VOLUME}:/data" \
-        "${PHOTODOC_BACKEND_IMAGE}" \
-        python -c "import os, sys; sys.exit(0 if os.path.exists('/data/orders.db') else 1)" && {
-            echo "       Applying additive P1 delivery schema reconciliation..."
-            docker run --rm --user 0 \
-                -v "${DB_VOLUME}:/data" \
-                "${PHOTODOC_BACKEND_IMAGE}" \
-                python migrations/reconcile_delivery_schema.py --db /data/orders.db --apply
-        } || {
-            echo "       No existing orders.db found in volume; fresh staging DB will initialize on startup."
-        }
+        python -c "import os,sys
+p='/data/orders.db'
+if os.path.exists(p):
+    sys.exit(0)
+if not os.path.isdir('/data'):
+    sys.exit(3)
+sys.exit(1)"
+    DB_PROBE=$?
+    set -e
+    case "${DB_PROBE}" in
+        0) DB_STATE="present" ;;
+        1) DB_STATE="absent"; DB_ABSENCE_PROVEN=1 ;;
+        *) echo "FATAL: cannot determine whether a database exists (probe exit ${DB_PROBE})."
+           echo "       Refusing to treat an unreadable volume as a cold start."
+           exit 1 ;;
+    esac
+    echo "       Volume '${DB_VOLUME}' exists; database state: ${DB_STATE}."
 else
-    echo "       Staging database volume does not exist yet. Volume will be created and fresh staging DB initialized."
+    DB_STATE="absent"
+    DB_ABSENCE_PROVEN=1
+    echo "       Volume '${DB_VOLUME}' does not exist; this is a genuine cold start."
 fi
 
 # ==============================================================================
-# Step 8b: Rollback Backup Gate (S6-01)
+# Step 7b: Rollback Backup Gate (S6-01) — BEFORE any database mutation
 # ==============================================================================
-# A cutover is only reversible if a verified backup exists that is newer than the
-# data being replaced. The gate itself lives in scripts/deploy_backup_gate.sh so it
-# can be tested without Docker; this step supplies the environment and stops the
-# deployment when the gate refuses.
+# A cutover is only reversible if a verified backup exists that preserves the data
+# being replaced. This must run before the schema migration below: migrating first
+# would change the live database before we know a rollback point exists, and would
+# also change the schema the gate is asked to approve.
 echo "[7b/10] Verifying rollback backup gate..."
 
 BACKUP_ROOT="${BACKUP_ROOT:-/var/backups/photodoc}"
 BACKUP_MAX_AGE_HOURS="${BACKUP_MAX_AGE_HOURS:-24}"
 
-DB_HAS_DATA=0
-if docker volume inspect "${DB_VOLUME}" >/dev/null 2>&1; then
-    if docker run --rm --user 65534:65534 \
-        -v "${DB_VOLUME}:/data:ro" \
-        "${PHOTODOC_BACKEND_IMAGE}" \
-        python -c "import os, sys; sys.exit(0 if os.path.exists('/data/orders.db') else 1)" 2>/dev/null; then
-        DB_HAS_DATA=1
-    fi
-fi
-
 GATE_STATUS=0
 set +e
-if [[ "${DB_HAS_DATA}" -eq 1 ]]; then
+if [[ "${DB_STATE}" == "present" ]]; then
     DB_VOLUME="${DB_VOLUME}" \
     BACKUP_ROOT="${BACKUP_ROOT}" \
     BACKUP_MAX_AGE_HOURS="${BACKUP_MAX_AGE_HOURS}" \
@@ -352,8 +348,8 @@ if [[ "${DB_HAS_DATA}" -eq 1 ]]; then
     bash "${REPO_ROOT}/scripts/deploy_backup_gate.sh"
     GATE_STATUS=$?
 else
-    # Cold start: there is no database, so there is nothing to protect yet.
-    GATE_MODE=cold REPO_ROOT="${REPO_ROOT}" bash "${REPO_ROOT}/scripts/deploy_backup_gate.sh"
+    GATE_MODE=cold DB_ABSENCE_PROVEN="${DB_ABSENCE_PROVEN}" REPO_ROOT="${REPO_ROOT}" \
+        bash "${REPO_ROOT}/scripts/deploy_backup_gate.sh"
     GATE_STATUS=$?
 fi
 set -e
@@ -363,6 +359,59 @@ if [[ "${GATE_STATUS}" -ne 0 ]]; then
     echo "FATAL: backup gate refused this deployment (exit ${GATE_STATUS})."
     echo "       Refusing to touch running data without a verified rollback path."
     exit 1
+fi
+
+# ==============================================================================
+# Step 7c: Safe Database Migration — only AFTER the backup gate passed
+# ==============================================================================
+# The migration mutates the live database. It runs here, not earlier, so that a
+# failed gate always leaves the database exactly as it was. A migration failure is
+# fatal: continuing would start the application against a schema that was
+# half-applied.
+if [[ "${DB_STATE}" == "present" ]]; then
+    echo "[7c/10] Reconciling SQLite database schema..."
+
+    echo "       Running read-only migration pre-check..."
+    set +e
+    docker run --rm --user 0 \
+        -v "${DB_VOLUME}:/data:ro" \
+        "${PHOTODOC_BACKEND_IMAGE}" \
+        python migrations/reconcile_delivery_schema.py --db /data/orders.db --check
+    CHECK_RC=$?
+    set -e
+    if [[ "${CHECK_RC}" -gt 1 ]]; then
+        echo "FATAL: migration pre-check failed (exit ${CHECK_RC})."
+        exit 1
+    fi
+
+    echo "       Applying additive P1 delivery schema reconciliation..."
+    set +e
+    docker run --rm --user 0 \
+        -v "${DB_VOLUME}:/data" \
+        "${PHOTODOC_BACKEND_IMAGE}" \
+        python migrations/reconcile_delivery_schema.py --db /data/orders.db --apply
+    APPLY_RC=$?
+    set -e
+    if [[ "${APPLY_RC}" -ne 0 ]]; then
+        echo "FATAL: schema migration failed (exit ${APPLY_RC})."
+        echo "       The database may be partially migrated; do not start the application."
+        exit 1
+    fi
+    echo "       Migration completed. Re-verifying the migrated database read-only..."
+
+    set +e
+    docker run --rm --user 0 \
+        -v "${DB_VOLUME}:/data:ro" \
+        "${PHOTODOC_BACKEND_IMAGE}" \
+        python migrations/reconcile_delivery_schema.py --db /data/orders.db --check
+    RECHECK_RC=$?
+    set -e
+    if [[ "${RECHECK_RC}" -gt 1 ]]; then
+        echo "FATAL: post-migration verification failed (exit ${RECHECK_RC})."
+        exit 1
+    fi
+else
+    echo "[7c/10] No existing database; schema will be created by the application on startup."
 fi
 
 # ==============================================================================
