@@ -1,0 +1,15 @@
+[Unit]
+Description=PhotoDoc AI — twice-daily Let's Encrypt renewal check
+Documentation=https://github.com/life2boat/photodoc-ai
+
+[Timer]
+# Let's Encrypt certificates are valid for 90 days; certbot renews at 30 days
+# remaining. Two runs per day with a randomised delay is the certbot-recommended
+# cadence and avoids a thundering herd against the ACME endpoint.
+OnCalendar=*-*-* 00,12:00:00
+RandomizedDelaySec=3600
+Persistent=true
+Unit=photodoc-certbot-renew.service
+
+[Install]
+WantedBy=timers.target

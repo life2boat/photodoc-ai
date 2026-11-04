@@ -1,0 +1,14 @@
+[Unit]
+Description=PhotoDoc AI — renew Let's Encrypt certificates and reload nginx
+Documentation=https://github.com/life2boat/photodoc-ai
+After=network-online.target nginx.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# --webroot must match the `location /.well-known/acme-challenge/` root in
+# infra/nginx/photodoc-http-bootstrap.conf and infra/nginx/photodoc-https.conf.
+ExecStart=/usr/bin/certbot renew --webroot -w /var/www/certbot --quiet --deploy-hook "systemctl reload nginx"
+# A failed renewal must not take the site down; it is reported via `systemctl status`.
+SuccessExitStatus=0
+Nice=10
