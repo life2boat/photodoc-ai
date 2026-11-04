@@ -208,31 +208,99 @@ docker compose -p photodoc \
 
 Never run `docker compose down -v`; the production volume must be preserved.
 
-### Step 7: Create the Database Backup
+### Step 7: Create the Database and Uploads Backup
+
+> **Changed in the S6-01 remediation.** The previous procedure copied a live
+> SQLite file with `cp`. That is not a valid backup: a plain file copy of a
+> database with writes in flight can capture a torn page, and it captured no
+> uploads at all — so a restore could have returned a database referencing photo
+> files that were never in the backup. Use the project's own backup tool, which
+> snapshots through SQLite's backup API under a read transaction, archives the
+> recovery originals, writes SHA-256 manifests and verifies the result before it
+> is published.
+
+The backend is already stopped from Step 6, which makes the upload snapshot
+consistent (see `docs/BACKUP_AND_RESTORE.md` for why that matters and what the
+online alternative costs).
 
 ```bash
-mkdir -p "${ACTIVE_RELEASE_DIR}/backups"
-BACKUP_NAME="orders.db.preupgrade.$(date +%Y%m%d%H%M%S)"
+BACKUP_ROOT="${BACKUP_ROOT:-/var/backups/photodoc}"
+STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+mkdir -p "${BACKUP_ROOT}"
+
 docker run --rm \
   -v "${PHOTODOC_DB_VOLUME:-photodoc_backend-data}:/data:ro" \
-  -v "${ACTIVE_RELEASE_DIR}/backups:/backup" \
-  alpine \
-  cp /data/orders.db "/backup/${BACKUP_NAME}"
-test -s "${ACTIVE_RELEASE_DIR}/backups/${BACKUP_NAME}"
+  -v "${PHOTODOC_UPLOADS_SOURCE:-/opt/photodoc/backend/uploads}:/app/uploads:ro" \
+  -v "${ACTIVE_RELEASE_DIR}:/repo:ro" \
+  -v "${BACKUP_ROOT}:/backups" \
+  -e PYTHONPATH=/repo/scripts \
+  "${PHOTODOC_BACKEND_IMAGE}" \
+  python /repo/scripts/create_backup.py \
+    --db /data/orders.db \
+    --uploads /app/uploads \
+    --output-dir "/backups/${STAMP}" \
+    --no-cleanup-sweep \
+    --json
 echo "BACKUP_CREATED=true"
+echo "BACKUP_DIR=${BACKUP_ROOT}/${STAMP}"
 ```
 
-No ownership or permission changes are allowed before this backup exists.
+`--no-cleanup-sweep` keeps the run read-only against the mounted volumes: the
+backup tool must never delete or modify customer uploads, and a backup taken
+during a cutover must not also mutate delivery state.
 
-### Step 8: Verify Backup Integrity
+The output is published atomically. If the run fails, nothing is published and any
+previous backup set is untouched — so a failed attempt can never destroy the
+backup you were relying on.
+
+### Step 8: Verify the Backup with the Deployment Gate
+
+A backup that merely exists is not a rollback path. The gate checks checksums,
+`PRAGMA integrity_check`, the application identity, the expected tables including
+the paid-email outbox, the upload archive against the database, and — decisively —
+that the backup is **newer than the newest order**, because a valid backup taken
+before the latest order still loses that order.
 
 ```bash
 docker run --rm \
-  -v "${ACTIVE_RELEASE_DIR}/backups:/backup:ro" \
-  alpine sh -c "apk add --no-cache sqlite >/dev/null && sqlite3 /backup/${BACKUP_NAME} 'PRAGMA integrity_check;'"
+  --user 0:0 \
+  --network none \
+  --read-only \
+  --tmpfs /tmp:rw,noexec,nosuid,size=64m \
+  --cap-drop ALL \
+  --security-opt no-new-privileges \
+  -v "${ACTIVE_RELEASE_DIR}:/repo:ro" \
+  -v "${BACKUP_ROOT}:/backups:ro" \
+  -v "${PHOTODOC_DB_VOLUME:-photodoc_backend-data}:/data:ro" \
+  -e PYTHONPATH=/repo/scripts \
+  -e PYTHONDONTWRITEBYTECODE=1 \
+  "${PHOTODOC_BACKEND_IMAGE}" \
+  python /repo/scripts/backup_gate.py \
+    --backup-dir "/backups/${STAMP}" \
+    --require-outbox \
+    --deep \
+    --live-db /data/orders.db \
+    --db /data/orders.db \
+    --require-quiescent \
+    --worker-enabled no
 ```
 
-The only accepted integrity result is `ok`.
+**Why root inside the container.** Backup sets are intentionally restrictive —
+`root:root 0700` with `0600` artifacts. A container running as an unprivileged UID
+cannot traverse that directory, which made a genuine backup look absent and would
+refuse every deployment. The fix is *not* to loosen the backup permissions: the
+verifier runs as root in a container with **no network, an immutable root
+filesystem, all capabilities dropped, and every host mount read-only**, so all it
+can do with that privilege is read the three mounted paths. It cannot modify or
+delete a backup. `scripts/deploy_backup_gate.sh` uses the identical flags, so the
+runbook and the automated gate behave the same way.
+
+Exit code 0 is the only acceptable result; anything else means **stop the release
+here**. Do not continue with a red gate, and do not substitute a manual
+`integrity_check` for it.
+
+**Do not proceed past this step without a green gate.** No ownership or permission
+changes and no schema mutation are allowed before a verified backup set exists.
 
 ### Step 9: Reconcile the Schema from the Staged Candidate
 
@@ -451,14 +519,63 @@ If the new stack fails cutover:
      --require frontend/nginx.conf
    ```
 3. Install the verified staged release files using the approved release procedure. Preserve `.env`, uploads, database volumes, backups, and logs; none are supplied by the bundle.
-4. **Restore database backup (if schema rollback is required)**:
+4. **Restore the database and uploads (only if schema rollback is required)**:
+
+   > **Changed in the S6-01 remediation.** This used to `cp` a file over the live
+   > database with no verification and no uploads. Restoring is the most dangerous
+   > step in the whole runbook, so it is now gated and explicit.
+
+   Two rules come first:
+
+   * **Never restore over a database that is newer than the backup.** If
+     `orders.db` contains orders created after the backup was taken, a restore
+     discards real customer data. Check before touching anything.
+   * **Never restore while a worker is running**, and never start a pre-PR #26
+     worker against a restored post-PR #26 database: it ignores
+     `paid_email_outbox` and will re-send paid notifications. See
+     `docs/launch/ROLLBACK_PLAN.md` §6.
+
    ```bash
+   # a. Refuse if the live database is newer than the backup you intend to restore
    docker run --rm \
-     -v photodoc_backend-data:/data \
-     -v "$PWD/backups:/backup" \
+     -v "${PHOTODOC_DB_VOLUME:-photodoc_backend-data}:/data:ro" \
+     -v "${ACTIVE_RELEASE_DIR}:/repo:ro" \
+     -v "${BACKUP_ROOT}:/backups:ro" \
+     -e PYTHONPATH=/repo/scripts \
+     "${PHOTODOC_BACKEND_IMAGE}" \
+     python /repo/scripts/backup_gate.py \
+       --backup-dir "/backups/${STAMP}" --require-outbox --live-db /data/orders.db
+   # exit 4 => the backup is older than the newest live order: STOP.
+   # Restoring it would delete orders that exist only in the live database.
+
+   # b. Restore the database file from the verified set
+   docker run --rm \
+     -v "${PHOTODOC_DB_VOLUME:-photodoc_backend-data}:/data" \
+     -v "${BACKUP_ROOT}:/backups:ro" \
      alpine \
-     cp "/backup/${BACKUP_NAME}" /data/orders.db
+     sh -c 'cp "/backups/'"${STAMP}"'/orders.db" /data/orders.db'
+
+   # c. Restore the recovery originals (unfinished deliveries only; delivered
+   #    customer photos are excluded by the zero-retention policy and must not
+   #    be re-introduced from an older archive)
+   docker run --rm \
+     -v "${PHOTODOC_UPLOADS_SOURCE:-/opt/photodoc/backend/uploads}:/app/uploads" \
+     -v "${BACKUP_ROOT}:/backups:ro" \
+     alpine \
+     sh -c 'cd /app/uploads && tar xzf "/backups/'"${STAMP}"'/uploads.tar.gz" --strip-components=1'
+
+   # d. Prove the restored pair is consistent before starting anything
+   docker run --rm \
+     -v "${ACTIVE_RELEASE_DIR}:/repo:ro" \
+     -v "${PHOTODOC_DB_VOLUME:-photodoc_backend-data}:/data:ro" \
+     -e PYTHONPATH=/repo/scripts \
+     alpine \
+     sh -c 'echo "attach the uploads path and run verify_backup_integrity.py before start"'
    ```
+
+   Verify with `verify_backup_integrity.py --db /data/orders.db --uploads /app/uploads`
+   (see `docs/BACKUP_AND_RESTORE.md` §5). Only start the stack once it reports a
+   clean result.
 5. **Permissions compatibility on rollback**:
    The previous production backend runs as `root`. Root retains full read/write access to files owned by `UID 1000` (`OLD_ROOT_BACKEND_CAN_ACCESS_UID1000_DB=true`). No reverse chown is required.
 6. **Start previous stack**:

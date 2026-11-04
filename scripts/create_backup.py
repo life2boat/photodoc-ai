@@ -549,6 +549,133 @@ def generate_backup(
     return report["success"], report
 
 
+def generate_backup_atomic(
+    db_path: Path,
+    uploads_dir: Path,
+    output_dir: Path,
+    **kwargs: Any,
+) -> Tuple[bool, Dict[str, Any]]:
+    """Build the backup set off to the side, then publish it with one rename.
+
+    ``generate_backup`` writes straight into its destination, so a run that dies
+    halfway — a full disk, a killed container, an unreadable upload — leaves a
+    directory that *looks* like a backup but cannot be restored, and if the
+    destination already held a good set it has been damaged. Staging the set in a
+    sibling directory and publishing atomically removes both failure modes:
+
+    * on failure the staging directory is removed and the destination is untouched
+      (the previous valid backup survives);
+    * on success the switch is a single ``os.replace``, so no reader can observe a
+      partial set at the published path.
+    """
+    from backup_safety import (
+        STAGING_LOCK_NAME,
+        BackupSafetyError,
+        atomic_publish,
+        staging_dir_for,
+        sweep_staging_dirs,
+        utc_now,
+        verify_backup_set,
+    )
+
+    output_dir = Path(output_dir)
+    try:
+        output_dir.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return False, {
+            "success": False,
+            "errors": [f"cannot create parent directory for backup: {exc}"],
+            "output_dir": str(output_dir),
+            "atomic": True,
+        }
+
+    # Reclaim staging directories abandoned by a killed run. Bounded and
+    # age-gated, so a concurrent backup is never disturbed.
+    try:
+        removed, skipped = sweep_staging_dirs(output_dir.parent)
+        staging_sweep = {"removed": [str(p) for p in removed], "skipped": skipped}
+    except OSError as exc:  # pragma: no cover - sweep must never block a backup
+        staging_sweep = {"removed": [], "skipped": [], "error": str(exc)}
+
+    staging = staging_dir_for(output_dir)
+    try:
+        staging.mkdir(parents=True)
+    except OSError as exc:
+        return False, {
+            "success": False,
+            "errors": [f"cannot create staging directory: {exc}"],
+            "output_dir": str(output_dir),
+            "atomic": True,
+            "staging_sweep": staging_sweep,
+        }
+    # Marks this attempt as live so a concurrent sweep leaves it alone.
+    try:
+        (staging / STAGING_LOCK_NAME).write_text(
+            f"{os.getpid()} {utc_now().isoformat()}\n", encoding="utf-8")
+    except OSError:
+        pass
+
+    try:
+        success, report = generate_backup(
+            db_path=db_path, uploads_dir=uploads_dir, output_dir=staging, **kwargs)
+        report["atomic"] = True
+        report["staging_dir"] = str(staging)
+
+        if not success:
+            # Fail closed: the published path is never touched on failure.
+            shutil.rmtree(staging, ignore_errors=True)
+            report["output_dir"] = str(output_dir)
+            report["published"] = False
+            report.setdefault("errors", []).append(
+                "backup was not published; any previous valid backup is unchanged")
+            return False, report
+
+        ok, set_report = verify_backup_set(
+            staging,
+            require_verified=not kwargs.get("skip_verification", False),
+            check_upload_archive=False,
+            allow_staging=True,
+        )
+        if not ok:
+            shutil.rmtree(staging, ignore_errors=True)
+            report["errors"].extend(set_report.get("errors", []))
+            report["success"] = False
+            report["output_dir"] = str(output_dir)
+            report["published"] = False
+            report["staging_sweep"] = staging_sweep
+            return False, report
+
+        # The attempt lock is scaffolding, not part of the backup: drop it before
+        # publication so the published set contains only backup artifacts.
+        try:
+            (staging / STAGING_LOCK_NAME).unlink()
+        except OSError:
+            pass
+
+        durability_report: Dict[str, Any] = {}
+        atomic_publish(staging, output_dir, durability=durability_report)
+        report["output_dir"] = str(output_dir)
+        report["published"] = True
+        report["success"] = True
+        report["staging_sweep"] = staging_sweep
+        report["durable_publish"] = True
+        report["durability"] = durability_report
+        return True, report
+    except BackupSafetyError as exc:
+        shutil.rmtree(staging, ignore_errors=True)
+        return False, {
+            "success": False,
+            "errors": [f"atomic publication failed: {exc}"],
+            "output_dir": str(output_dir),
+            "atomic": True,
+            "published": False,
+            "staging_sweep": staging_sweep,
+        }
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+
+
 def print_backup_report(success: bool, report: Dict[str, Any], *, as_json: bool = False) -> None:
     if as_json:
         print(json.dumps({"success": success, "report": report}, indent=2))
@@ -628,7 +755,9 @@ def main_cli() -> int:
 
     args = parser.parse_args()
 
-    success, report = generate_backup(
+    # The CLI always publishes atomically. `generate_backup` remains available as
+    # the in-place primitive for tests and for callers that stage themselves.
+    success, report = generate_backup_atomic(
         db_path=args.db,
         uploads_dir=args.uploads,
         output_dir=args.output_dir,

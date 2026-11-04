@@ -1,0 +1,19 @@
+[Unit]
+# PhotoDoc AI — backup schedule. NOT installed by the repository.
+#
+# Two runs a day: one in the quiet early-morning window for the canonical
+# retention set, one at midday to bound the RPO to ~12 h without paying for more
+# storage than the retention plan needs.
+Description=PhotoDoc AI backup timer
+Documentation=file:///srv/photodoc/docs/BACKUP_AND_RESTORE.md
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+OnCalendar=*-*-* 13:30:00
+RandomizedDelaySec=900
+Persistent=true
+AccuracySec=1min
+Unit=photodoc-backup.service
+
+[Install]
+WantedBy=timers.target
