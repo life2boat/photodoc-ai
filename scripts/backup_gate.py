@@ -29,6 +29,7 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from backup_safety import (  # noqa: E402
+    backup_timestamp,
     check_quiescence,
     verify_backup_set,
 )
@@ -64,7 +65,17 @@ def latest_backup_set(root: Path, *, require_outbox: bool = False,
             candidates.append(entry)
     if not candidates:
         return None
-    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+
+    # Order by the manifest timestamp, not the directory mtime. A set that was
+    # copied, restored or extracted into the backup root carries an mtime from the
+    # copy, not from when the backup was taken, so mtime ordering can promote an
+    # older backup. The manifest is the artifact the verification path trusts.
+    def sort_key(entry: Path) -> tuple:
+        stamp = backup_timestamp(entry)
+        return (stamp is not None, stamp.timestamp() if stamp else 0.0,
+                entry.stat().st_mtime)
+
+    candidates.sort(key=sort_key, reverse=True)
     return candidates[0]
 
 

@@ -43,7 +43,39 @@ that no longer exist.
    references vs archive contents, sizes and digests) before publishing;
 6. publishes **atomically** — it builds in a hidden sibling directory and renames it
    into place, so a failure cannot leave a partial set where a restore would find it,
-   and cannot damage the previous valid set.
+   and cannot damage the previous valid set;
+7. applies **durability barriers** before and after the rename (see §2.1).
+
+### 2.1 Durability barriers, and what they do not prove
+
+A rename is atomic in *visibility*, not in *storage*. Without an explicit flush, a
+power cut can leave the new name pointing at bytes that never reached the disk, or
+revert the rename while the previous entry has already been moved aside. The
+publication path therefore:
+
+1. flushes every artifact (`fsync`) **before** the rename, so the published manifest
+   can never describe unflushed data;
+2. flushes the staging directory;
+3. flushes the parent directory after the `.previous` rotation and again after the
+   rename, so the directory entries themselves are durable.
+
+**What is supported where:**
+
+| Platform | File contents | Directory entries |
+|---|---|---|
+| Linux (the deployment target) | `fsync` — supported | `fsync` on the directory — supported |
+| Windows (development) | flush of a write handle only; reported as *unsupported* when it cannot be done | **not exposed** — reported as `directory_fsync_supported: false` |
+
+The API never pretends a barrier happened: `fsync_file`/`fsync_dir` return `False`
+when the platform cannot perform the flush, and the backup report carries
+`{"files_flushed", "files_unsupported", "directory_fsync_supported"}`.
+
+**This is a best-effort barrier, not a proof of power-loss survival.** It assumes
+the filesystem honours `fsync` and orders the directory entry after it. On a
+network filesystem, an overlay that ignores flushes, or a virtualised disk with a
+volatile write cache, that assumption can be false. What has been *verified* is that
+the process survives being killed at any boundary (see the crash-matrix evidence);
+power-loss behaviour has not been tested on the target hardware.
 
 ## 3. Quiescence: when an online backup is enough, and when it is not
 
@@ -119,15 +151,55 @@ The gate is fail-closed and returns distinct exit codes:
 `--require-outbox` is mandatory once the paid-email outbox exists: restoring a set
 without it loses the evidence that decides whether an ambiguous email may be resent.
 
-### 4.2 Retention
+**Permissions model.** Backup sets are intentionally restrictive: the directory is
+`root:root 0700` and the artifacts are `0600`. Verification therefore runs as root
+*inside a narrowly scoped container* — `--network none`, `--read-only`, all
+capabilities dropped, `no-new-privileges`, a small `tmpfs` for `--deep` extraction, and
+every host mount `:ro`. With that privilege the verifier can only read the three
+mounted paths; it cannot modify or delete a backup and it cannot reach the network. The
+alternative — making backups group/world-readable — was rejected: it would trade a
+permanent confidentiality loss for a temporary convenience.
+
+### 4.2 Retention, `.previous` sets and abandoned attempts
 
 ```bash
 python scripts/backup_retention.py --root "${BACKUP_ROOT}" --require-outbox          # plan
 python scripts/backup_retention.py --root "${BACKUP_ROOT}" --require-outbox --apply  # prune
+
+# also reclaim staging directories left by killed attempts
+python scripts/backup_retention.py --root "${BACKUP_ROOT}" --apply --sweep-staging
 ```
 
 Default plan: 7 most recent, 14 daily, 8 weekly. The newest set is never pruned, and
-the tool refuses to prune if it would leave no verified set at all.
+the tool **refuses to prune at all if no published set currently verifies** — pruning
+must never run on the assumption that a replacement succeeded.
+
+**`.previous` sets.** Replacing a backup keeps the displaced copy as
+`<name>.previous` (and older displacements as `<name>.previous-<stamp>`). These are a
+fallback, not archives: `--keep-previous` (default 2) retains the most recent ones and
+prunes the rest, so disk use does not grow without bound. A `.previous` is never
+treated as the primary copy, and retention refuses to prune when there is no verified
+published set to fall back *from*.
+
+**Abandoned staging (`.tmp-*`).** A killed backup leaves its staging directory behind.
+`create_backup.py` sweeps them at the start of every run, and `--sweep-staging` does it
+on demand. The sweep is deliberately conservative:
+
+* only names beginning with `.tmp-` are considered, so a **published backup can never
+  be removed** by it;
+* symlinks are refused, never followed;
+* an attempt is treated as live if its `.attempt-lock` (or the directory itself) was
+  touched within 180 minutes, so a concurrent backup is never disturbed;
+* anything younger than `--staging-min-age-hours` (default 24 h) is skipped;
+* every skip is reported with a reason, so a run is bounded and explainable.
+
+### 4.3 Which backup is "the latest"
+
+Selection uses the **manifest timestamp**, not the directory modification time. A set
+that was copied, restored or extracted into the backup root carries the copy's mtime,
+which can make an older backup look newest. Directory mtime is only a fallback when the
+manifest is unreadable — and a set whose manifest cannot be read fails verification, so
+it is never selected.
 
 ## 5. Restoring
 
@@ -243,3 +315,6 @@ restic/rclone; and why backups run inside the backend image (which has Python an
 | Backup set stores plaintext PII inside the archive (before encryption) | Mitigated by `chmod 600` on host and encryption before any transfer; the local archive itself is not encrypted at rest |
 | Retention/pruning is manual until the timer is enabled | **OPEN** |
 | Restore rehearsal covers the current schema, not a byte-for-byte production restore | Documented; the rehearsal is synthetic by design |
+| Power-loss survival is not proven | `fsync` barriers are in place (§2.1), but durability depends on the filesystem honouring them. Verified for process kill only. Unproven on the target hardware and on Windows, where the directory barrier does not exist. |
+| Docker-mode gate execution not verified in development | The permission model is covered by static tests; the container invocation itself has not been run outside a host with Docker (`docker` is absent in the development environment). |
+| Kernel/driver write caches | `fsync` cannot force data out of a drive's volatile cache; a UPS or a barrier-aware storage stack is the only further mitigation |

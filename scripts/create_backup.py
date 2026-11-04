@@ -568,7 +568,15 @@ def generate_backup_atomic(
     * on success the switch is a single ``os.replace``, so no reader can observe a
       partial set at the published path.
     """
-    from backup_safety import BackupSafetyError, atomic_publish, staging_dir_for, verify_backup_set
+    from backup_safety import (
+        STAGING_LOCK_NAME,
+        BackupSafetyError,
+        atomic_publish,
+        staging_dir_for,
+        sweep_staging_dirs,
+        utc_now,
+        verify_backup_set,
+    )
 
     output_dir = Path(output_dir)
     try:
@@ -581,6 +589,14 @@ def generate_backup_atomic(
             "atomic": True,
         }
 
+    # Reclaim staging directories abandoned by a killed run. Bounded and
+    # age-gated, so a concurrent backup is never disturbed.
+    try:
+        removed, skipped = sweep_staging_dirs(output_dir.parent)
+        staging_sweep = {"removed": [str(p) for p in removed], "skipped": skipped}
+    except OSError as exc:  # pragma: no cover - sweep must never block a backup
+        staging_sweep = {"removed": [], "skipped": [], "error": str(exc)}
+
     staging = staging_dir_for(output_dir)
     try:
         staging.mkdir(parents=True)
@@ -590,7 +606,14 @@ def generate_backup_atomic(
             "errors": [f"cannot create staging directory: {exc}"],
             "output_dir": str(output_dir),
             "atomic": True,
+            "staging_sweep": staging_sweep,
         }
+    # Marks this attempt as live so a concurrent sweep leaves it alone.
+    try:
+        (staging / STAGING_LOCK_NAME).write_text(
+            f"{os.getpid()} {utc_now().isoformat()}\n", encoding="utf-8")
+    except OSError:
+        pass
 
     try:
         success, report = generate_backup(
@@ -619,12 +642,24 @@ def generate_backup_atomic(
             report["success"] = False
             report["output_dir"] = str(output_dir)
             report["published"] = False
+            report["staging_sweep"] = staging_sweep
             return False, report
 
-        atomic_publish(staging, output_dir)
+        # The attempt lock is scaffolding, not part of the backup: drop it before
+        # publication so the published set contains only backup artifacts.
+        try:
+            (staging / STAGING_LOCK_NAME).unlink()
+        except OSError:
+            pass
+
+        durability_report: Dict[str, Any] = {}
+        atomic_publish(staging, output_dir, durability=durability_report)
         report["output_dir"] = str(output_dir)
         report["published"] = True
         report["success"] = True
+        report["staging_sweep"] = staging_sweep
+        report["durable_publish"] = True
+        report["durability"] = durability_report
         return True, report
     except BackupSafetyError as exc:
         shutil.rmtree(staging, ignore_errors=True)
@@ -634,6 +669,7 @@ def generate_backup_atomic(
             "output_dir": str(output_dir),
             "atomic": True,
             "published": False,
+            "staging_sweep": staging_sweep,
         }
     except BaseException:
         shutil.rmtree(staging, ignore_errors=True)

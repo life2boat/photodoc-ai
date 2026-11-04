@@ -263,10 +263,17 @@ before the latest order still loses that order.
 
 ```bash
 docker run --rm \
+  --user 0:0 \
+  --network none \
+  --read-only \
+  --tmpfs /tmp:rw,noexec,nosuid,size=64m \
+  --cap-drop ALL \
+  --security-opt no-new-privileges \
   -v "${ACTIVE_RELEASE_DIR}:/repo:ro" \
   -v "${BACKUP_ROOT}:/backups:ro" \
   -v "${PHOTODOC_DB_VOLUME:-photodoc_backend-data}:/data:ro" \
   -e PYTHONPATH=/repo/scripts \
+  -e PYTHONDONTWRITEBYTECODE=1 \
   "${PHOTODOC_BACKEND_IMAGE}" \
   python /repo/scripts/backup_gate.py \
     --backup-dir "/backups/${STAMP}" \
@@ -277,6 +284,16 @@ docker run --rm \
     --require-quiescent \
     --worker-enabled no
 ```
+
+**Why root inside the container.** Backup sets are intentionally restrictive —
+`root:root 0700` with `0600` artifacts. A container running as an unprivileged UID
+cannot traverse that directory, which made a genuine backup look absent and would
+refuse every deployment. The fix is *not* to loosen the backup permissions: the
+verifier runs as root in a container with **no network, an immutable root
+filesystem, all capabilities dropped, and every host mount read-only**, so all it
+can do with that privilege is read the three mounted paths. It cannot modify or
+delete a backup. `scripts/deploy_backup_gate.sh` uses the identical flags, so the
+runbook and the automated gate behave the same way.
 
 Exit code 0 is the only acceptable result; anything else means **stop the release
 here**. Do not continue with a red gate, and do not substitute a manual

@@ -75,11 +75,36 @@ elif [[ "${GATE_MODE}" == "docker" ]]; then
         log "FATAL: PHOTODOC_BACKEND_IMAGE is required to run the gate against a volume."
         exit 1
     fi
-    docker run --rm --user 65534:65534 \
+
+    # Permission model (fixes the S6-01 review finding H1).
+    #
+    # Backup sets are deliberately restrictive: the directory is root-owned 0700
+    # and the artifacts 0600. A previous version of this wrapper dropped to
+    # --user 65534:65534, which cannot traverse that directory, so a genuine
+    # backup was reported as missing and every deployment was refused. Making the
+    # backups world-readable to work around that would be worse.
+    #
+    # Instead the verifier runs as root *inside a narrowly scoped container*:
+    #   --network none        no network at all (the gate performs no I/O off-host)
+    #   --read-only           container filesystem immutable
+    #   --tmpfs /tmp:...      the only writable location, for --deep extraction
+    #   --cap-drop ALL        no capabilities
+    #   no-new-privileges     cannot regain privileges
+    #   every host mount is :ro, so the container cannot modify or delete backups
+    # Running as root here only grants read access to the mounted paths; with all
+    # three mounts read-only and no network there is nothing else it can reach.
+    docker run --rm \
+        --user 0:0 \
+        --network none \
+        --read-only \
+        --tmpfs /tmp:rw,noexec,nosuid,size=64m \
+        --cap-drop ALL \
+        --security-opt no-new-privileges \
         -v "${REPO_ROOT}:/repo:ro" \
         -v "${BACKUP_ROOT}:/backups:ro" \
         -v "${DB_VOLUME}:/data:ro" \
         -e PYTHONPATH=/repo/scripts \
+        -e PYTHONDONTWRITEBYTECODE=1 \
         "${PHOTODOC_BACKEND_IMAGE}" \
         python /repo/scripts/backup_gate.py \
             --latest-of /backups \

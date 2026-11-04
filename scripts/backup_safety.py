@@ -76,12 +76,104 @@ def _is_safe_child(base: Path, target: Path) -> bool:
 
 
 # --------------------------------------------------------------------------- publish
-def atomic_publish(tmp_dir: Path, final_dir: Path, *, replace: bool = True) -> Path:
+#: Set when the platform cannot flush a directory entry (Windows). Durability of
+#: the rename itself is then unprovable, which is reported rather than assumed.
+DIRECTORY_FSYNC_SUPPORTED = os.name == "posix"
+
+
+def fsync_file(path: Path) -> bool:
+    """Flush one file's contents to stable storage. Returns False if unsupported.
+
+    ``os.replace`` makes a new name *visible*; it does not make the bytes durable.
+    Every artifact is flushed before the rename so a published set can never
+    reference data that only exists in cache.
+
+    Platform note: Windows only flushes handles with write access, and the
+    directory-entry barrier is not exposed at all. Rather than pretend, an
+    unsupported flush returns False so the caller can report degraded durability.
+    """
+    path = Path(path)
+    if path.is_symlink():
+        raise BackupSafetyError(f"refusing to fsync a symlink: {path}")
+
+    fd = None
+    for flags in (os.O_RDWR, os.O_RDONLY):
+        try:
+            fd = os.open(path, flags)
+            break
+        except OSError:
+            continue
+    if fd is None:
+        if os.name == "nt":  # pragma: no cover - Windows handle semantics
+            return False
+        raise BackupSafetyError(f"cannot open for fsync: {path}")
+    try:
+        os.fsync(fd)
+        return True
+    except OSError:
+        if os.name == "nt":  # pragma: no cover - Windows handle semantics
+            return False
+        raise BackupSafetyError(f"fsync failed for {path}")
+    finally:
+        os.close(fd)
+
+
+def fsync_dir(path: Path) -> bool:
+    """Flush a directory entry (the rename/rotation itself).
+
+    Returns False when the platform does not support it instead of pretending the
+    barrier happened.
+    """
+    path = Path(path)
+    if not DIRECTORY_FSYNC_SUPPORTED:
+        return False
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return False
+    try:
+        os.fsync(fd)
+        return True
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+
+
+def fsync_tree(root: Path) -> Tuple[int, int]:
+    """Flush every regular file below ``root``.
+
+    Returns ``(flushed, unsupported)``. Symlinks are rejected rather than
+    followed: a backup set is produced by this project and must contain only
+    regular files.
+    """
+    root = Path(root)
+    flushed = unsupported = 0
+    for entry in sorted(root.rglob("*")):
+        if entry.is_symlink():
+            raise BackupSafetyError(f"backup set contains a symlink: {entry}")
+        if entry.is_file():
+            if fsync_file(entry):
+                flushed += 1
+            else:
+                unsupported += 1
+    return flushed, unsupported
+
+
+def atomic_publish(tmp_dir: Path, final_dir: Path, *, replace: bool = True,
+                   durable: bool = True,
+                   durability: Optional[Dict[str, Any]] = None) -> Path:
     """Publish ``tmp_dir`` as ``final_dir`` without ever exposing a partial set.
 
     The previous set, if any, is moved aside to ``<final>.previous`` and restored
     if publishing fails. A failed run therefore leaves either the old set or the
     new one — never a half-written mixture, and never nothing.
+
+    With ``durable`` (the default) the contents are flushed before the rename and
+    the containing directories are flushed after it and after the rotation, so the
+    published name points at data that reached storage. This is a best-effort
+    barrier: it is what the filesystem and platform expose, not a proof of
+    power-loss survival (see docs/BACKUP_AND_RESTORE.md).
     """
     tmp_dir = Path(tmp_dir)
     final_dir = Path(final_dir)
@@ -92,8 +184,21 @@ def atomic_publish(tmp_dir: Path, final_dir: Path, *, replace: bool = True) -> P
     if not _is_safe_child(final_dir.parent, tmp_dir):
         raise BackupSafetyError("staging directory is outside the destination parent")
 
+    if durable:
+        # 1. Contents first: the manifest must never describe unflushed bytes.
+        flushed, unsupported = fsync_tree(tmp_dir)
+        dir_ok = fsync_dir(tmp_dir)
+        if durability is not None:
+            durability.update({
+                "files_flushed": flushed,
+                "files_unsupported": unsupported,
+                "staging_dir_flushed": dir_ok,
+                "directory_fsync_supported": DIRECTORY_FSYNC_SUPPORTED,
+            })
+
     previous = final_dir.with_name(final_dir.name + PREVIOUS_SUFFIX)
     moved_previous = False
+    parent = final_dir.parent
 
     if final_dir.exists():
         if not replace:
@@ -105,6 +210,10 @@ def atomic_publish(tmp_dir: Path, final_dir: Path, *, replace: bool = True) -> P
             os.replace(previous, displaced)
         os.replace(final_dir, previous)
         moved_previous = True
+        if durable:
+            # The rotation must be durable before the new set takes the name,
+            # otherwise a power cut could leave neither.
+            fsync_dir(parent)
 
     try:
         os.replace(tmp_dir, final_dir)
@@ -112,11 +221,16 @@ def atomic_publish(tmp_dir: Path, final_dir: Path, *, replace: bool = True) -> P
         if moved_previous and not final_dir.exists():
             try:
                 os.replace(previous, final_dir)
+                if durable:
+                    fsync_dir(parent)
             except OSError:  # pragma: no cover - last-resort reporting
                 raise BackupSafetyError(
                     f"publish failed ({exc}) and the previous set could not be restored; "
                     f"it remains at {previous}") from exc
         raise BackupSafetyError(f"failed to publish backup set: {exc}") from exc
+
+    if durable:
+        fsync_dir(parent)
     return final_dir
 
 
@@ -124,6 +238,136 @@ def staging_dir_for(final_dir: Path) -> Path:
     """Sibling staging directory used while a set is being built."""
     final_dir = Path(final_dir)
     return final_dir.parent / f"{TMP_PREFIX}{final_dir.name}-{uuid.uuid4().hex[:12]}"
+
+
+# ------------------------------------------------------------------ staging sweep
+STAGING_LOCK_NAME = ".attempt-lock"
+
+
+def staging_is_active(staging: Path, *, now: Optional[datetime] = None,
+                      active_window_minutes: int = 180) -> bool:
+    """Report whether a staging directory may still belong to a live attempt.
+
+    A backup for a small VPS finishes in minutes, so an attempt whose lock (or
+    directory) is younger than the window is treated as live regardless of age
+    thresholds. Liveness by PID is not portable, so freshness is the signal.
+    """
+    now = now or utc_now()
+    staging = Path(staging)
+    for candidate in (staging / STAGING_LOCK_NAME, staging):
+        try:
+            mtime = datetime.fromtimestamp(candidate.stat().st_mtime, tz=timezone.utc)
+        except OSError:
+            continue
+        if now - mtime < timedelta(minutes=active_window_minutes):
+            return True
+    return False
+
+
+def sweep_staging_dirs(
+    root: Path,
+    *,
+    min_age_hours: float = 24.0,
+    now: Optional[datetime] = None,
+    dry_run: bool = False,
+    active_window_minutes: int = 180,
+) -> Tuple[List[Path], List[Dict[str, Any]]]:
+    """Remove abandoned ``.tmp-*`` staging directories under ``root``.
+
+    Safety rules, in order:
+
+    * only entries named with the staging prefix are considered at all, so a
+      published backup set can never be removed by this function;
+    * symlinks and non-directories are refused, never followed;
+    * an attempt that still looks live (lock file or directory touched within
+      ``active_window_minutes``) is skipped, so a concurrent run is not clobbered;
+    * anything younger than ``min_age_hours`` is skipped.
+
+    Returns ``(removed, skipped)`` where each skip records the reason, so a caller
+    can log a bounded, explainable outcome.
+    """
+    now = now or utc_now()
+    root = Path(root)
+    removed: List[Path] = []
+    skipped: List[Dict[str, Any]] = []
+    if not root.is_dir():
+        return removed, [{"path": str(root), "reason": "root does not exist"}]
+
+    for entry in sorted(root.iterdir()):
+        if not entry.name.startswith(TMP_PREFIX):
+            continue
+        record = {"path": str(entry)}
+        if entry.is_symlink():
+            skipped.append({**record, "reason": "symlink refused"})
+            continue
+        if not entry.is_dir():
+            skipped.append({**record, "reason": "not a directory"})
+            continue
+        try:
+            age_hours = (now - datetime.fromtimestamp(
+                entry.stat().st_mtime, tz=timezone.utc)).total_seconds() / 3600.0
+        except OSError as exc:
+            skipped.append({**record, "reason": f"unreadable: {exc}"})
+            continue
+        if staging_is_active(entry, now=now, active_window_minutes=active_window_minutes):
+            skipped.append({**record, "reason": "active attempt"})
+            continue
+        if age_hours < min_age_hours:
+            skipped.append({**record, "reason": f"younger than {min_age_hours}h"})
+            continue
+        if dry_run:
+            skipped.append({**record, "reason": "dry run"})
+            continue
+        try:
+            shutil.rmtree(entry)
+            removed.append(entry)
+        except OSError as exc:
+            skipped.append({**record, "reason": f"delete failed: {exc}"})
+    return removed, skipped
+
+
+# ------------------------------------------------------------------- selection
+def backup_timestamp(backup_dir: Path) -> Optional[datetime]:
+    """Creation time from the manifest, falling back to the directory mtime.
+
+    The manifest is the artifact the verification path already trusts; mtime is
+    only a copy artifact (``cp``, restore, archive extraction) and must not decide
+    which backup is newest.
+    """
+    backup_dir = Path(backup_dir)
+    manifest = backup_dir / "backup_manifest.json"
+    try:
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+        stamp = payload.get("timestamp")
+        if stamp:
+            parsed = datetime.fromisoformat(str(stamp))
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    except (OSError, ValueError, json.JSONDecodeError):
+        pass
+    try:
+        return datetime.fromtimestamp(backup_dir.stat().st_mtime, tz=timezone.utc)
+    except OSError:
+        return None
+
+
+# --------------------------------------------------------- previous retention
+def plan_previous_retention(
+    previous_sets: Sequence[Tuple[Path, datetime]],
+    *,
+    keep: int = 2,
+    now: Optional[datetime] = None,
+) -> Tuple[List[Path], List[Path]]:
+    """Plan pruning of ``.previous`` sets while keeping the recent ones.
+
+    ``.previous`` exists so a replaced backup remains recoverable. Keeping every
+    one forever doubles disk use, but keeping none removes the fallback. The
+    newest ``keep`` are always retained regardless of age.
+    """
+    now = now or utc_now()
+    ordered = sorted(previous_sets, key=lambda item: item[1], reverse=True)
+    keep_paths = [path for path, _ in ordered[:max(1, keep)]]
+    prune_paths = [path for path, _ in ordered[max(1, keep):]]
+    return keep_paths, prune_paths
 
 
 # --------------------------------------------------------------------------- verify
