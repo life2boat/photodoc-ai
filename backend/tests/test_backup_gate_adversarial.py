@@ -230,18 +230,25 @@ def test_require_quiescent_without_a_database_is_a_configuration_error(tmp_path,
 
 
 def test_a_processing_job_blocks_the_gate(tmp_path):
-    backup, live = snapshot_pair(tmp_path)
-    conn = sqlite3.connect(live)
+    """The job is in flight when the backup is taken, so evidence matches and only
+    quiescence can reject it."""
+    live_db, uploads = quiet_live(tmp_path)
+    # Pick a file job whose source still exists, so the backup can archive it.
+    conn = sqlite3.connect(live_db)
     try:
-        conn.execute(
-            "UPDATE delivery_jobs SET state='processing', lease_until=? "
-            "WHERE id=(SELECT id FROM delivery_jobs ORDER BY id LIMIT 1)",
-            ((NOW + timedelta(minutes=3)).isoformat(),))
+        candidates = conn.execute(
+            "SELECT id, local_path FROM delivery_jobs WHERE kind='file' AND local_path IS NOT NULL"
+        ).fetchall()
+        target = next(job_id for job_id, local_path in candidates
+                      if (uploads / Path(local_path).name).is_file())
+        conn.execute("UPDATE delivery_jobs SET state='processing', lease_until=? WHERE id=?",
+                     ((NOW + timedelta(minutes=3)).isoformat(), target))
         conn.commit()
     finally:
         conn.close()
+    backup, _ = backup_from_live(live_db, uploads, tmp_path / "backups" / "20260101T000000Z")
 
-    code = run_gate(gate_args(backup, live, "--require-quiescent", "--worker-enabled", "no"))
+    code = run_gate(gate_args(backup, live_db, "--require-quiescent", "--worker-enabled", "no"))
     assert code == backup_gate.EXIT_NOT_QUIESCENT
 
 

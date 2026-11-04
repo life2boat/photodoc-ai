@@ -82,10 +82,31 @@ case "${GATE_MODE}" in
         command -v docker >/dev/null 2>&1 || fail "GATE_MODE=docker but docker is not available"
         ;;
     cold)
+        # A cold start skips the backup gate entirely, so it needs positive evidence,
+        # not a variable set by the code that is about to benefit from it.
         if [[ "${DB_ABSENCE_PROVEN:-0}" != "1" ]]; then
             fail "cold start refused: the absence of an existing database has not been proven. Pass DB_ABSENCE_PROVEN=1 only after positively establishing that no database file exists."
         fi
-        log "       Cold start proven: no existing database, so there is no data to protect yet."
+        if [[ -n "${LIVE_DB}" && -e "${LIVE_DB}" ]]; then
+            fail "cold start refused: LIVE_DB (${LIVE_DB}) exists, which contradicts the claimed absence."
+        fi
+        if [[ -n "${DB_VOLUME}" ]] && command -v docker >/dev/null 2>&1; then
+            # Re-prove absence independently: a daemon or permission error must not
+            # be read as "the volume does not exist".
+            docker info >/dev/null 2>&1 || fail "cold start refused: the Docker daemon is unreachable, so absence cannot be confirmed."
+            set +e
+            _volume_error=$(docker volume inspect "${DB_VOLUME}" 2>&1)
+            _volume_rc=$?
+            set -e
+            if [[ "${_volume_rc}" -eq 0 ]]; then
+                fail "cold start refused: volume '${DB_VOLUME}' exists, so the absence of a database inside it cannot be proven from here."
+            fi
+            case "${_volume_error}" in
+                *"no such volume"*|*"No such volume"*|*"no such object"*) ;;
+                *) fail "cold start refused: cannot distinguish an absent volume from an error (${_volume_error})." ;;
+            esac
+        fi
+        log "       Cold start proven (${DB_ABSENCE_EVIDENCE:-evidence supplied}): no existing database."
         log "       (Once a database exists, this deployment will refuse to proceed without a verified backup.)"
         exit 0
         ;;
@@ -93,6 +114,19 @@ case "${GATE_MODE}" in
         fail "unknown GATE_MODE '${GATE_MODE}'"
         ;;
 esac
+
+# The worker state is an input to quiescence. "unknown" is not evidence that the
+# worker is stopped, and a running worker writes to the database mid-deployment, so
+# it is refused rather than assumed.
+case "${WORKER_STATE}" in
+    yes|no) ;;
+    *)
+        fail "DELIVERY_WORKER_ENABLED_STATE must be 'yes' or 'no' (got '${WORKER_STATE}'). The worker state is required to prove quiescence; an unknown state cannot be assumed safe."
+        ;;
+esac
+if [[ "${WORKER_STATE}" == "yes" ]]; then
+    fail "the delivery worker is enabled; stop it before gathering a rollback point (DELIVERY_WORKER_ENABLED=0)."
+fi
 
 if [[ ! -d "${BACKUP_ROOT}" ]]; then
     log "FATAL: backup root '${BACKUP_ROOT}' does not exist."
@@ -124,7 +158,7 @@ if [[ "${GATE_MODE}" == "host" ]]; then
     PYTHONPATH="${REPO_ROOT}/scripts" "${PYTHON_BIN}" "${REPO_ROOT}/scripts/backup_gate.py" \
         --latest-of "${BACKUP_ROOT}" \
         --deep \
-        --require-quiescent --db "${LIVE_DB}" --worker-enabled "${WORKER_STATE}" \
+        --require-quiescent --require-exclusive-lock --db "${LIVE_DB}" --worker-enabled "${WORKER_STATE}" \
         "${GATE_FLAGS[@]}" \
         --live-db "${LIVE_DB}" \
         --max-age-hours "${BACKUP_MAX_AGE_HOURS}" || GATE_STATUS=$?

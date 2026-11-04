@@ -95,14 +95,52 @@ incompletely.
 **Quiescence procedure (the supported cutover path):**
 
 ```bash
-# 1. stop writers (backup takes seconds-to-minutes; measure on your data volume)
-docker compose -f docker-compose.yml -f docker-compose.production.yml stop backend
-# 2. confirm nothing is in flight
-python3 scripts/backup_gate.py --db /data/orders.db --require-quiescent \
-        --worker-enabled no --json        # only the quiescence section matters here
-# 3. take the backup (Section 4), verify it (Section 4.2)
-# 4. continue the release, or restart: docker compose ... start backend
+# 1. stop every writer — the application container is a writer even with the
+#    delivery worker disabled, because order intake writes to the database.
+docker compose -p photodoc-staging stop backend
+
+# 2. prove exclusion and quiescence (read-only; run this exact command)
+python3 scripts/writer_barrier.py \
+    --db /var/lib/docker/volumes/photodoc_staging_backend-data/_data/orders.db \
+    --volume photodoc_staging_backend-data
+python3 scripts/backup_gate.py --quiescence-only \
+    --db /var/lib/docker/volumes/photodoc_staging_backend-data/_data/orders.db \
+    --worker-enabled no --require-exclusive-lock --json
+
+# 3. take the backup (§4) and verify it with the gate (§4.1)
+# 4. run the gate again; it must still pass against the same database
+# 5. migrate, cut over, and only then start the application again
 ```
+
+`--quiescence-only` is a standalone mode: it needs a database, not a backup set, so it
+can run before any backup exists. `writer_barrier.py` answers a different question — no
+container is attached to the volume, no host process holds the file open, and an
+exclusive lock is free — and both must pass.
+
+### 3.1 The trusted boundary for writer exclusion
+
+The barrier and the gate can prove that **no writer was detected at a known moment**, and
+that an exclusive lock was obtainable. They cannot prove that nothing writes afterwards:
+a SQLite read transaction does not exclude future writers, and both processes exit before
+the migration runs. Continuous exclusion is therefore a *protocol*, and the trusted
+boundary is:
+
+* the staging/production **host** and its Docker daemon;
+* the **enumerated writer set**: the application container (order intake, delivery
+  worker), scheduled jobs, and any operator-run script that opens the database;
+* the rule that **nothing in that set is started** between the barrier and the completed
+  cutover.
+
+Outside that boundary — an external process with its own filesystem access, a second
+host sharing the volume, a manually started container with a different name — cannot be
+excluded by this tooling and must be prevented by infrastructure. When the boundary
+cannot be established (no `/proc`, no docker daemon, an unreadable volume), the
+deployment **fails closed**; it never assumes silence.
+
+The deployment script enforces the protocol mechanically: barrier → gate → operator
+confirmation → re-check barrier and database identity → migration. If the database
+changes between the gate and the migration (`device:inode:size:mtime` differs), the
+deployment aborts and a fresh backup is required.
 
 Required downtime is the backup duration: the database snapshot is milliseconds, the
 upload archive dominates and scales with the number of unfinished deliveries (not
@@ -179,15 +217,38 @@ disable the age check entirely.
 ### 4.1.0 Ordering: gate first, mutate second
 
 In `deploy_staging_prebuilt.sh` the database-presence probe (`[7a/10]`) runs as root so a
-permission error cannot masquerade as "no database"; the backup gate (`[7b/10]`) runs
-next; only then does the schema migration (`[7c/10]`) touch the live database. A failed
-gate therefore leaves the database exactly as it was, and a failed migration aborts the
-deployment instead of starting the application against a half-applied schema.
+permission error cannot masquerade as "no database"; the writer barrier and the backup
+gate (`[7b/10]`) run next; then the operator confirms; only then does the schema
+migration (`[7c/10]`) touch the live database. A failed gate *or a declined
+confirmation* therefore leaves the database exactly as it was, and a failed migration
+aborts the deployment instead of starting the application against a half-applied schema.
+
+Immediately before the migration the script re-runs the barrier with the fingerprint
+captured when the gate approved the backup. If anything wrote in between, the deployment
+stops and a fresh backup is required — the gate's snapshot is a photograph, not a lock.
 
 A cold start is only accepted when the deployment script has positively proven that no
-database file exists (`DB_ABSENCE_PROVEN=1`). An unreachable volume, a missing
-configuration or an auto-detected mode with neither `LIVE_DB` nor `DB_VOLUME` is an error,
-never a cold start.
+database file exists (`DB_ABSENCE_PROVEN=1`) **and** the evidence survives an independent
+re-check: the Docker daemon must answer, the volume must be reported missing with the
+specific not-found error, and `LIVE_DB` must not contradict the claim. An unreachable
+daemon, a permission error, an existing volume or an auto-detected mode with neither
+`LIVE_DB` nor `DB_VOLUME` is an error, never a cold start.
+
+#### Recovering from an interrupted deployment
+
+| Interrupted at | State | Recovery |
+|---|---|---|
+| before the gate | nothing mutated | re-run; fix whatever the gate reported |
+| after the gate, before the migration | nothing mutated; the approval is now stale | re-take the backup if the fingerprint changed, then re-gate |
+| during `--apply` | schema possibly half-applied | **do not start the application**; re-run the migration (`--check` then `--apply`); it is additive and idempotent |
+| after migration, before containers start | database migrated, old containers still stopped | start the stack; the migration is forward-only and the old code ignores added tables |
+| after containers start | new code running | normal rollback ladder (`docs/launch/ROLLBACK_PLAN.md`) |
+
+Never restore the backup over a migrated database without first running the gate with
+`--live-db`: if the live database holds newer orders, restoring it deletes them. The
+pre-outbox transition flag stays valid only until the live database gains the outbox
+table, so a half-finished transition is completed by starting the new code, not by
+re-running the old one.
 
 ### 4.1.1 The one-time pre-outbox transition
 

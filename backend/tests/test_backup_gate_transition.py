@@ -132,7 +132,7 @@ def test_valid_legacy_database_and_backup_is_allowed(tmp_path, capsys):
     assert payload["checks"]["backup_set"]["sqlite_integrity"] == "ok"
     assert payload["checks"]["backup_set"].get("upload_archive_verified") is True
     # evidence was compared row by row, not counted
-    assert payload["checks"]["evidence"]["orders_compared"] >= 5
+    assert payload["checks"]["evidence"]["tables"]["orders"]["compared"] >= 5
 
 
 def test_transition_emits_a_prominent_non_json_warning(tmp_path, capsys):
@@ -288,7 +288,7 @@ def test_email_evidence_loss_is_refused(tmp_path, capsys):
     code = run_gate(transition_args(backup_dir, live, "--json"))
     payload = json.loads(capsys.readouterr().out)
     assert code == backup_gate.EXIT_UNVERIFIED
-    assert any("would lose the record" in e or "email" in e for e in payload["errors"])
+    assert any("does not contain row" in e for e in payload["errors"])
 
 
 def test_an_order_missing_from_the_backup_is_refused(tmp_path, capsys):
@@ -307,7 +307,7 @@ def test_an_order_missing_from_the_backup_is_refused(tmp_path, capsys):
     code = run_gate(transition_args(backup_dir, live, "--json"))
     payload = json.loads(capsys.readouterr().out)
     assert code != 0
-    assert any("does not contain order #999" in e or "predates" in e
+    assert any("does not contain row" in e or "predates" in e
                for e in payload["errors"])
 
 
@@ -330,6 +330,7 @@ def run_wrapper(backup_root: Path, live_db: Path, **env_overrides):
         "REPO_ROOT": REPO_DIR.as_posix(),
         "PYTHON_BIN": sys.executable,
         "GATE_MODE": "host",
+        "DELIVERY_WORKER_ENABLED_STATE": "no",
         "BACKUP_ROOT": backup_root.as_posix(),
         "LIVE_DB": live_db.as_posix(),
         "BACKUP_MAX_AGE_HOURS": "48",

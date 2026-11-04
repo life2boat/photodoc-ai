@@ -76,6 +76,7 @@ def run_gate(tmp_path: Path, **env_overrides) -> subprocess.CompletedProcess:
         "REPO_ROOT": _posix(REPO_DIR),
         "PYTHON_BIN": sys.executable,
         "GATE_MODE": "host",
+        "DELIVERY_WORKER_ENABLED_STATE": "no",
     })
     env.pop("SKIP_BACKUP_GATE", None)
     # A Git-bash subprocess inherits the Windows PATH, where coreutils such as
