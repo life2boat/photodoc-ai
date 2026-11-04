@@ -1,0 +1,25 @@
+[Unit]
+# PhotoDoc AI — scheduled verified backup + off-host replication.
+#
+# Deliberately NOT enabled by the repository. Activation prerequisites are in
+# docs/BACKUP_AND_RESTORE.md. Installing this unit without them would produce
+# failing timer runs, which is worse than an honestly-absent backup job.
+Description=PhotoDoc AI verified backup and off-host replication
+Documentation=file:///srv/photodoc/docs/BACKUP_AND_RESTORE.md
+After=docker.service
+Requires=docker.service
+ConditionPathExists=/etc/photodoc/backup.env
+
+[Service]
+Type=oneshot
+Nice=10
+IOSchedulingClass=best-effort
+# Keep the backup from starving request handling on a 1-2 vCPU VPS.
+CPUWeight=20
+IOWeight=20
+EnvironmentFile=-/etc/photodoc/backup.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/env bash /srv/photodoc/scripts/run_backup.sh
+TimeoutStartSec=3600
+# No restart storms: the timer retries on its next schedule.
+Restart=no

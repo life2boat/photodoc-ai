@@ -318,6 +318,54 @@ else
 fi
 
 # ==============================================================================
+# Step 8b: Rollback Backup Gate (S6-01)
+# ==============================================================================
+# A cutover is only reversible if a verified backup exists that is newer than the
+# data being replaced. The gate itself lives in scripts/deploy_backup_gate.sh so it
+# can be tested without Docker; this step supplies the environment and stops the
+# deployment when the gate refuses.
+echo "[7b/10] Verifying rollback backup gate..."
+
+BACKUP_ROOT="${BACKUP_ROOT:-/var/backups/photodoc}"
+BACKUP_MAX_AGE_HOURS="${BACKUP_MAX_AGE_HOURS:-24}"
+
+DB_HAS_DATA=0
+if docker volume inspect "${DB_VOLUME}" >/dev/null 2>&1; then
+    if docker run --rm --user 65534:65534 \
+        -v "${DB_VOLUME}:/data:ro" \
+        "${PHOTODOC_BACKEND_IMAGE}" \
+        python -c "import os, sys; sys.exit(0 if os.path.exists('/data/orders.db') else 1)" 2>/dev/null; then
+        DB_HAS_DATA=1
+    fi
+fi
+
+GATE_STATUS=0
+set +e
+if [[ "${DB_HAS_DATA}" -eq 1 ]]; then
+    DB_VOLUME="${DB_VOLUME}" \
+    BACKUP_ROOT="${BACKUP_ROOT}" \
+    BACKUP_MAX_AGE_HOURS="${BACKUP_MAX_AGE_HOURS}" \
+    SKIP_BACKUP_GATE="${SKIP_BACKUP_GATE:-0}" \
+    PHOTODOC_BACKEND_IMAGE="${PHOTODOC_BACKEND_IMAGE}" \
+    REPO_ROOT="${REPO_ROOT}" \
+    GATE_MODE=docker \
+    bash "${REPO_ROOT}/scripts/deploy_backup_gate.sh"
+    GATE_STATUS=$?
+else
+    # Cold start: there is no database, so there is nothing to protect yet.
+    GATE_MODE=cold REPO_ROOT="${REPO_ROOT}" bash "${REPO_ROOT}/scripts/deploy_backup_gate.sh"
+    GATE_STATUS=$?
+fi
+set -e
+
+if [[ "${GATE_STATUS}" -ne 0 ]]; then
+    echo ""
+    echo "FATAL: backup gate refused this deployment (exit ${GATE_STATUS})."
+    echo "       Refusing to touch running data without a verified rollback path."
+    exit 1
+fi
+
+# ==============================================================================
 # Confirmation Gate (State-Changing Operations)
 # ==============================================================================
 if [[ "${CONFIRM}" -eq 0 ]]; then

@@ -549,6 +549,97 @@ def generate_backup(
     return report["success"], report
 
 
+def generate_backup_atomic(
+    db_path: Path,
+    uploads_dir: Path,
+    output_dir: Path,
+    **kwargs: Any,
+) -> Tuple[bool, Dict[str, Any]]:
+    """Build the backup set off to the side, then publish it with one rename.
+
+    ``generate_backup`` writes straight into its destination, so a run that dies
+    halfway — a full disk, a killed container, an unreadable upload — leaves a
+    directory that *looks* like a backup but cannot be restored, and if the
+    destination already held a good set it has been damaged. Staging the set in a
+    sibling directory and publishing atomically removes both failure modes:
+
+    * on failure the staging directory is removed and the destination is untouched
+      (the previous valid backup survives);
+    * on success the switch is a single ``os.replace``, so no reader can observe a
+      partial set at the published path.
+    """
+    from backup_safety import BackupSafetyError, atomic_publish, staging_dir_for, verify_backup_set
+
+    output_dir = Path(output_dir)
+    try:
+        output_dir.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return False, {
+            "success": False,
+            "errors": [f"cannot create parent directory for backup: {exc}"],
+            "output_dir": str(output_dir),
+            "atomic": True,
+        }
+
+    staging = staging_dir_for(output_dir)
+    try:
+        staging.mkdir(parents=True)
+    except OSError as exc:
+        return False, {
+            "success": False,
+            "errors": [f"cannot create staging directory: {exc}"],
+            "output_dir": str(output_dir),
+            "atomic": True,
+        }
+
+    try:
+        success, report = generate_backup(
+            db_path=db_path, uploads_dir=uploads_dir, output_dir=staging, **kwargs)
+        report["atomic"] = True
+        report["staging_dir"] = str(staging)
+
+        if not success:
+            # Fail closed: the published path is never touched on failure.
+            shutil.rmtree(staging, ignore_errors=True)
+            report["output_dir"] = str(output_dir)
+            report["published"] = False
+            report.setdefault("errors", []).append(
+                "backup was not published; any previous valid backup is unchanged")
+            return False, report
+
+        ok, set_report = verify_backup_set(
+            staging,
+            require_verified=not kwargs.get("skip_verification", False),
+            check_upload_archive=False,
+            allow_staging=True,
+        )
+        if not ok:
+            shutil.rmtree(staging, ignore_errors=True)
+            report["errors"].extend(set_report.get("errors", []))
+            report["success"] = False
+            report["output_dir"] = str(output_dir)
+            report["published"] = False
+            return False, report
+
+        atomic_publish(staging, output_dir)
+        report["output_dir"] = str(output_dir)
+        report["published"] = True
+        report["success"] = True
+        return True, report
+    except BackupSafetyError as exc:
+        shutil.rmtree(staging, ignore_errors=True)
+        return False, {
+            "success": False,
+            "errors": [f"atomic publication failed: {exc}"],
+            "output_dir": str(output_dir),
+            "atomic": True,
+            "published": False,
+        }
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+
+
 def print_backup_report(success: bool, report: Dict[str, Any], *, as_json: bool = False) -> None:
     if as_json:
         print(json.dumps({"success": success, "report": report}, indent=2))
@@ -628,7 +719,9 @@ def main_cli() -> int:
 
     args = parser.parse_args()
 
-    success, report = generate_backup(
+    # The CLI always publishes atomically. `generate_backup` remains available as
+    # the in-place primitive for tests and for callers that stage themselves.
+    success, report = generate_backup_atomic(
         db_path=args.db,
         uploads_dir=args.uploads,
         output_dir=args.output_dir,
