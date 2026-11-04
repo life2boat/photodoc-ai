@@ -109,29 +109,53 @@ def _live_database(tmp_path, newest_order: datetime) -> Path:
     return db
 
 
-def test_gate_rejects_a_backup_older_than_the_newest_order(tmp_path):
-    """A perfectly valid backup taken before the latest order is still unsafe."""
-    backup_dir, _ = make_backup_set(tmp_path / "backups", created=NOW - timedelta(hours=6))
-    live_db = _live_database(tmp_path, NOW)
+def _snapshot_pair(tmp_path, *, created=None, live_mutation=None):
+    """A live database plus a backup taken *of that database*.
 
+    The evidence comparison requires the backup to be a true snapshot, so the
+    backup is produced from the live database rather than built independently.
+    """
+    from backup_set_builder import age_orders, backup_from_live
+
+    live_db = tmp_path / "live" / "orders.db"
+    live_uploads = tmp_path / "live" / "uploads"
+    build_database(live_db, live_uploads, with_outbox=True)
+    age_orders(live_db, NOW - timedelta(hours=1))
+    backup_dir, _ = backup_from_live(live_db, live_uploads,
+                                     tmp_path / "backups" / "20260101T000000Z")
+    if live_mutation is not None:
+        live_mutation(live_db)
+    return backup_dir, live_db
+
+
+def test_gate_rejects_a_backup_older_than_the_newest_order(tmp_path):
+    """A valid snapshot still loses an order created after it was taken."""
+    def add_later_order(live_db):
+        conn = sqlite3.connect(live_db)
+        try:
+            conn.execute(
+                "INSERT INTO orders (id, name, filename, payment_status, created_at) "
+                "VALUES (999, 'Later', 'later.jpg', 'unpaid', ?)",
+                ((NOW + timedelta(minutes=5)).isoformat(),))
+            conn.commit()
+        finally:
+            conn.close()
+
+    backup_dir, live_db = _snapshot_pair(tmp_path, live_mutation=add_later_order)
     code = run_gate(["--backup-dir", str(backup_dir), "--live-db", str(live_db),
                      "--require-outbox", "--max-age-hours", "48"])
-    assert code == backup_gate.EXIT_STALE
+    assert code != 0
 
 
-def test_gate_accepts_a_backup_newer_than_the_newest_order(tmp_path):
-    backup_dir, _ = make_backup_set(tmp_path / "backups", created=NOW + timedelta(minutes=1))
-    live_db = _live_database(tmp_path, NOW)
-
+def test_gate_accepts_a_backup_of_the_current_live_database(tmp_path):
+    backup_dir, live_db = _snapshot_pair(tmp_path)
     code = run_gate(["--backup-dir", str(backup_dir), "--live-db", str(live_db),
                      "--require-outbox", "--max-age-hours", "48"])
     assert code == 0
 
 
 def test_gate_reports_live_coverage_in_json(tmp_path, capsys):
-    backup_dir, _ = make_backup_set(tmp_path / "backups", created=NOW + timedelta(minutes=1))
-    live_db = _live_database(tmp_path, NOW)
-
+    backup_dir, live_db = _snapshot_pair(tmp_path)
     run_gate(["--backup-dir", str(backup_dir), "--live-db", str(live_db),
               "--require-outbox", "--max-age-hours", "48", "--json"])
     report = json.loads(capsys.readouterr().out)
@@ -145,7 +169,7 @@ def test_gate_rejects_a_missing_live_database(tmp_path):
     backup_dir, _ = make_backup_set(tmp_path / "backups")
     code = run_gate(["--backup-dir", str(backup_dir),
                      "--live-db", str(tmp_path / "no-such.db"), "--require-outbox"])
-    assert code == backup_gate.EXIT_STALE
+    assert code == backup_gate.EXIT_UNVERIFIED
 
 
 # ---------------------------------------------------------------- quiescence

@@ -95,14 +95,52 @@ incompletely.
 **Quiescence procedure (the supported cutover path):**
 
 ```bash
-# 1. stop writers (backup takes seconds-to-minutes; measure on your data volume)
-docker compose -f docker-compose.yml -f docker-compose.production.yml stop backend
-# 2. confirm nothing is in flight
-python3 scripts/backup_gate.py --db /data/orders.db --require-quiescent \
-        --worker-enabled no --json        # only the quiescence section matters here
-# 3. take the backup (Section 4), verify it (Section 4.2)
-# 4. continue the release, or restart: docker compose ... start backend
+# 1. stop every writer — the application container is a writer even with the
+#    delivery worker disabled, because order intake writes to the database.
+docker compose -p photodoc-staging stop backend
+
+# 2. prove exclusion and quiescence (read-only; run this exact command)
+python3 scripts/writer_barrier.py \
+    --db /var/lib/docker/volumes/photodoc_staging_backend-data/_data/orders.db \
+    --volume photodoc_staging_backend-data
+python3 scripts/backup_gate.py --quiescence-only \
+    --db /var/lib/docker/volumes/photodoc_staging_backend-data/_data/orders.db \
+    --worker-enabled no --require-exclusive-lock --json
+
+# 3. take the backup (§4) and verify it with the gate (§4.1)
+# 4. run the gate again; it must still pass against the same database
+# 5. migrate, cut over, and only then start the application again
 ```
+
+`--quiescence-only` is a standalone mode: it needs a database, not a backup set, so it
+can run before any backup exists. `writer_barrier.py` answers a different question — no
+container is attached to the volume, no host process holds the file open, and an
+exclusive lock is free — and both must pass.
+
+### 3.1 The trusted boundary for writer exclusion
+
+The barrier and the gate can prove that **no writer was detected at a known moment**, and
+that an exclusive lock was obtainable. They cannot prove that nothing writes afterwards:
+a SQLite read transaction does not exclude future writers, and both processes exit before
+the migration runs. Continuous exclusion is therefore a *protocol*, and the trusted
+boundary is:
+
+* the staging/production **host** and its Docker daemon;
+* the **enumerated writer set**: the application container (order intake, delivery
+  worker), scheduled jobs, and any operator-run script that opens the database;
+* the rule that **nothing in that set is started** between the barrier and the completed
+  cutover.
+
+Outside that boundary — an external process with its own filesystem access, a second
+host sharing the volume, a manually started container with a different name — cannot be
+excluded by this tooling and must be prevented by infrastructure. When the boundary
+cannot be established (no `/proc`, no docker daemon, an unreadable volume), the
+deployment **fails closed**; it never assumes silence.
+
+The deployment script enforces the protocol mechanically: barrier → gate → operator
+confirmation → re-check barrier and database identity → migration. If the database
+changes between the gate and the migration (`device:inode:size:mtime` differs), the
+deployment aborts and a fresh backup is required.
 
 Required downtime is the backup duration: the database snapshot is milliseconds, the
 upload archive dominates and scales with the number of unfinished deliveries (not
@@ -142,14 +180,114 @@ The gate is fail-closed and returns distinct exit codes:
 
 | Exit | Meaning |
 |---|---|
-| 0 | A verified, current set exists |
+| 0 | A verified, current set exists and matches the live database |
 | 2 | No complete backup set found |
-| 3 | A set exists but is not verified |
+| 3 | A set exists but is not verified, the archive cannot be re-verified, or the backup does not match the live rows |
 | 4 | Too old, or **older than the newest live order** |
 | 5 | Writers are in flight (when `--require-quiescent`) |
+| 6 | Invalid configuration (bad age value, contradictory flags, missing input) |
 
 `--require-outbox` is mandatory once the paid-email outbox exists: restoring a set
 without it loses the evidence that decides whether an ambiguous email may be resent.
+
+**`--deep` is not optional for a deployment.** `deploy_backup_gate.sh` always passes it,
+in both the host and the Docker path, and the check fails closed if the verifier module
+cannot be imported — a deep check that silently degrades to "not checked" is worse than
+none, because the deployment would proceed believing the archive was verified. Size the
+container's writable `/tmp` for the extracted archive (the wrapper uses 1 GiB).
+
+**The gate compares rows, not counts.** With `--live-db` it reads the live database in a
+single `BEGIN` transaction and compares, per row: every live order (id, `payment_status`,
+`payment_amount`, `paid_at`, `payment_email_sent_at`) and every delivery job (id, kind,
+state, attempts, cleanup state/phase, deletion timestamp, content digest), plus every
+`paid_email_outbox` row when the table exists. Equal counts with different content are
+rejected — a backup that still says `unpaid` where live says `paid`, or one that lost the
+record of an ambiguous email attempt, is not a rollback point.
+
+**Quiescence is enforced, not assumed.** `--require-quiescent` now requires `--db` or
+`--live-db`; without one the gate exits `6` instead of silently skipping the check. The
+worker check and the in-flight delivery/cleanup counts come from the same snapshot as the
+row comparison, so a writer cannot slip between the two.
+
+**Freshness values are validated.** `--max-age-hours` (and `BACKUP_MAX_AGE_HOURS`) must be
+a finite positive number below ten years. `nan`, `inf`, `-1`, `0` and non-numeric values
+are rejected: every comparison against NaN is false, so a stray `nan` would silently
+disable the age check entirely.
+
+### 4.1.0 Ordering: gate first, mutate second
+
+In `deploy_staging_prebuilt.sh` the database-presence probe (`[7a/10]`) runs as root so a
+permission error cannot masquerade as "no database"; the writer barrier and the backup
+gate (`[7b/10]`) run next; then the operator confirms; only then does the schema
+migration (`[7c/10]`) touch the live database. A failed gate *or a declined
+confirmation* therefore leaves the database exactly as it was, and a failed migration
+aborts the deployment instead of starting the application against a half-applied schema.
+
+Immediately before the migration the script re-runs the barrier with the fingerprint
+captured when the gate approved the backup. If anything wrote in between, the deployment
+stops and a fresh backup is required — the gate's snapshot is a photograph, not a lock.
+
+A cold start is only accepted when the deployment script has positively proven that no
+database file exists (`DB_ABSENCE_PROVEN=1`) **and** the evidence survives an independent
+re-check: the Docker daemon must answer, the volume must be reported missing with the
+specific not-found error, and `LIVE_DB` must not contradict the claim. An unreachable
+daemon, a permission error, an existing volume or an auto-detected mode with neither
+`LIVE_DB` nor `DB_VOLUME` is an error, never a cold start.
+
+#### Recovering from an interrupted deployment
+
+| Interrupted at | State | Recovery |
+|---|---|---|
+| before the gate | nothing mutated | re-run; fix whatever the gate reported |
+| after the gate, before the migration | nothing mutated; the approval is now stale | re-take the backup if the fingerprint changed, then re-gate |
+| during `--apply` | schema possibly half-applied | **do not start the application**; re-run the migration (`--check` then `--apply`); it is additive and idempotent |
+| after migration, before containers start | database migrated, old containers still stopped | start the stack; the migration is forward-only and the old code ignores added tables |
+| after containers start | new code running | normal rollback ladder (`docs/launch/ROLLBACK_PLAN.md`) |
+
+Never restore the backup over a migrated database without first running the gate with
+`--live-db`: if the live database holds newer orders, restoring it deletes them. The
+pre-outbox transition flag stays valid only until the live database gains the outbox
+table, so a half-finished transition is completed by starting the new code, not by
+re-running the old one.
+
+### 4.1.1 The one-time pre-outbox transition
+
+A database that predates PR #26 has no `paid_email_outbox` table, so **no backup of it
+can contain one** — and the standard gate would therefore refuse the very deployment
+that creates it. For that single step only, the outbox requirement can be replaced by
+the transition check:
+
+```bash
+BACKUP_GATE_ALLOW_PRE_OUTBOX=1 sudo -E bash scripts/deploy_backup_gate.sh
+# or directly:
+python scripts/backup_gate.py --latest-of /var/backups/photodoc \
+    --allow-pre-outbox-transition --live-db /data/orders.db --deep
+```
+
+It is **off by default** and it is not a relaxation of anything else. The gate still
+requires a fresh, checksum-verified, identity-matching set with a passing deep upload
+check; on top of that the transition is refused unless:
+
+* the **live** database has no `paid_email_outbox` (once it does, the flag is an error —
+  the transition is over and the normal requirement applies again);
+* the **backup** has no `paid_email_outbox` (if it does, use the normal gate);
+* the backup preserves **every live row**, compared field by field — each order's
+  payment state, amount, `paid_at` and `payment_email_sent_at`, and each delivery job's
+  kind, state, attempts, cleanup state/phase, deletion timestamp and content digest.
+  An order or job that exists only in the live database is refused, and so is any
+  material difference in a shared row: restoring such a backup would roll a payment back
+  or erase the record that an email attempt was ambiguous.
+
+Counts are never used as evidence. Both sides are read in one transaction each, so the
+comparison describes a single moment rather than a sequence of queries.
+
+It is independent of `SKIP_BACKUP_GATE` (which still aborts the deployment) and it
+cannot be enabled together with `--require-outbox`. The run prints a bordered warning
+and records `transition: true` plus the compared counts in its JSON output, so the
+exception is auditable after the fact.
+
+After the first successful cutover the table exists, and every later backup must pass
+`--require-outbox`.
 
 **Permissions model.** Backup sets are intentionally restrictive: the directory is
 `root:root 0700` and the artifacts are `0600`. Verification therefore runs as root

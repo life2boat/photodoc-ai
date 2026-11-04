@@ -283,77 +283,147 @@ fi
 echo "       Resolved Compose configuration is valid and zero-build."
 
 # ==============================================================================
-# Step 8: Safe Database Migration Check & Application
+# Step 7a: Determine whether a database exists — proven, not assumed
 # ==============================================================================
-echo "[7/10] Checking SQLite Database Schema & Migrations..."
+# Everything below depends on this answer, so an inconclusive probe is fatal.
+# The probe runs as root: under an unprivileged UID a permission error is
+# indistinguishable from "the file is not there", which is how a permission
+# problem could previously be misread as a cold start.
+echo "[7a/10] Determining whether a staging database exists..."
 
 DB_VOLUME="photodoc_staging_backend-data"
+DB_STATE="unknown"     # absent | present | unknown
+DB_ABSENCE_PROVEN=0
+DB_ABSENCE_EVIDENCE=""
 
-# Check if staging DB volume exists
-if docker volume inspect "${DB_VOLUME}" >/dev/null 2>&1; then
-    echo "       Found existing staging database volume '${DB_VOLUME}'. Data will be preserved."
+# A daemon failure, a permission error or a timeout must never be read as "the
+# volume does not exist". Confirm the daemon answers before drawing any
+# conclusion, then require the *specific* not-found error for a cold start.
+if ! docker info >/dev/null 2>&1; then
+    echo "FATAL: the Docker daemon is unreachable; cannot determine whether a database exists."
+    echo "       Refusing to guess, because guessing 'no database' skips the backup gate."
+    exit 1
+fi
 
-    # Run read-only schema compatibility inspection
-    echo "       Running read-only migration pre-check..."
-    docker run --rm --user 65534:65534 \
+set +e
+VOLUME_INSPECT=$(docker volume inspect "${DB_VOLUME}" 2>&1)
+VOLUME_RC=$?
+set -e
+
+if [[ "${VOLUME_RC}" -ne 0 ]]; then
+    case "${VOLUME_INSPECT}" in
+        *"no such volume"*|*"No such volume"*|*"no such object"*)
+            DB_STATE="absent"
+            DB_ABSENCE_PROVEN=1
+            DB_ABSENCE_EVIDENCE="volume-not-found"
+            echo "       Volume '${DB_VOLUME}' does not exist; this is a genuine cold start."
+            ;;
+        *)
+            echo "FATAL: cannot determine whether the volume exists (inspect exit ${VOLUME_RC})."
+            echo "       ${VOLUME_INSPECT}"
+            echo "       A daemon, permission or timeout error is not proof of absence."
+            exit 1
+            ;;
+    esac
+else
+    # The volume exists: probe the file as root. Under an unprivileged UID a
+    # permission error is indistinguishable from "the file is not there".
+    set +e
+    docker run --rm --user 0 \
         -v "${DB_VOLUME}:/data:ro" \
         "${PHOTODOC_BACKEND_IMAGE}" \
-        python migrations/reconcile_delivery_schema.py --db /data/orders.db --check || true
-
-    # Run additive migration if orders.db exists
-    docker run --rm --user 0 \
-        -v "${DB_VOLUME}:/data" \
-        "${PHOTODOC_BACKEND_IMAGE}" \
-        python -c "import os, sys; sys.exit(0 if os.path.exists('/data/orders.db') else 1)" && {
-            echo "       Applying additive P1 delivery schema reconciliation..."
-            docker run --rm --user 0 \
-                -v "${DB_VOLUME}:/data" \
-                "${PHOTODOC_BACKEND_IMAGE}" \
-                python migrations/reconcile_delivery_schema.py --db /data/orders.db --apply
-        } || {
-            echo "       No existing orders.db found in volume; fresh staging DB will initialize on startup."
-        }
-else
-    echo "       Staging database volume does not exist yet. Volume will be created and fresh staging DB initialized."
+        python -c "import os,sys
+p='/data/orders.db'
+if os.path.exists(p):
+    sys.exit(0)
+if not os.path.isdir('/data'):
+    sys.exit(3)
+sys.exit(1)"
+    DB_PROBE=$?
+    set -e
+    case "${DB_PROBE}" in
+        0) DB_STATE="present" ;;
+        1) DB_STATE="absent"; DB_ABSENCE_PROVEN=1; DB_ABSENCE_EVIDENCE="file-absent" ;;
+        *) echo "FATAL: cannot determine whether a database exists (probe exit ${DB_PROBE})."
+           echo "       Refusing to treat an unreadable volume as a cold start."
+           exit 1 ;;
+    esac
+    echo "       Volume '${DB_VOLUME}' exists; database state: ${DB_STATE}."
 fi
 
 # ==============================================================================
-# Step 8b: Rollback Backup Gate (S6-01)
+# Step 7b: Exclude writers, then verify the rollback backup gate (S6-01)
 # ==============================================================================
-# A cutover is only reversible if a verified backup exists that is newer than the
-# data being replaced. The gate itself lives in scripts/deploy_backup_gate.sh so it
-# can be tested without Docker; this step supplies the environment and stops the
-# deployment when the gate refuses.
-echo "[7b/10] Verifying rollback backup gate..."
+# Two separate questions, both required:
+#   1. Is anything still writing? A read transaction proves a consistent snapshot
+#      but does not stop a later INSERT, so the writers are excluded *before* the
+#      snapshot and held down until the cutover completes.
+#   2. Is there a verified backup that matches the live rows?
+# Migrating before this would change the database before we know a rollback point
+# exists, and would change the schema the gate is asked to approve.
+echo "[7b/10] Excluding writers and verifying the rollback backup gate..."
 
 BACKUP_ROOT="${BACKUP_ROOT:-/var/backups/photodoc}"
 BACKUP_MAX_AGE_HOURS="${BACKUP_MAX_AGE_HOURS:-24}"
 
-DB_HAS_DATA=0
-if docker volume inspect "${DB_VOLUME}" >/dev/null 2>&1; then
-    if docker run --rm --user 65534:65534 \
-        -v "${DB_VOLUME}:/data:ro" \
-        "${PHOTODOC_BACKEND_IMAGE}" \
-        python -c "import os, sys; sys.exit(0 if os.path.exists('/data/orders.db') else 1)" 2>/dev/null; then
-        DB_HAS_DATA=1
-    fi
+# The worker state is read from the compose file rather than assumed. "unknown" is
+# treated as not-proven by the gate, so a missing or unparseable file blocks the
+# deployment instead of silently passing.
+WORKER_STATE="unknown"
+if [[ -f "${STAGING_COMPOSE_FILE}" ]]; then
+    set +e
+    _WORKER_FLAG=$(grep -Eo 'DELIVERY_WORKER_ENABLED:[[:space:]]*"?[01]"?|DELIVERY_WORKER_ENABLED=[01]' \
+        "${STAGING_COMPOSE_FILE}" 2>/dev/null | grep -Eo '[01]' | head -1)
+    set -e
+    case "${_WORKER_FLAG:-}" in
+        0) WORKER_STATE="no" ;;
+        1) WORKER_STATE="yes" ;;
+        *) WORKER_STATE="unknown" ;;
+    esac
+fi
+echo "       Delivery worker state (from compose): ${WORKER_STATE}"
+
+if [[ "${DB_STATE}" == "present" ]]; then
+    DB_HOST_PATH="/var/lib/docker/volumes/${DB_VOLUME}/_data/orders.db"
+    echo "       Checking that no process holds the database open..."
+    set +e
+    "${PYTHON_BIN:-python3}" "${REPO_ROOT}/scripts/writer_barrier.py" \
+        --db "${DB_HOST_PATH}" --volume "${DB_VOLUME}"
+    BARRIER_RC=$?
+    set -e
+    case "${BARRIER_RC}" in
+        0) echo "       Writer barrier passed: no container or process holds the database." ;;
+        3) echo "FATAL: this host cannot inspect processes, so writer exclusion cannot be proven."
+           echo "       Refusing to deploy (documented boundary: docs/BACKUP_AND_RESTORE.md)."
+           exit 1 ;;
+        *) echo "FATAL: writers are active or exclusion cannot be demonstrated."
+           echo "       Stop the application container and any worker before deploying:"
+           echo "         docker compose -p photodoc-staging stop backend"
+           exit 1 ;;
+    esac
+    # The exact instance the gate is about to approve. If it changes before the
+    # migration, something wrote after the check and the approval is stale.
+    DB_IDENTITY_AT_GATE=$(stat -c '%d:%i:%s:%Y' "${DB_HOST_PATH}" 2>/dev/null || echo unknown)
 fi
 
 GATE_STATUS=0
 set +e
-if [[ "${DB_HAS_DATA}" -eq 1 ]]; then
+if [[ "${DB_STATE}" == "present" ]]; then
     DB_VOLUME="${DB_VOLUME}" \
     BACKUP_ROOT="${BACKUP_ROOT}" \
     BACKUP_MAX_AGE_HOURS="${BACKUP_MAX_AGE_HOURS}" \
     SKIP_BACKUP_GATE="${SKIP_BACKUP_GATE:-0}" \
     PHOTODOC_BACKEND_IMAGE="${PHOTODOC_BACKEND_IMAGE}" \
+    DELIVERY_WORKER_ENABLED_STATE="${WORKER_STATE}" \
     REPO_ROOT="${REPO_ROOT}" \
     GATE_MODE=docker \
     bash "${REPO_ROOT}/scripts/deploy_backup_gate.sh"
     GATE_STATUS=$?
 else
-    # Cold start: there is no database, so there is nothing to protect yet.
-    GATE_MODE=cold REPO_ROOT="${REPO_ROOT}" bash "${REPO_ROOT}/scripts/deploy_backup_gate.sh"
+    GATE_MODE=cold DB_ABSENCE_PROVEN="${DB_ABSENCE_PROVEN}" \
+        DB_ABSENCE_EVIDENCE="${DB_ABSENCE_EVIDENCE}" \
+        LIVE_DB="" REPO_ROOT="${REPO_ROOT}" \
+        bash "${REPO_ROOT}/scripts/deploy_backup_gate.sh"
     GATE_STATUS=$?
 fi
 set -e
@@ -366,8 +436,11 @@ if [[ "${GATE_STATUS}" -ne 0 ]]; then
 fi
 
 # ==============================================================================
-# Confirmation Gate (State-Changing Operations)
+# Confirmation Gate — BEFORE any database mutation
 # ==============================================================================
+# Everything up to here is read-only (probe, barrier, gate). The next step writes
+# to the database, so the operator approves *now*. A refusal leaves persistent
+# state untouched.
 if [[ "${CONFIRM}" -eq 0 ]]; then
     echo ""
     echo "----------------------------------------------------------------------"
@@ -375,6 +448,7 @@ if [[ "${CONFIRM}" -eq 0 ]]; then
     echo " Backend  : ${PHOTODOC_BACKEND_IMAGE}"
     echo " Frontend : ${PHOTODOC_FRONTEND_IMAGE}"
     echo " Port     : 127.0.0.1:${STAGING_PORT}"
+    echo " Database : ${DB_STATE} (schema reconciliation next)"
     echo "----------------------------------------------------------------------"
     read -r -p "Apply staging container update now? [y/N]: " USER_CONFIRM
     case "${USER_CONFIRM}" in
@@ -382,10 +456,85 @@ if [[ "${CONFIRM}" -eq 0 ]]; then
             echo "Proceeding with deployment..."
             ;;
         *)
-            echo "Deployment cancelled by operator."
+            echo "Deployment cancelled by operator. Nothing has been changed."
             exit 0
             ;;
     esac
+fi
+
+# ==============================================================================
+# Step 7c: Safe Database Migration — only AFTER approval and the gate
+# ==============================================================================
+# The migration mutates the live database. It runs here, not earlier, so that a
+# refused gate or a denied confirmation always leaves the database exactly as it
+# was. A migration failure is fatal: continuing would start the application against
+# a schema that was half-applied.
+if [[ "${DB_STATE}" == "present" ]]; then
+    echo "[7c/10] Reconciling SQLite database schema..."
+
+    # Exclusion and identity are re-proved immediately before the write, because
+    # everything between the gate and here is a window in which something could
+    # have written.
+    DB_IDENTITY_NOW=$(stat -c '%d:%i:%s:%Y' "${DB_HOST_PATH}" 2>/dev/null || echo unknown)
+    if [[ "${DB_IDENTITY_NOW}" != "${DB_IDENTITY_AT_GATE}" ]]; then
+        echo "FATAL: the database changed after the backup gate approved it."
+        echo "       approved=${DB_IDENTITY_AT_GATE} now=${DB_IDENTITY_NOW}"
+        echo "       Stop every writer, take a fresh backup and run the gate again."
+        exit 1
+    fi
+    set +e
+    "${PYTHON_BIN:-python3}" "${REPO_ROOT}/scripts/writer_barrier.py" \
+        --db "${DB_HOST_PATH}" --volume "${DB_VOLUME}" \
+        --expect-fingerprint "${DB_IDENTITY_AT_GATE}"
+    RECHECK_BARRIER=$?
+    set -e
+    if [[ "${RECHECK_BARRIER}" -ne 0 ]]; then
+        echo "FATAL: a writer reappeared, or the database changed, between the gate and the migration."
+        echo "       Stop every writer, take a fresh backup and run the gate again."
+        exit 1
+    fi
+
+    echo "       Running read-only migration pre-check..."
+    set +e
+    docker run --rm --user 0 \
+        -v "${DB_VOLUME}:/data:ro" \
+        "${PHOTODOC_BACKEND_IMAGE}" \
+        python migrations/reconcile_delivery_schema.py --db /data/orders.db --check
+    CHECK_RC=$?
+    set -e
+    if [[ "${CHECK_RC}" -gt 1 ]]; then
+        echo "FATAL: migration pre-check failed (exit ${CHECK_RC})."
+        exit 1
+    fi
+
+    echo "       Applying additive P1 delivery schema reconciliation..."
+    set +e
+    docker run --rm --user 0 \
+        -v "${DB_VOLUME}:/data" \
+        "${PHOTODOC_BACKEND_IMAGE}" \
+        python migrations/reconcile_delivery_schema.py --db /data/orders.db --apply
+    APPLY_RC=$?
+    set -e
+    if [[ "${APPLY_RC}" -ne 0 ]]; then
+        echo "FATAL: schema migration failed (exit ${APPLY_RC})."
+        echo "       The database may be partially migrated; do not start the application."
+        exit 1
+    fi
+    echo "       Migration completed. Re-verifying the migrated database read-only..."
+
+    set +e
+    docker run --rm --user 0 \
+        -v "${DB_VOLUME}:/data:ro" \
+        "${PHOTODOC_BACKEND_IMAGE}" \
+        python migrations/reconcile_delivery_schema.py --db /data/orders.db --check
+    RECHECK_RC=$?
+    set -e
+    if [[ "${RECHECK_RC}" -gt 1 ]]; then
+        echo "FATAL: post-migration verification failed (exit ${RECHECK_RC})."
+        exit 1
+    fi
+else
+    echo "[7c/10] No existing database; schema will be created by the application on startup."
 fi
 
 # ==============================================================================

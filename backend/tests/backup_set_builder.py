@@ -32,6 +32,37 @@ for _p in (str(BACKEND_DIR), str(SCRIPTS_DIR)):
 JPEG = b"\xff\xd8\xffsynthetic-jpeg-data-for-backup-rehearsal"
 PASSWORD2 = "synthetic-pass-2"
 
+
+def backup_from_live(source_db: Path, source_uploads: Path, target_dir: Path,
+                     *, run_cleanups: bool = False) -> tuple[Path, Dict[str, Any]]:
+    """Take a real backup *of this database*, so backup and live are the same rows.
+
+    Fixtures that build the backup and the live database independently produce two
+    different databases with the same shape. That is useless for any test of the
+    evidence comparison, which is about proving the backup is a faithful snapshot.
+    """
+    import create_backup
+
+    ok, report = create_backup.generate_backup_atomic(
+        db_path=Path(source_db),
+        uploads_dir=Path(source_uploads),
+        output_dir=Path(target_dir),
+        run_pending_cleanups_flag=run_cleanups,
+    )
+    if not ok:
+        raise RuntimeError(f"backup_from_live failed: {report.get('errors')}")
+    return Path(target_dir), report
+
+
+def age_orders(db_path: Path, when: datetime) -> None:
+    """Pin every order's ``created_at`` so coverage checks are deterministic."""
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("UPDATE orders SET created_at=?", (iso(when),))
+        conn.commit()
+    finally:
+        conn.close()
+
 #: order number -> (filename sent by the client, bytes)
 CUSTOMER_FILES = {
     1: ("pending_photo.jpg", JPEG + b"-1"),
