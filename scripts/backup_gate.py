@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -29,6 +30,7 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from backup_safety import (  # noqa: E402
+    OUTBOX_TABLE,
     backup_timestamp,
     check_quiescence,
     verify_backup_set,
@@ -152,12 +154,126 @@ def _live_db_checks(backup_dir: Path, live_db: Path) -> tuple[list[str], dict]:
     return errors, info
 
 
+def _table_exists(conn, name: str) -> bool:
+    return bool(conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)).fetchone())
+
+
+def _pre_outbox_transition_checks(backup_dir: Path, live_db: Path) -> tuple[list[str], dict]:
+    """Authorise a backup that lacks ``paid_email_outbox`` — once, and narrowly.
+
+    PR #26 added the paid-email outbox. The first deployment onto a database that
+    predates it cannot produce a backup containing the table without migrating the
+    live database first, so the standard gate (``--require-outbox``) would refuse
+    the very transition that creates the table.
+
+    This check exists only for that single step. It is deliberately strict:
+
+    * the operator must ask for it explicitly;
+    * the **live** database must lack the table (already transitioned => refuse);
+    * the **backup** must lack the table (use the normal gate instead);
+    * the backup must not hold less email-delivery evidence than the live
+      database — fewer orders, fewer delivery jobs, fewer ``paid_email`` jobs or
+      fewer ``payment_email_sent_at`` timestamps all mean evidence could be lost.
+
+    Once the live database has the table, this path can never be taken again: the
+    flag itself becomes an error, so it cannot silently degrade the gate later.
+    """
+    errors: list[str] = []
+    info: dict = {
+        "requested": True,
+        "applicable": False,
+        "live_has_outbox": None,
+        "backup_has_outbox": None,
+        "evidence": {},
+    }
+    backup_dir = Path(backup_dir)
+    live_db = Path(live_db)
+
+    if not live_db.is_file():
+        return [f"live database not found: {live_db}; the transition needs it to prove "
+                "the outbox is genuinely absent"], info
+
+    try:
+        live = sqlite3.connect(f"file:{live_db.resolve().as_posix()}?mode=ro", uri=True, timeout=10.0)
+    except sqlite3.Error as exc:
+        return [f"cannot open live database for the transition check: {exc}"], info
+    try:
+        info["live_has_outbox"] = _table_exists(live, OUTBOX_TABLE)
+    except sqlite3.Error as exc:
+        return [f"cannot inspect the live database for the transition check: {exc}"], info
+    finally:
+        live.close()
+
+    try:
+        conn = sqlite3.connect(f"file:{backup_dir.joinpath('orders.db').resolve().as_posix()}?mode=ro",
+                               uri=True, timeout=10.0)
+    except sqlite3.Error as exc:
+        return [f"cannot open backup database for the transition check: {exc}"], info
+    try:
+        info["backup_has_outbox"] = _table_exists(conn, OUTBOX_TABLE)
+    except sqlite3.Error as exc:
+        return [f"cannot inspect the backup database for the transition check: {exc}"], info
+    finally:
+        conn.close()
+
+    if info["live_has_outbox"]:
+        errors.append(
+            f"the live database already contains {OUTBOX_TABLE}: the pre-outbox transition "
+            "is no longer applicable. Re-run the gate without --allow-pre-outbox-transition "
+            "so the table is required.")
+    if info["backup_has_outbox"]:
+        errors.append(
+            f"the backup already contains {OUTBOX_TABLE}: it is not a pre-outbox backup, so "
+            "the transition flag must not be used. Re-run without it.")
+    if errors:
+        return errors, info
+
+    queries = {
+        "orders": "SELECT COUNT(*) FROM orders",
+        "delivery_jobs": "SELECT COUNT(*) FROM delivery_jobs",
+        "paid_email_jobs": "SELECT COUNT(*) FROM delivery_jobs WHERE kind='paid_email'",
+        "email_sent_orders": "SELECT COUNT(*) FROM orders WHERE payment_email_sent_at IS NOT NULL",
+    }
+    for label, query in queries.items():
+        live_count = backup_count = None
+        try:
+            conn = sqlite3.connect(f"file:{live_db.resolve().as_posix()}?mode=ro", uri=True, timeout=10.0)
+            try:
+                live_count = conn.execute(query).fetchone()[0]
+            finally:
+                conn.close()
+            conn = sqlite3.connect(
+                f"file:{backup_dir.joinpath('orders.db').resolve().as_posix()}?mode=ro",
+                uri=True, timeout=10.0)
+            try:
+                backup_count = conn.execute(query).fetchone()[0]
+            finally:
+                conn.close()
+        except sqlite3.Error as exc:
+            errors.append(f"cannot compare {label} between live and backup: {exc}")
+            continue
+        info["evidence"][label] = {"live": live_count, "backup": backup_count}
+        if backup_count < live_count:
+            errors.append(
+                f"the backup holds fewer {label} than the live database "
+                f"({backup_count} < {live_count}); refusing the transition because "
+                "email-delivery evidence could be lost")
+
+    info["applicable"] = not errors
+    return errors, info
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="PhotoDoc AI — deployment backup gate")
     parser.add_argument("--backup-dir", type=Path, help="backup set directory to verify")
     parser.add_argument("--latest-of", type=Path, help="directory containing backup sets")
     parser.add_argument("--require-outbox", action="store_true",
                         help="require the paid-email outbox table (required when running PR #26+)")
+    parser.add_argument("--allow-pre-outbox-transition", action="store_true",
+                        help="ONE-TIME pre-PR#26 transition: allow a backup without "
+                             "paid_email_outbox, but only when the live database also lacks "
+                             "it and no email evidence would be lost. Requires --live-db.")
     parser.add_argument("--max-age-hours", type=float, default=24.0,
                         help="maximum acceptable backup age in hours (default 24)")
     parser.add_argument("--allow-unverified", action="store_true",
@@ -178,9 +294,31 @@ def main(argv: list[str] | None = None) -> int:
 
     report: dict = {"gate": "backup", "ok": False, "errors": [], "checks": {}}
 
+    # The transition flag and the outbox requirement contradict each other: one
+    # says the table is absent, the other says it must be present. Refuse rather
+    # than pick a winner.
+    if args.allow_pre_outbox_transition and args.require_outbox:
+        report["errors"].append(
+            "--require-outbox and --allow-pre-outbox-transition are mutually exclusive: "
+            "the transition is for backups without the table, the requirement is for "
+            "backups with it")
+        _emit(report, args.json, EXIT_UNVERIFIED)
+        return EXIT_UNVERIFIED
+
+    if args.allow_pre_outbox_transition and args.live_db is None:
+        report["errors"].append(
+            "--allow-pre-outbox-transition requires --live-db so the gate can prove the "
+            "live database genuinely lacks paid_email_outbox")
+        _emit(report, args.json, EXIT_UNVERIFIED)
+        return EXIT_UNVERIFIED
+
+    # While transitioning, the outbox requirement is off — but only until the live
+    # database gains the table, at which point the transition check fails closed.
+    require_outbox = args.require_outbox and not args.allow_pre_outbox_transition
+
     target = args.backup_dir
     if target is None:
-        target = latest_backup_set(args.latest_of, require_outbox=args.require_outbox,
+        target = latest_backup_set(args.latest_of, require_outbox=require_outbox,
                                    require_verified=not args.allow_unverified)
         report["selected"] = str(target) if target else None
         if target is None:
@@ -191,7 +329,7 @@ def main(argv: list[str] | None = None) -> int:
 
     ok, set_report = verify_backup_set(
         target,
-        require_outbox=args.require_outbox,
+        require_outbox=require_outbox,
         max_age_hours=args.max_age_hours,
         require_verified=not args.allow_unverified,
         check_upload_archive=args.deep,
@@ -200,6 +338,21 @@ def main(argv: list[str] | None = None) -> int:
     report["errors"].extend(set_report.get("errors", []))
     report["ok"] = ok and not report["errors"]
     code = EXIT_OK if report["ok"] else _classify(set_report)
+
+    if args.allow_pre_outbox_transition:
+        transition_errors, transition_info = _pre_outbox_transition_checks(target, args.live_db)
+        report["checks"]["pre_outbox_transition"] = transition_info
+        transition_info["errors"] = transition_errors
+        if transition_errors:
+            report["ok"] = False
+            code = EXIT_UNVERIFIED
+            report["errors"].extend(transition_errors)
+        else:
+            report["warning"] = (
+                "PRE-OUTBOX TRANSITION: this backup has no paid_email_outbox table and the "
+                "live database does not have one either. The deployment creates the table; "
+                "from then on every backup must pass the normal outbox requirement.")
+            report["transition"] = True
 
     if args.live_db is not None:
         live_errors, live_info = _live_db_checks(target, args.live_db)
@@ -244,7 +397,19 @@ def _emit(report: dict, as_json: bool, code: int) -> None:
     quiet = report.get("checks", {}).get("quiescence")
     if quiet:
         print(f"Quiescent:                {quiet.get('quiescent')} {quiet.get('reasons') or ''}")
+    transition = report.get("checks", {}).get("pre_outbox_transition")
+    if transition:
+        print(f"Pre-outbox transition:    requested  "
+              f"live_has_outbox={transition.get('live_has_outbox')} "
+              f"backup_has_outbox={transition.get('backup_has_outbox')} "
+              f"applicable={transition.get('applicable')}")
+        for label, counts in (transition.get("evidence") or {}).items():
+            print(f"  evidence {label:<18} live={counts['live']} backup={counts['backup']}")
     print("--------------------------------------------------")
+    if report.get("warning"):
+        print("####################################################################")
+        print("# " + str(report["warning"]))
+        print("####################################################################")
     if code == EXIT_OK:
         print("GATE: PASS — a verified backup set is available for rollback.")
     else:

@@ -151,6 +151,40 @@ The gate is fail-closed and returns distinct exit codes:
 `--require-outbox` is mandatory once the paid-email outbox exists: restoring a set
 without it loses the evidence that decides whether an ambiguous email may be resent.
 
+### 4.1.1 The one-time pre-outbox transition
+
+A database that predates PR #26 has no `paid_email_outbox` table, so **no backup of it
+can contain one** — and the standard gate would therefore refuse the very deployment
+that creates it. For that single step only, the outbox requirement can be replaced by
+the transition check:
+
+```bash
+BACKUP_GATE_ALLOW_PRE_OUTBOX=1 sudo -E bash scripts/deploy_backup_gate.sh
+# or directly:
+python scripts/backup_gate.py --latest-of /var/backups/photodoc \
+    --allow-pre-outbox-transition --live-db /data/orders.db --deep
+```
+
+It is **off by default** and it is not a relaxation of anything else. The gate still
+requires a fresh, checksum-verified, identity-matching set with a passing deep upload
+check; on top of that the transition is refused unless:
+
+* the **live** database has no `paid_email_outbox` (once it does, the flag is an error —
+  the transition is over and the normal requirement applies again);
+* the **backup** has no `paid_email_outbox` (if it does, use the normal gate);
+* the backup holds **no less email evidence than the live database** — comparing
+  `orders`, `delivery_jobs`, `delivery_jobs WHERE kind='paid_email'` and
+  `orders WHERE payment_email_sent_at IS NOT NULL`. Fewer of any of these in the backup
+  means attempting the transition could discard evidence, and the gate refuses.
+
+It is independent of `SKIP_BACKUP_GATE` (which still aborts the deployment) and it
+cannot be enabled together with `--require-outbox`. The run prints a bordered warning
+and records `transition: true` plus the compared counts in its JSON output, so the
+exception is auditable after the fact.
+
+After the first successful cutover the table exists, and every later backup must pass
+`--require-outbox`.
+
 **Permissions model.** Backup sets are intentionally restrictive: the directory is
 `root:root 0700` and the artifacts are `0600`. Verification therefore runs as root
 *inside a narrowly scoped container* — `--network none`, `--read-only`, all

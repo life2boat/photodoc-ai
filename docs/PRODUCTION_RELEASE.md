@@ -285,6 +285,15 @@ docker run --rm \
     --worker-enabled no
 ```
 
+**First deployment onto a pre-PR #26 database.** If the live database has no
+`paid_email_outbox` table yet, no backup of it can contain one, so `--require-outbox`
+would refuse the very release that creates it. For that single step replace
+`--require-outbox` with `--allow-pre-outbox-transition` (or set
+`BACKUP_GATE_ALLOW_PRE_OUTBOX=1` when using `deploy_backup_gate.sh`). The flag is
+refused once either database has the table, refuses if the backup holds less email
+evidence than live, and leaves every other check — freshness, identity, deep uploads,
+coverage — fully in force. Details: `docs/BACKUP_AND_RESTORE.md` §4.1.1.
+
 **Why root inside the container.** Backup sets are intentionally restrictive —
 `root:root 0700` with `0600` artifacts. A container running as an unprivileged UID
 cannot traverse that directory, which made a genuine backup look absent and would

@@ -63,11 +63,34 @@ fi
 
 log "       Checking '${BACKUP_ROOT}' for a verified backup set (max age ${BACKUP_MAX_AGE_HOURS}h)..."
 
+# One-time pre-PR #26 transition. The first deployment onto a database that
+# predates paid_email_outbox cannot produce a backup containing that table
+# without migrating live data first, so the standard outbox requirement would
+# block the very deployment that creates it. This flag relaxes exactly that one
+# requirement, and backup_gate.py refuses it unless BOTH the live database and
+# the backup lack the table. Once the live database has it, the flag is an error,
+# so it cannot be left enabled by accident. It is independent of
+# SKIP_BACKUP_GATE: nothing here skips verification.
+GATE_FLAGS=()
+if [[ "${BACKUP_GATE_ALLOW_PRE_OUTBOX:-0}" == "1" ]]; then
+    log "       ####################################################################"
+    log "       # WARNING: BACKUP_GATE_ALLOW_PRE_OUTBOX=1"
+    log "       # Allowing a backup WITHOUT paid_email_outbox. This is only valid for"
+    log "       # the first transition from a pre-PR#26 database; it is refused if"
+    log "       # either the live database or the backup already has the table."
+    log "       # Every other check (integrity, identity, freshness, deep uploads)"
+    log "       # still applies."
+    log "       ####################################################################"
+    GATE_FLAGS+=(--allow-pre-outbox-transition)
+else
+    GATE_FLAGS+=(--require-outbox)
+fi
+
 GATE_STATUS=0
 if [[ "${GATE_MODE}" == "host" ]]; then
     PYTHONPATH="${REPO_ROOT}/scripts" "${PYTHON_BIN}" "${REPO_ROOT}/scripts/backup_gate.py" \
         --latest-of "${BACKUP_ROOT}" \
-        --require-outbox \
+        "${GATE_FLAGS[@]}" \
         --live-db "${LIVE_DB}" \
         --max-age-hours "${BACKUP_MAX_AGE_HOURS}" || GATE_STATUS=$?
 elif [[ "${GATE_MODE}" == "docker" ]]; then
@@ -108,7 +131,7 @@ elif [[ "${GATE_MODE}" == "docker" ]]; then
         "${PHOTODOC_BACKEND_IMAGE}" \
         python /repo/scripts/backup_gate.py \
             --latest-of /backups \
-            --require-outbox \
+            "${GATE_FLAGS[@]}" \
             --live-db /data/orders.db \
             --max-age-hours "${BACKUP_MAX_AGE_HOURS}" || GATE_STATUS=$?
 else
