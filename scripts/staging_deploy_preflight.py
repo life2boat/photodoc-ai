@@ -36,9 +36,23 @@ except ImportError:
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-# Known production server IP and domains that must be strictly rejected
+# Known production server IP and domains that must be strictly rejected.
+#
+# `photo1storage.ru` (apex) is deliberately NOT in this list. The private staging
+# VPS *is* that host — its own hostname is `photo1storage.ru` — so rejecting the
+# apex would block the legitimate staging deployment on its own machine and push
+# operators to bypass the guard. The apex is the service domain, not a
+# deploy-target discriminator; what actually separates staging from production
+# here is the protected IP, the volumes, the env-file path and the public `www`
+# entrypoint, all of which are covered below and below in this module.
+SERVICE_DOMAIN = "photo1storage.ru"
 PRODUCTION_TARGET_IPS = {"79.137.196.14"}
-PRODUCTION_TARGET_HOSTS = {"79.137.196.14", "photodoc-ai.ru", "www.photodoc-ai.ru"}
+PRODUCTION_TARGET_HOSTS = {
+    "79.137.196.14",
+    "photodoc-ai.ru",          # legacy, unregistered; kept so old runbooks stay blocked
+    "www.photodoc-ai.ru",
+    "www.photo1storage.ru",    # public www entrypoint: never a staging deploy target
+}
 
 PRODUCTION_FORBIDDEN_VOLUMES = {"photodoc_backend-data", "photodoc_uploads"}
 PRODUCTION_FORBIDDEN_ENV_FILES = {"backend/.env", "./backend/.env"}

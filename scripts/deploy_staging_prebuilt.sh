@@ -106,8 +106,16 @@ echo "======================================================================"
 echo "[0/10] Verifying Production Target Safety Guard..."
 
 # Check explicit target host
+#
+# The canonical apex `photo1storage.ru` is intentionally NOT blocked here: the
+# private staging VPS hostname IS that domain, so blocking it would reject the
+# legitimate staging deployment on its own machine. Only the public `www`
+# entrypoint and the legacy unregistered domain are rejected. Keep this list in
+# step with PRODUCTION_TARGET_HOSTS in scripts/staging_deploy_preflight.py.
 if [[ -n "${TARGET_HOST}" ]]; then
-    if [[ "${TARGET_HOST}" == "${PRODUCTION_IP}" ]] || [[ "${TARGET_HOST}" == *"photodoc-ai.ru"* ]]; then
+    if [[ "${TARGET_HOST}" == "${PRODUCTION_IP}" ]] \
+        || [[ "${TARGET_HOST}" == *"photodoc-ai.ru"* ]] \
+        || [[ "${TARGET_HOST}" == *"www.photo1storage.ru"* ]]; then
         echo "FATAL: Target host '${TARGET_HOST}' matches protected production infrastructure." >&2
         echo "Staging deployment is strictly prohibited on production target!" >&2
         exit 1

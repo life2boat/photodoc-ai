@@ -1,4 +1,4 @@
 User-agent: *
 Allow: /
 Disallow: /api/
-Sitemap: https://photodoc-ai.ru/sitemap.xml
+Sitemap: https://photo1storage.ru/sitemap.xml

@@ -588,6 +588,43 @@ async def _stage_upload(file: UploadFile, used_bytes: int) -> dict:
 
 
 # --- Фоновые задачи ---
+#: Fallback domain for outbound Message-IDs when nothing else is configured.
+DEFAULT_MAIL_DOMAIN = "photo1storage.ru"
+
+_DOMAIN_LABEL = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+_MAIL_DOMAIN_RE = re.compile(rf"^{_DOMAIN_LABEL}(?:\.{_DOMAIN_LABEL})+$")
+
+
+def get_mail_domain() -> str:
+    """Domain used in outbound ``Message-ID`` headers.
+
+    Message identity must match the domain the site is actually served from, or
+    recipients applying DMARC alignment will treat the mail as unaligned. The
+    value is configurable (``PHOTODOC_MAIL_DOMAIN``) and otherwise derived from
+    the authenticated mailbox, falling back to the canonical domain.
+
+    The result is strictly validated as a dotted DNS name. That is a security
+    requirement, not a convenience: the value is interpolated straight into a
+    message header, so anything permitting CR/LF or angle brackets would be a
+    header-injection primitive. An invalid value falls back rather than raising,
+    because a malformed envelope must not take down order notifications.
+    """
+    candidate = (os.getenv("PHOTODOC_MAIL_DOMAIN") or "").strip().lower()
+    if not candidate:
+        mailbox = (os.getenv("SMTP_USER") or "").strip()
+        if "@" in mailbox:
+            candidate = mailbox.rsplit("@", 1)[1].strip().lower()
+    if candidate and _MAIL_DOMAIN_RE.fullmatch(candidate):
+        return candidate
+    return DEFAULT_MAIL_DOMAIN
+
+
+def message_id(order_id: int, kind: str) -> str:
+    """Stable Message-ID for an order notification, on the configured domain."""
+    assert kind in ("new", "paid")
+    return f"<photodoc-order-{order_id}-{kind}@{get_mail_domain()}>"
+
+
 def send_order_email(order_id: int, name: str, phone: str, comment: str, format: str = "Не указан", paper: str = "Не указана", crop: str = "Не указано"):
     smtp_server = os.getenv("SMTP_SERVER")
     smtp_port = int(os.getenv("SMTP_PORT", 465))
@@ -603,7 +640,7 @@ def send_order_email(order_id: int, name: str, phone: str, comment: str, format:
     msg["From"] = smtp_user
     msg["To"] = email_to
     msg["Subject"] = f"Новый заказ #{order_id} | PhotoDoc AI"
-    msg["Message-ID"] = f"<photodoc-order-{order_id}-new@photodoc-ai.ru>"
+    msg["Message-ID"] = message_id(order_id, "new")
 
     safe_folder_name = f"Заказ_{order_id}_{name.replace(' ', '_')}"
     raw_path = f"{get_yandex_disk_root()}/{safe_folder_name}"
@@ -728,7 +765,7 @@ def send_paid_order_email(order_id: int):
     msg["From"] = smtp_user
     msg["To"] = email_to
     msg["Subject"] = f"✅ Заказ #{order_id} ОПЛАЧЕН ({order.get('payment_amount', '0.00')} руб.) | PhotoDoc AI"
-    msg["Message-ID"] = f"<photodoc-order-{order_id}-paid@photodoc-ai.ru>"
+    msg["Message-ID"] = message_id(order_id, "paid")
     body = (
         f"Заказ #{order_id} успешно оплачен!\n"
         f"Клиент: {order.get('name')}\n"
