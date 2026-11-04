@@ -678,6 +678,13 @@ def process_due_cleanups(
         rows = conn.execute(
             "SELECT id FROM delivery_jobs "
             "WHERE state='delivered' AND kind IN ('file', 'info') "
+            # Eligibility, not just permission: an unpaid order's source must be
+            # retained, so it must never occupy a slot in the sweep window.
+            # Without this predicate a backlog of older unpaid jobs keeps
+            # re-entering every sweep and starves newer paid cleanups, and each
+            # futile attempt still takes a write lock in perform_job_cleanup.
+            "AND EXISTS (SELECT 1 FROM orders o "
+            "            WHERE o.id=delivery_jobs.order_id AND o.payment_status='paid') "
             "AND ("
             "  cleanup_state = 'pending' "
             "  OR (cleanup_state = 'failed' AND cleanup_attempts < 10 "

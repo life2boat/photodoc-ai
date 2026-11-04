@@ -628,6 +628,76 @@ def send_order_email(order_id: int, name: str, phone: str, comment: str, format:
         return False
 
 
+def _smtp_dot_stuff(payload: bytes) -> bytes:
+    """SMTP transparency (RFC 5321 §4.5.2): double a leading '.' on any line."""
+    if payload.startswith(b"."):
+        payload = b"." + payload
+    return payload.replace(b"\r\n.", b"\r\n..")
+
+
+def _smtp_transport(host: str, port: int, timeout: float):
+    """Open an SMTP_SSL client that reports where the DATA transaction reached.
+
+    ``smtplib.send_message()`` hides the moment the server accepts the DATA
+    command (354). That moment is the only protocol-level evidence separating
+    "nothing was transmitted" from "content may have been accepted", so it is
+    observed directly instead of being inferred from exception types.
+
+    A substitute transport (test double, mock) cannot report protocol state and
+    is used unchanged; its failures are consequently treated as unproven.
+    """
+    base = smtplib.SMTP_SSL
+    if not (isinstance(base, type) and issubclass(base, smtplib.SMTP)):
+        return base(host, port, timeout=timeout)
+
+    class _ObservedSMTPSSL(base):
+        content_committed = False
+
+        def data(self, payload):
+            self.putcmd("data")
+            code, reply = self.getreply()
+            if code != 354:
+                # Refused before any content, so the server cannot hold it.
+                raise smtplib.SMTPDataError(code, reply)
+            # 354 accepted: message content starts flowing from here.
+            self.content_committed = True
+            if isinstance(payload, str):
+                # Mirror smtplib.SMTP.data: normalise line endings for text input.
+                payload = re.sub(r"(?:\r\n|\n|\r(?!\n))", "\r\n", payload).encode("ascii")
+            body = _smtp_dot_stuff(payload)
+            if not body.endswith(b"\r\n"):
+                body += b"\r\n"
+            self.send(body + b".\r\n")
+            return self.getreply()
+
+    return _ObservedSMTPSSL(host, port, timeout=timeout)
+
+
+def _email_failure_state(error: Exception, phase: str, client) -> str:
+    """Decide whether an SMTP failure may be retried automatically.
+
+    'retry' is only returned when it is provable that no message content could
+    have been accepted:
+
+      * the failure happened before ``send_message()`` was entered — connect,
+        EHLO, TLS handshake or AUTH;
+      * the server explicitly refused the message (``SMTPDataError`` carries the
+        reply code, which is positive evidence of non-acceptance);
+      * the observing client proves the DATA command never received 354.
+
+    Every other outcome stays 'uncertain'. Retrying an ambiguous send risks
+    duplicate mail, and that is never an acceptable trade for availability.
+    """
+    if isinstance(error, smtplib.SMTPDataError):
+        return "retry"
+    if phase != "send":
+        return "retry"
+    committed = getattr(client, "content_committed", None) if client is not None else None
+    if committed is False:
+        return "retry"
+    return "uncertain"
+
+
 def send_paid_order_email(order_id: int):
     """Durable SMTP attempt; ambiguous outcomes require manual reconciliation."""
     order = get_order_by_id(order_id)
@@ -672,17 +742,25 @@ def send_paid_order_email(order_id: int):
     action, attempt = paid_email_outbox.claim(DB_PATH, order_id)
     if action != "send":
         return action == "sent"
-    data_started = False
+    payment_phase = "connect"
+    client = None
     accepted = False
     acknowledged = False
     try:
-        with smtplib.SMTP_SSL(smtp_server, smtp_port, timeout=30) as server:
+        with _smtp_transport(smtp_server, smtp_port, 30) as server:
+            client = server
+            payment_phase = "auth"
             server.login(smtp_user, smtp_password)
             require_paid_order(order_id)
-            data_started = True
+            payment_phase = "send"
             refused = server.send_message(msg)
             if isinstance(refused, dict) and refused:
-                raise RuntimeError("Some email recipients were refused")
+                # At least one recipient accepted and the message received its
+                # final reply, so it was delivered and must never be resent.
+                logging.warning(
+                    "Paid email %s: %s recipient(s) refused: %s",
+                    order_id, len(refused), sorted(refused),
+                )
             accepted = True
             # QUIT failure must not undo a successful DATA acknowledgment.
             paid_email_outbox.record(DB_PATH, order_id, attempt, "sent")
@@ -693,10 +771,7 @@ def send_paid_order_email(order_id: int):
             # if acknowledgment still cannot be committed after bounded retries.
             logging.warning("Paid email %s acknowledgment: %s", order_id, type(error).__name__)
             return acknowledged
-        proven_rejection = isinstance(error, (
-            smtplib.SMTPRecipientsRefused, smtplib.SMTPSenderRefused, smtplib.SMTPDataError,
-        ))
-        state = "uncertain" if data_started and not proven_rejection else "retry"
+        state = _email_failure_state(error, payment_phase, client)
         paid_email_outbox.record(DB_PATH, order_id, attempt, state, type(error).__name__)
         return False
     return True

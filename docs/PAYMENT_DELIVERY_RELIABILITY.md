@@ -38,7 +38,7 @@ attempt counter, timestamps, and explicit states:
 | State | Automatic behavior |
 | --- | --- |
 | pending | Eligible once the order is paid and its delivery job is due |
-| retry | Safe failure before DATA, or a definite SMTP rejection; bounded job backoff |
+| retry | Provable pre-content failure, or a definite SMTP rejection; bounded job backoff |
 | sending | Committed before opening SMTP; only the owning attempt can acknowledge |
 | sent | SMTP accepted and SQL acknowledgment committed; retry never sends again |
 | uncertain | Outcome cannot be established; operator reconciliation required |
@@ -53,12 +53,29 @@ which is excluded from automatic claims. A late acknowledgment can still commit
 only with the original attempt token. A failed QUIT after accepted/recorded DATA
 does not re-send the message. No exception text containing SMTP details is logged.
 
-Timeout/disconnect during send_message, partial recipient acceptance or a process
-crash after the durable claim has an unknown outcome. No automatic resend is
-allowed, even when that means an email might never have been sent. A stable
-Message-ID aids investigation but is not provider-side idempotency. SMTP and a
-local database cannot guarantee exactly-once recipient delivery without such a
-provider feature. See the [Python SMTP contract](https://docs.python.org/3/library/smtplib.html#smtplib.SMTP.sendmail).
+A failure is retried automatically only when it is provable that no content could
+have been accepted:
+
+* connect, EHLO, TLS handshake or AUTH failed, so `send_message()` was never
+  entered;
+* the server replied with a definite rejection (`SMTPDataError` carries the reply
+  code, which is positive evidence of non-acceptance);
+* the client proves the DATA command never received 354.
+
+The client observes the DATA/354 boundary directly (`_smtp_transport` and
+`_ObservedSMTPSSL`), because `smtplib.send_message()` hides it. Without that
+observation, a connection dropped between AUTH and `MAIL FROM` is
+indistinguishable from one during the body — which previously recorded a
+never-transmitted message as `uncertain` and suppressed it permanently.
+
+Everything from the 354 onward — a disconnect or timeout while the body is
+flowing, or a missing final reply — stays `uncertain`. No automatic resend is
+allowed, even when that means an email might never have been sent. A transport
+that cannot report protocol state (a test double, or a future replacement) is
+treated identically: unproven outcomes stay `uncertain`. A stable Message-ID aids
+investigation but is not provider-side idempotency. SMTP and a local database
+cannot guarantee exactly-once recipient delivery without such a provider feature.
+See the [Python SMTP contract](https://docs.python.org/3/library/smtplib.html#smtplib.SMTP.sendmail).
 
 Before resolving uncertain mail, stop its workers, inspect provider delivery
 evidence by order/Message-ID, and record that evidence privately. A verified
@@ -101,19 +118,77 @@ review held legacy email and unpaid-delivery jobs, start the updated version, an
 check the new table before considering worker activation. No migration is run on
 any server by this PR task.
 
-For rollback, keep delivery workers stopped while reverting the application.
-Preserve the new table and all uploaded sources; do not restore an old database
-over newer payment/order records. Old code ignores the table and reintroduces the
-unpaid-delivery and duplicate-email defects, so do not resume its worker. Prefer a
-forward fix that understands the durable attempt evidence. No automatic rollback
-or destructive schema down-migration is provided.
+## Rollback safety
+
+Reverting the application code does **not** remove the new evidence, and the old
+code cannot read it. Two distinct hazards must be handled before any revert:
+
+* Pre-PR code ignores `paid_email_outbox` entirely and retries a paid email
+  whenever `orders.payment_email_sent_at` is NULL. Every row held in `sending` or
+  `uncertain` therefore becomes eligible for an automatic send again, so a
+  message that was actually accepted during an ambiguous attempt can be
+  delivered **twice**.
+* Pre-PR code also reintroduces the unpaid-delivery defect: `file`/`info` jobs of
+  unpaid orders become claimable, are uploaded, and their local sources are
+  deleted.
+
+Safe procedure:
+
+1. Stop every delivery worker, and any script or manual drain that could claim
+   jobs. Reverting with a running old worker is not a safe rollback.
+2. Preserve `paid_email_outbox` and the surrounding `delivery_jobs` rows. They
+   are attempt evidence: do not drop the table, do not bulk-reset states, and do
+   not restore an older database over newer order/payment records.
+3. Before starting the reverted code, make every ambiguous attempt unreachable by
+   the old retry path **without deleting evidence**: for each order whose outbox
+   state is `sending` or `uncertain`, either set `orders.payment_email_sent_at`
+   from verified provider evidence, or keep the workers stopped until that
+   evidence is available. Never leave an `uncertain` row reachable by an old
+   worker.
+4. Record each reconciliation decision privately outside the database: order id,
+   Message-ID, provider evidence, operator and timestamp.
+5. Prefer a forward fix that understands the durable attempt evidence. No
+   automatic rollback and no destructive schema down-migration is provided.
+
+## Known limitations (independently reviewed, accepted and tracked)
+
+None of these is a regression introduced by this change, and none is fixed here:
+
+* **Remote directories for an order that becomes unpaid mid-flight.** The pre-PUT
+  paid recheck runs after `ensure_yandex_folder()`, so empty remote directories
+  can be created for a payment revoked during the request. No file content is
+  uploaded and no local source is deleted.
+* **Optional payment-gate parameter.** `upload_to_yandex_disk(..., order_id=None)`
+  is fail-open: a caller omitting `order_id` skips the transport-level gate. The
+  dispatcher gate and the pre-PUT recheck still apply, so no production path is
+  currently affected, but the parameter should become required.
+* **Schema readiness excludes the new table.** `delivery_schema_ready()`,
+  `reconcile_delivery_schema.py` and `verify_backup_integrity.py` do not know
+  `paid_email_outbox`. Startup creates it and backups copy the whole database via
+  SQLite's backup API, so data is complete; but draining a queue on a database
+  that never went through startup raises `no such table: paid_email_outbox`
+  instead of degrading, and the integrity verifier does not check outbox
+  invariants.
+* **Independent retry budgets.** The outbox claim defaults to 10 attempts and
+  ignores `DELIVERY_MAX_ATTEMPTS`, so the email and its delivery job can disagree
+  about when retrying stops.
 
 ## Verification evidence
 
-The initial full backend suite collected 429 tests: 427 passed and two Windows symlink
-privilege skips; Linux CI passed all 429. The final regression modules contribute
-40 cases, including a mode=ro startup regression and real
-process exits before/after SMTP DATA, post-acceptance SQLite lock contention,
+The full backend suite collects 448 tests: 446 pass and two are Windows symlink
+privilege skips; Linux CI runs the same set. The regression modules contribute 58
+cases: 40 in the original reliability/concurrency modules plus 18 in
+`tests/test_smtp_protocol_stage.py`, which drives a **real implicit-TLS SMTP server
+over a loopback socket** and covers every protocol stage — disconnect before
+`MAIL FROM`, during `RCPT`, before `DATA`, inside the body, a definite rejection
+after the body, an explicit `421` to `DATA`, AUTH rejection, TLS handshake failure,
+connection refused, successful acceptance, and proof that an `uncertain` attempt is
+never repeated while a `retry` one is. It also covers cleanup eligibility with 20,
+100 and 1 000 older unpaid legacy jobs in front of a newer paid job, that unpaid
+jobs are never even attempted, that an unpaid job becomes eligible once paid, and
+that payment is rechecked at the deletion boundary. The remaining 40 cases include
+a mode=ro startup regression, real process
+exits before/after SMTP DATA, post-acceptance SQLite lock contention,
 multiple workers/direct email callers, invalid signed OutSum values, unpaid
 file/info retention and legacy mail migration. An independent four-worker run
 also passed: eight public-API synthetic orders, half paid, duplicate callbacks,
