@@ -334,7 +334,8 @@ def run_preflight(
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="PhotoDoc AI — R2 Staging Preflight Checker")
-    parser.add_argument("--domain", default="photodoc-ai.ru", help="Domain to test")
+    parser.add_argument("--domain", default="photo1storage.ru",
+                        help="Domain to test (default: the canonical served domain)")
     parser.add_argument("--expected-ip", help="Expected IPv4 address")
     parser.add_argument("--skip-tls-verify", action="store_true", help="Allow self-signed or invalid certs in staging")
     parser.add_argument("--forbidden-ports", nargs="*", type=int, default=[8000, 8080], help="Ports that must be closed")

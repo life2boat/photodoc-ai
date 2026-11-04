@@ -91,7 +91,11 @@ def test_mixed_paid_unpaid_four_workers_lock_contention_and_restart(tmp_path, mo
                 futures=[pool.submit(run_worker) for i in range(4)]
                 for f in futures:f.result(timeout=30)
     assert len(puts)==len(set(puts))==len(paid)*2
-    assert Counter(smtp_ids)==Counter(f"<photodoc-order-{oid}-paid@photodoc-ai.ru>" for oid in paid)
+    # Message identity follows the configured mailbox domain, not a hardcoded
+    # literal. This fixture authenticates as owner@example.invalid.
+    expected_domain=main.get_mail_domain()
+    assert expected_domain=="example.invalid"
+    assert Counter(smtp_ids)==Counter(f"<photodoc-order-{oid}-paid@{expected_domain}>" for oid in paid)
     with sqlite3.connect(main.DB_PATH) as c:
         for oid in paid:
             assert c.execute("SELECT DISTINCT state FROM delivery_jobs WHERE order_id=?",(oid,)).fetchall()==[("delivered",)]
