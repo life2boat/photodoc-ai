@@ -70,13 +70,17 @@ EVIDENCE_FORMAT_VERSION = db_evidence.EVIDENCE_FORMAT_VERSION
 SET_ID_RE = re.compile(r"^(?:[0-9a-fA-F]{32}|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-"
                        r"[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$")
 ALLOWED_UPLOAD_KEYS = {"members", "uncompressed_bytes"}
+ALLOWED_ARTIFACT_KEYS = set(MANIFEST_ARTIFACTS)
+#: The recorded SQLite version is informational (the engine that produced the database),
+#: so it is validated for shape but not required to equal the verifier's runtime version.
+SQLITE_VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
 
 #: Top-level manifest keys this version understands. An unknown key means the set
 #: was produced by a different contract, which must not be interpreted silently.
 ALLOWED_MANIFEST_KEYS = {
     "format_version", "set_id", "created_at", "artifacts", "application_id",
     "evidence_format", "schema_digest", "logical_digest", "database_identity",
-    "uploads", "verification", "trust_note",
+    "uploads", "verification", "trust_note", "restore_uploads_root",
 }
 ALLOWED_IDENTITY_KEYS = {"application_id", "schema_digest", "logical_digest",
                          "sqlite_version"}
@@ -114,7 +118,8 @@ def build_manifest(*, artifacts: Dict[str, str], created_at: datetime,
                    upload_members: int, upload_bytes: int,
                    verification: str = "PASS",
                    evidence_format: int = EVIDENCE_FORMAT_VERSION,
-                   set_id: Optional[str] = None) -> Dict[str, Any]:
+                   set_id: Optional[str] = None,
+                   restore_uploads_root: Optional[str] = None) -> Dict[str, Any]:
     """Assemble the metadata document for a verified set."""
     for name in MANIFEST_ARTIFACTS:
         if not _is_hex64(artifacts.get(name)):
@@ -132,6 +137,9 @@ def build_manifest(*, artifacts: Dict[str, str], created_at: datetime,
         raise FormatError("upload_members must be a non-negative integer")
     if not isinstance(upload_bytes, int) or upload_bytes < 0:
         raise FormatError("upload_bytes must be a non-negative integer")
+    if restore_uploads_root is not None and (
+            not isinstance(restore_uploads_root, str) or not restore_uploads_root):
+        raise FormatError("restore_uploads_root must be a non-empty string when provided")
     identity = dict(database_identity)
     identity.setdefault("application_id", application_id)
     identity.setdefault("schema_digest", schema_digest)
@@ -152,6 +160,7 @@ def build_manifest(*, artifacts: Dict[str, str], created_at: datetime,
         "uploads": {"members": upload_members, "uncompressed_bytes": upload_bytes},
         "verification": verification,
         "trust_note": TRUST_NOTE,
+        "restore_uploads_root": restore_uploads_root,
     }
 
 
@@ -172,14 +181,14 @@ def staging_dir_for(final_dir: Path) -> Path:
 
 
 #: errno values that mean "this platform cannot flush this kind of handle", as opposed
-#: to an I/O failure that must abort publication.
+#: to an I/O or permission failure that must abort publication. EPERM/EACCES are
+#: deliberately absent: a permission or policy denial is not proof that the filesystem
+#: cannot flush, and treating it as "unsupported" let a set publish without any flush.
 _FSYNC_UNSUPPORTED_ERRNOS = {errno.EINVAL, errno.ENOSYS, errno.EBADF}
 if hasattr(errno, "ENOTSUP"):
     _FSYNC_UNSUPPORTED_ERRNOS.add(errno.ENOTSUP)
 if hasattr(errno, "EOPNOTSUPP"):
     _FSYNC_UNSUPPORTED_ERRNOS.add(errno.EOPNOTSUPP)
-if hasattr(errno, "EPERM"):
-    _FSYNC_UNSUPPORTED_ERRNOS.add(errno.EPERM)
 
 
 def fsync_file(path: Path) -> str:
@@ -430,6 +439,10 @@ def verify_set(directory: Path, *, expected_application_id: Optional[int] = None
     if not isinstance(recorded, dict):
         errors.append("manifest artifacts is not an object")
         recorded = {}
+    else:
+        unknown_artifacts = set(recorded) - ALLOWED_ARTIFACT_KEYS
+        if unknown_artifacts:
+            errors.append(f"manifest artifacts has unknown fields: {sorted(unknown_artifacts)}")
     for name in MANIFEST_ARTIFACTS:
         if recorded.get(name) != actual[name]:
             errors.append(
@@ -508,6 +521,11 @@ def verify_set(directory: Path, *, expected_application_id: Optional[int] = None
                     errors.append(
                         "the backup database application_id does not match the expected "
                         "application")
+            recorded_version = identity.get("sqlite_version")
+            if recorded_version is not None and not SQLITE_VERSION_RE.match(str(recorded_version)):
+                errors.append(
+                    f"database_identity.sqlite_version is malformed: {recorded_version!r}; "
+                    "expected a MAJOR.MINOR.PATCH version string")
             for label, expected_value in (("schema_digest", recomputed.get("schema_digest")),
                                           ("logical_digest", recomputed.get("logical_digest"))):
                 recorded_value = identity.get(label)
@@ -528,6 +546,24 @@ def verify_set(directory: Path, *, expected_application_id: Optional[int] = None
         report["checks"]["recovery"] = recovery
         if not recovery_ok:
             errors.extend(recovery.get("errors", []))
+        recorded_root = recovery.get("required", {}).get("uploads_root")
+        # H2: the restore root is bound only when there are originals to place. An empty
+        # set has no recorded path to bind, so its absence is not a defect.
+        restore_root = manifest.get("restore_uploads_root")
+        if recorded_root is not None:
+            if not isinstance(restore_root, str) or not restore_root:
+                errors.append(
+                    "the manifest does not record restore_uploads_root: the path the "
+                    "restored application will use cannot be bound")
+            else:
+                if Path(restore_root.replace("\\", "/")).name != "uploads":
+                    errors.append(
+                        f"restore_uploads_root {restore_root!r} does not name an uploads "
+                        "directory")
+                if restore_root != recorded_root:
+                    errors.append(
+                        f"restore_uploads_root {restore_root!r} disagrees with the "
+                        f"database's recorded uploads root {recorded_root!r}")
     elif deep and not database_ok:
         errors.append("cannot deep-verify recovery files without the backup database")
 

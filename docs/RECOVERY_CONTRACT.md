@@ -37,6 +37,10 @@ because the mapping is ambiguous until an operator reconciles those orders into
 `delivery_jobs`. `exclude` is not offered — for a *backup* it means deliberately discarding
 the only copy of a customer file.
 
+An order whose `filename` is empty, NULL or unparseable is **refused** under `include`: an
+empty list does not prove that no original ever existed. A stored layout claimed by more
+than one original is refused as ambiguous.
+
 ## 2. Job kinds
 
 | Kind | File ownership | Rule |
@@ -48,6 +52,10 @@ the only copy of a customer file.
 | unknown | — | refused: the contract cannot guess whether a file is required |
 
 An email job with a `local_path` is contradictory and is refused rather than ignored.
+Email jobs have a recognized state too: `state` must be one of the known states,
+`cleanup_state` must be `not_applicable`, `cleanup_phase` must be `none`, and no
+`local_deleted_at` may be set. An unknown email state is refused rather than hidden behind
+"no file to check".
 
 ## 3. State × cleanup matrix (upload-backed kinds)
 
@@ -72,6 +80,23 @@ Additional contradictions, all refusals:
   proves nothing);
 * a `file`/`info` job with an empty `local_path`;
 * a required job without a valid `content_sha256` or `content_size`.
+
+### 3a. Order-to-job completeness (P1)
+
+Being P1 does not by itself prove that every order still has its jobs. A partial migration
+or a missing row can leave an order with an `orders.filename` but no `file` job, in which
+case the original is unaddressable and must not be silently dropped. The application
+creates, atomically with each order, one `file` job per attachment name and exactly one
+`info` job. Both invariants are checked per order (including unpaid orders); a mismatch, or
+an empty `filename`, is a refusal — not "zero originals".
+
+### 3b. Restore-root binding
+
+Every required original must be restorable to the **exact path the application records**.
+All required `local_path` values must share one uploads root; it is recorded as
+`restore_uploads_root`, and the restore rehearsal extracts members to that root and verifies
+`local_path == <root>/<basename>`, not just the basename and hash. A target-root relocation
+therefore needs an explicit, verified path rewrite or is refused.
 
 ## 4. Archive path contract
 

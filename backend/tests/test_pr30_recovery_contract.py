@@ -42,7 +42,15 @@ CREATE TABLE orders (
 
 
 # --------------------------------------------------------------------- fixtures
-def p1_db(path: Path, *, jobs=(), orders=((1, "paid", "tok"),)) -> Path:
+INFO_BYTES = b"order info file"
+
+
+def p1_db(path: Path, *, jobs=(), orders=((1, "paid", "tok"),),
+          auto_complete: bool = True) -> Path:
+    """A P1 database. With ``auto_complete``, each order is completed with the
+    ``filename`` derived from its file jobs and an already-delivered ``info`` job, so the
+    recovery completeness check (one file job per name, exactly one info job) accepts it.
+    """
     path = Path(path)
     conn = sqlite3.connect(path)
     conn.execute(f"PRAGMA application_id = {APPLICATION_ID}")
@@ -72,7 +80,31 @@ def p1_db(path: Path, *, jobs=(), orders=((1, "paid", "tok"),)) -> Path:
     for order_id, status, token in orders:
         conn.execute("INSERT INTO orders (id, customer, filename, payment_status, "
                      "order_token_hash) VALUES (?,?,?,?,?)",
-                     (order_id, f"C{order_id}", None, status, token))
+                     (order_id, f"C{order_id}", "", status, token))
+
+    if auto_complete:
+        for order_id, _status, _token in orders:
+            file_jobs = [j for j in jobs if j.get("order_id", 1) == order_id
+                         and j.get("kind") == "file"]
+            names = []
+            for job in file_jobs:
+                lp = (job.get("local_path") or "").replace("\\", "/")
+                names.append(Path(lp).name if lp else f"{job['id']}.jpg")
+            conn.execute("UPDATE orders SET filename=? WHERE id=?",
+                         (", ".join(names), order_id))
+            has_info = any(j.get("order_id", 1) == order_id and j.get("kind") == "info"
+                           for j in jobs)
+            if not has_info:
+                conn.execute(
+                    "INSERT INTO delivery_jobs (id, order_id, kind, local_path, "
+                    "content_sha256, content_size, state, cleanup_state, cleanup_phase, "
+                    "local_deleted_at, delivered_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    (f"info-{order_id}", order_id, "info",
+                     f"/app/uploads/{order_id}_info.txt",
+                     hashlib.sha256(INFO_BYTES).hexdigest(), len(INFO_BYTES),
+                     "delivered", "completed", "deleted",
+                     "2026-01-01T00:10:00+00:00", "2026-01-01T00:05:00+00:00"))
+
     for job in jobs:
         columns = ", ".join(job)
         placeholders = ", ".join("?" for _ in job)
@@ -143,6 +175,7 @@ def build_set(db: Path, dest: Path, members: dict[str, bytes]) -> Path:
     finally:
         conn.close()
     info, _ = backup_format.inspect_archive(archive)
+    _req, _grp, _err, _stats = recovery_artifacts.required_sources(dest / "orders.db")
     manifest = backup_format.build_manifest(
         artifacts={"orders.db": backup_format.sha256_file(dest / "orders.db"),
                    "uploads.tar.gz": backup_format.sha256_file(archive)},
@@ -151,7 +184,8 @@ def build_set(db: Path, dest: Path, members: dict[str, bytes]) -> Path:
         database_identity={"application_id": APPLICATION_ID,
                            "schema_digest": schema["digest"],
                            "logical_digest": logical},
-        upload_members=info["members"], upload_bytes=info["bytes"])
+        upload_members=info["members"], upload_bytes=info["bytes"],
+        restore_uploads_root=_stats.get("uploads_root"))
     backup_format.write_manifest_files(dest, manifest)
     return dest
 
@@ -284,7 +318,7 @@ def test_a_delivered_durably_deleted_job_is_exempt(tmp_path):
     required, _groups, errors, stats = recovery_artifacts.required_sources(db)
     assert not errors
     assert not required
-    assert stats["cleaned"] == 1
+    assert stats["cleaned"] >= 1
 
 
 def test_a_delivered_uncleaned_job_is_not_required_but_must_not_be_archived(tmp_path):
@@ -433,10 +467,12 @@ def test_email_jobs_are_database_backed(tmp_path):
          "content_sha256": None, "content_size": None, "state": "pending",
          "cleanup_state": "not_applicable", "cleanup_phase": "none"},
     )
+    jobs = jobs + (file_job(),)
     db = p1_db(tmp_path / "db.db", jobs=jobs)
     required, _groups, errors, stats = recovery_artifacts.required_sources(db)
     assert not errors
-    assert not required
+    # only the file job's original is required; email jobs own no file
+    assert set(required) == {"uploads/photo.jpg"}
     assert stats["email_jobs"] == 2
 
 
@@ -461,9 +497,11 @@ def test_an_unknown_job_kind_is_refused(tmp_path):
 
 def test_info_jobs_are_upload_backed(tmp_path):
     data = OTHER
-    job = file_job(name="/app/uploads/info.pdf", data=data)
-    job["kind"] = "info"
-    db = p1_db(tmp_path / "db.db", jobs=(job,))
+    file = file_job(name="/app/uploads/photo.jpg", data=GOOD)
+    info = file_job(name="/app/uploads/info.pdf", data=data)
+    info["id"] = "job-info"
+    info["kind"] = "info"
+    db = p1_db(tmp_path / "db.db", jobs=(file, info))
     required, _groups, errors, _stats = recovery_artifacts.required_sources(db)
     assert not errors
     assert "uploads/info.pdf" in required

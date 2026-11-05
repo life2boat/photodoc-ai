@@ -182,10 +182,12 @@ true. Both are now checked.
 ### Publication
 
 `publish_set()` refuses to overwrite an existing set — a set ID identifies one set forever —
-and flushes every file before the rename. A **file** fsync failure aborts publication; only
-a genuinely unsupported handle is tolerated, and `fsync_supported` records it. The parent
-directory flush is best-effort and reported separately. A `.tmp-*` staging directory is
-never a set and is refused by verification.
+and flushes every file before the rename. A **file** fsync failure, including a permission
+denial (`EPERM`/`EACCES`), aborts publication: permission failure is not proof that the
+filesystem cannot flush. Only a genuinely unsupported handle (`EINVAL`/`ENOSYS`/`EBADF`) is
+tolerated and recorded via `fsync_supported`. The parent directory flush is best-effort and
+reported separately. A `.tmp-*` staging directory is never a set and is refused by
+verification.
 
 ## 9. Producer and version compatibility
 

@@ -159,6 +159,7 @@ def scan_archive(archive_path: Path, limits: Limits = DEFAULT_LIMITS
                             "bytes": 0, "hashed_bytes": 0}
     errors: List[str] = validate_gzip_trailer(Path(archive_path), limits)
     seen: Dict[str, str] = {}
+    directory_names: List[str] = []
 
     try:
         with tarfile.open(archive_path, "r:gz") as tar:
@@ -179,6 +180,7 @@ def scan_archive(archive_path: Path, limits: Limits = DEFAULT_LIMITS
 
                 if member.isdir():
                     info["directories"] += 1
+                    directory_names.append(name)
                     continue
                 if member.issym() or member.islnk():
                     errors.append(f"archive contains a link member: {name!r}")
@@ -230,6 +232,18 @@ def scan_archive(archive_path: Path, limits: Limits = DEFAULT_LIMITS
                 members[name] = {"size": member.size, "sha256": digest.hexdigest()}
     except (OSError, tarfile.TarError, EOFError) as exc:
         errors.append(f"cannot read the upload archive: {exc}")
+
+    # M3: the contract is exactly one `uploads` root directory entry and no other
+    # directories. A set without it, or with an extra directory, is not the same layout
+    # a restore will produce.
+    if UPLOAD_ROOT not in directory_names:
+        errors.append("the archive is missing its uploads/ root directory entry")
+    extra_dirs = sorted({n for n in directory_names if n != UPLOAD_ROOT})
+    if extra_dirs:
+        errors.append(f"the archive has unexpected directory entries: {extra_dirs}")
+    if directory_names.count(UPLOAD_ROOT) > 1:
+        errors.append("the archive has duplicate uploads/ directory entries")
+
     return members, info, errors
 
 
@@ -322,9 +336,10 @@ def required_sources(db_path: Path, *, legacy_p0_policy: str = "fail",
     required: Dict[str, Dict[str, Any]] = {}
     groups: List[Dict[str, Any]] = []
     errors: List[str] = []
+    roots: set[str] = set()
     stats: Dict[str, Any] = {"generation": None, "jobs": 0, "required": 0, "cleaned": 0,
                              "exempt": 0, "email_jobs": 0, "p0_orders": 0,
-                             "policy": legacy_p0_policy}
+                             "policy": legacy_p0_policy, "uploads_root": None}
 
     if legacy_p0_policy not in P0_POLICIES:
         return {}, [], [f"unknown --legacy-p0-policy {legacy_p0_policy!r}; "
@@ -349,19 +364,38 @@ def required_sources(db_path: Path, *, legacy_p0_policy: str = "fail",
                     "customer files. Reconcile the legacy orders into delivery_jobs, or pass "
                     "--legacy-p0-policy include to require the candidates explicitly.")
             else:
+                claimed: Dict[str, str] = {}
                 for order_id, filename in conn.execute(
                         "SELECT id, filename FROM orders ORDER BY id").fetchall():
                     raw = (filename or "").strip()
-                    if not raw:
+                    names = [n.strip() for n in raw.split(",") if n.strip()]
+                    # H3: an order with no usable filename does not prove that no
+                    # customer original ever existed — it is indistinguishable from a
+                    # damaged legacy row.
+                    if not raw or not names:
+                        errors.append(
+                            f"P0 order {order_id} has an empty or unparseable filename; "
+                            "refusing to treat it as an order with no original")
                         continue
-                    members = [n.strip() for n in raw.split(",") if n.strip()]
-                    for index, name in enumerate(members):
+                    for index, name in enumerate(names):
                         candidates = _p0_candidates(order_id, name)
                         if not candidates:
+                            errors.append(
+                                f"P0 order {order_id} name {name!r} produced no candidate "
+                                "archive path")
                             continue
+                        group_key = f"{order_id}:{index}:{name}"
+                        for candidate in candidates:
+                            previous = claimed.get(candidate)
+                            if previous is not None and previous != group_key:
+                                errors.append(
+                                    f"two claimed originals map to the same stored layout "
+                                    f"{candidate!r} ({previous} and {group_key}); the original "
+                                    "is ambiguous")
+                            claimed.setdefault(candidate, group_key)
                         groups.append({"order_id": order_id, "name": name,
-                                       "candidates": candidates,
-                                       "group": f"{order_id}:{index}"})
+                                       "candidates": candidates, "group": group_key})
+            stats["uploads_root"] = UPLOAD_ROOT
             return required, groups, errors, stats
 
         if generation == "mixed":
@@ -369,6 +403,34 @@ def required_sources(db_path: Path, *, legacy_p0_policy: str = "fail",
                 "mixed schema: delivery_jobs exists but orders.order_token_hash does not. "
                 "The delivery records cannot be trusted to describe every order, so the "
                 "required file set cannot be derived. Migrate the schema first.")
+
+        # H1: being P1 does not by itself prove that every order still has its jobs.
+        # A partial migration or a missing row can leave an order with a filename but no
+        # file job, in which case the original is unaddressable and must not be silently
+        # dropped. The application creates, atomically with the order: one file job per
+        # attachment name, exactly one info job, and exactly one admin_email job.
+        by_order: Dict[int, Dict[str, int]] = {}
+        for order_id, kind, count in conn.execute(
+                "SELECT order_id, kind, COUNT(*) FROM delivery_jobs "
+                "GROUP BY order_id, kind").fetchall():
+            by_order.setdefault(order_id, {})[kind] = count
+        for order_id, filename in conn.execute(
+                "SELECT id, filename FROM orders ORDER BY id").fetchall():
+            names = [n.strip() for n in (filename or "").split(",") if n.strip()]
+            counts = by_order.get(order_id, {})
+            if not names:
+                errors.append(
+                    f"order {order_id} has an empty filename: an order with no recorded "
+                    "attachment cannot be distinguished from a damaged one, so its original "
+                    "cannot be assumed absent")
+            if counts.get("file", 0) != len(names):
+                errors.append(
+                    f"order {order_id} records {len(names)} attachment name(s) but has "
+                    f"{counts.get('file', 0)} file job(s); the original(s) cannot be selected")
+            if counts.get("info", 0) != 1:
+                errors.append(
+                    f"order {order_id} must have exactly one info job (has "
+                    f"{counts.get('info', 0)})")
 
         rows = conn.execute(
             "SELECT id, order_id, kind, state, local_path, content_sha256, content_size, "
@@ -383,8 +445,9 @@ def required_sources(db_path: Path, *, legacy_p0_policy: str = "fail",
             pass
         conn.close()
 
-    if errors:
-        return required, groups, errors, stats
+    # Note: completeness/state errors above are collected but do NOT short-circuit the
+    # per-job loop, so a single damaged database yields every reason rather than only the
+    # first. A refused set stays refused.
 
     for (job_id, order_id, kind, state, local_path, sha, size,
          cleanup_state, cleanup_phase, deleted_at, delivered_at) in rows:
@@ -397,6 +460,25 @@ def required_sources(db_path: Path, *, legacy_p0_policy: str = "fail",
 
         if kind in DATABASE_KINDS:
             stats["email_jobs"] += 1
+            # M1: database-backed jobs have no file, but their state and cleanup metadata
+            # are still evidence and must be valid; an unknown state must not be hidden
+            # behind "no file to check".
+            if state not in KNOWN_STATES:
+                errors.append(
+                    f"job {job_id!r} (order {order_id}, kind {kind}) has unrecognised "
+                    f"state {state!r}")
+            if cleanup_state != "not_applicable":
+                errors.append(
+                    f"job {job_id!r} (order {order_id}, kind {kind}) has cleanup_state "
+                    f"{cleanup_state!r}; a database-backed job records 'not_applicable'")
+            if cleanup_phase != "none":
+                errors.append(
+                    f"job {job_id!r} (order {order_id}, kind {kind}) has cleanup_phase "
+                    f"{cleanup_phase!r}; a database-backed job has no file to delete")
+            if deleted_at:
+                errors.append(
+                    f"job {job_id!r} (order {order_id}, kind {kind}) records "
+                    "local_deleted_at although it owns no local file")
             if local_path:
                 errors.append(
                     f"job {job_id!r} (order {order_id}, kind {kind}) is a database-backed "
@@ -426,6 +508,7 @@ def required_sources(db_path: Path, *, legacy_p0_policy: str = "fail",
                 "location")
             continue
         member = f"{UPLOAD_ROOT}/{basename}"
+        roots.add(Path(normalised).parent.as_posix())
 
         if state not in KNOWN_STATES:
             errors.append(f"job {job_id!r} has unrecognised state {state!r}")
@@ -482,6 +565,16 @@ def required_sources(db_path: Path, *, legacy_p0_policy: str = "fail",
             stats["cleaned"] += 1
         else:
             stats["exempt"] += 1
+
+    # H2: every required original must live under one uploads root, so a single restore
+    # root can satisfy every recorded path. Different roots mean the set cannot be
+    # restored to the paths the application will use.
+    if len(roots) > 1:
+        errors.append(
+            f"required originals are recorded under {len(roots)} different uploads roots "
+            f"({', '.join(sorted(roots))}); a single restore root cannot satisfy all of them")
+    elif roots:
+        stats["uploads_root"] = sorted(roots)[0]
 
     return required, groups, errors, stats
 

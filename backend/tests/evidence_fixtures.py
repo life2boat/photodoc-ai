@@ -51,6 +51,7 @@ def build_database(path: Path, *, variant: str = "base") -> Path:
                 customer TEXT NOT NULL,
                 amount TEXT CHECK (length(amount) > 0),
                 note TEXT DEFAULT 'none',
+                filename TEXT,
                 order_token_hash TEXT
             );
             CREATE TABLE delivery_jobs (
@@ -92,8 +93,29 @@ def build_database(path: Path, *, variant: str = "base") -> Path:
             CREATE VIEW v_orders AS SELECT id, customer FROM orders;
             """
         )
-        conn.executemany("INSERT INTO orders (customer, amount, note) VALUES (?,?,?)",
-                         [("ann", "10.00", "a"), ("bob", "20.00", "b")])
+        conn.executemany(
+            "INSERT INTO orders (customer, amount, note, filename) VALUES (?,?,?,?)",
+            [("ann", "10.00", "a", "ann.jpg"), ("bob", "20.00", "b", "bob.jpg")])
+        # Complete the P1 delivery invariant: one delivered-and-deleted file job per
+        # filename and one delivered-and-deleted info job, so the recovery completeness
+        # check accepts the fixture without requiring any archived originals.
+        for order_id, original in ((1, "ann.jpg"), (2, "bob.jpg")):
+            conn.execute(
+                "INSERT INTO delivery_jobs (id, order_id, kind, state, local_path, "
+                "content_sha256, content_size, cleanup_state, cleanup_phase, "
+                "local_deleted_at, delivered_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (f"file-{order_id}", order_id, "file", "delivered",
+                 f"/app/uploads/{order_id}_{original}", "0" * 64, 4,
+                 "completed", "deleted", "2026-01-01T00:10:00+00:00",
+                 "2026-01-01T00:05:00+00:00"))
+            conn.execute(
+                "INSERT INTO delivery_jobs (id, order_id, kind, state, local_path, "
+                "content_sha256, content_size, cleanup_state, cleanup_phase, "
+                "local_deleted_at, delivered_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (f"info-{order_id}", order_id, "info", "delivered",
+                 f"/app/uploads/{order_id}_info.txt", "0" * 64, 4,
+                 "completed", "deleted", "2026-01-01T00:10:00+00:00",
+                 "2026-01-01T00:05:00+00:00"))
         conn.executemany("INSERT INTO wr_items VALUES (?,?,?)",
                          [(1, 1, "first"), (1, 2, "second"), (2, 1, "third")])
         conn.execute("INSERT INTO shadowed VALUES ('x', 'one')")
@@ -114,7 +136,20 @@ def build_database(path: Path, *, variant: str = "base") -> Path:
         elif variant == "shadow_row":
             conn.execute("UPDATE shadowed SET value='CHANGED' WHERE rowid='y'")
         elif variant == "backup_only_row":
-            conn.execute("INSERT INTO orders (customer, amount, note) VALUES ('eve','30.00','c')")
+            conn.execute("INSERT INTO orders (customer, amount, note, filename) "
+                         "VALUES ('eve','30.00','c','eve.jpg')")
+            conn.execute(
+                "INSERT INTO delivery_jobs (id, order_id, kind, state, local_path, "
+                "content_sha256, content_size, cleanup_state, cleanup_phase, "
+                "local_deleted_at, delivered_at) VALUES ('file-3', 3, 'file', 'delivered', "
+                "'/app/uploads/3_eve.jpg', ?, 4, 'completed', 'deleted', "
+                "'2026-01-01T00:10:00+00:00', '2026-01-01T00:05:00+00:00')", ("0" * 64,))
+            conn.execute(
+                "INSERT INTO delivery_jobs (id, order_id, kind, state, local_path, "
+                "content_sha256, content_size, cleanup_state, cleanup_phase, "
+                "local_deleted_at, delivered_at) VALUES ('info-3', 3, 'info', 'delivered', "
+                "'/app/uploads/3_info.txt', ?, 4, 'completed', 'deleted', "
+                "'2026-01-01T00:10:00+00:00', '2026-01-01T00:05:00+00:00')", ("0" * 64,))
         elif variant == "sequence":
             conn.execute("INSERT INTO orders (customer, amount, note) VALUES ('zed','40.00','d')")
             conn.execute("DELETE FROM orders WHERE customer='zed'")
@@ -207,6 +242,9 @@ def make_set(live_db: Path, destination: Path, *,
                 + ", ".join(needed))
         upload_files = {}
 
+    _rq, _gr, _er, _st = recovery_artifacts.required_sources(backup_db)
+    restore_root = _st.get("uploads_root")
+
     uploads = make_uploads(destination.parent / f"uploads-{destination.name}", upload_files)
     archive = uploads_tar(uploads, destination / backup_format.TAR_FILE)
 
@@ -232,6 +270,7 @@ def make_set(live_db: Path, destination: Path, *,
         upload_members=info["members"],
         upload_bytes=info["bytes"],
         verification=verification,
+        restore_uploads_root=restore_root,
     )
     if mutate_manifest is not None:
         mutate_manifest(manifest)
@@ -278,10 +317,12 @@ def build_delivery_database(path: Path, uploads_dir: Path, *,
                             photo: bytes = GOOD_PHOTO,
                             second: bytes = OTHER_PHOTO,
                             cleaned: bool = True) -> Path:
-    """A database whose delivery jobs require verifiable recovery originals.
+    """A P1-complete database whose delivery jobs require verifiable originals.
 
-    One pending ``file`` job, one ``info`` job, and (optionally) a delivered job with
-    durable deletion evidence whose file must *not* be required.
+    Mirrors the application's order-to-job invariant (one ``file`` job per
+    ``orders.filename`` entry, exactly one ``info`` job, exactly one ``admin_email``
+    job), so the recovery completeness check accepts it. One pending ``file`` job, one
+    ``info`` job, and (optionally) a delivered-and-durably-deleted ``file`` job.
     """
     import hashlib
 
@@ -301,6 +342,7 @@ def build_delivery_database(path: Path, uploads_dir: Path, *,
             CREATE TABLE orders (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 payment_status TEXT,
+                filename TEXT,
                 order_token_hash TEXT
             );
             CREATE TABLE delivery_jobs (
@@ -312,32 +354,40 @@ def build_delivery_database(path: Path, uploads_dir: Path, *,
                 content_sha256 TEXT,
                 content_size INTEGER,
                 cleanup_state TEXT DEFAULT 'pending',
-                cleanup_phase TEXT,
-local_deleted_at TEXT,
+                cleanup_phase TEXT DEFAULT 'none',
+                local_deleted_at TEXT,
                 delivered_at TEXT
             );
             """
         )
-        conn.execute("INSERT INTO orders (id, payment_status) VALUES (1,'paid')")
-        conn.execute("INSERT INTO orders (id, payment_status) VALUES (2,'paid')")
+        conn.execute(
+            "INSERT INTO orders (id, payment_status, filename, order_token_hash) "
+            "VALUES (1,'paid','photo.jpg, gone.jpg','tok1')")
         conn.execute(
             "INSERT INTO delivery_jobs (id, order_id, kind, state, local_path, "
-            "content_sha256, content_size) VALUES (?,?,?,?,?,?,?)",
+            "content_sha256, content_size, cleanup_state, cleanup_phase) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
             ("job-file", 1, "file", "pending", "/app/uploads/photo.jpg",
-             hashlib.sha256(photo).hexdigest(), len(photo)))
+             hashlib.sha256(photo).hexdigest(), len(photo), "pending", "none"))
         conn.execute(
             "INSERT INTO delivery_jobs (id, order_id, kind, state, local_path, "
-            "content_sha256, content_size) VALUES (?,?,?,?,?,?,?)",
-            ("job-info", 2, "info", "pending", "/app/uploads/info.pdf",
-             hashlib.sha256(second).hexdigest(), len(second)))
+            "content_sha256, content_size, cleanup_state, cleanup_phase) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            ("job-info", 1, "info", "pending", "/app/uploads/info.pdf",
+             hashlib.sha256(second).hexdigest(), len(second), "pending", "none"))
+        conn.execute(
+            "INSERT INTO delivery_jobs (id, order_id, kind, state, cleanup_state, "
+            "cleanup_phase) VALUES (?,?,?,?,?,?)",
+            ("admin-1", 1, "admin_email", "pending", "not_applicable", "none"))
         if cleaned:
             conn.execute(
                 "INSERT INTO delivery_jobs (id, order_id, kind, state, local_path, "
                 "content_sha256, content_size, cleanup_state, cleanup_phase, "
-                "local_deleted_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                "local_deleted_at, delivered_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 ("job-cleaned", 1, "file", "delivered", "/app/uploads/gone.jpg",
                  hashlib.sha256(b"deleted long ago").hexdigest(), 18,
-                 "completed", "deleted", "2026-01-01T00:10:00+00:00"))
+                 "completed", "deleted", "2026-01-01T00:10:00+00:00",
+                 "2026-01-01T00:05:00+00:00"))
         conn.commit()
     finally:
         conn.close()

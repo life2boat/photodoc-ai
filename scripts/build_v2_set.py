@@ -195,7 +195,8 @@ def _finalise(staging: Path, output: Path, evidence: dict, limits,
                            "logical_digest": evidence["logical_digest"],
                            "sqlite_version": evidence["sqlite_version"]},
         upload_members=info["members"], upload_bytes=info["bytes"],
-        verification="PASS")
+        verification="PASS",
+        restore_uploads_root=recovery["required"].get("uploads_root"))
     backup_format.write_manifest_files(staging, manifest)
 
     verified, report = backup_format.verify_set(
