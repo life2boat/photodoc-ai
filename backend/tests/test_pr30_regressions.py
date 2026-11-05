@@ -245,7 +245,7 @@ def test_a_job_with_an_unknown_state_is_refused(tmp_path, delivery):
         conn.commit()
     finally:
         conn.close()
-    _, errors, _ = recovery_artifacts.required_sources(db)
+    _, _groups, errors, _stats = recovery_artifacts.required_sources(db)
     assert any("unrecognised state" in e for e in errors)
 
 

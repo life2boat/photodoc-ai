@@ -28,6 +28,7 @@ for _p in (str(BACKEND_DIR), str(SCRIPTS_DIR)):
 
 import backup_format  # noqa: E402
 import db_evidence  # noqa: E402
+import recovery_artifacts  # noqa: E402
 
 APPLICATION_ID = 1346650441
 NOW = datetime.now(timezone.utc)
@@ -49,7 +50,21 @@ def build_database(path: Path, *, variant: str = "base") -> Path:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 customer TEXT NOT NULL,
                 amount TEXT CHECK (length(amount) > 0),
-                note TEXT DEFAULT 'none'
+                note TEXT DEFAULT 'none',
+                order_token_hash TEXT
+            );
+            CREATE TABLE delivery_jobs (
+                id TEXT PRIMARY KEY,
+                order_id INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                local_path TEXT,
+                content_sha256 TEXT,
+                content_size INTEGER,
+                state TEXT NOT NULL DEFAULT 'pending',
+                cleanup_state TEXT NOT NULL DEFAULT 'pending',
+                cleanup_phase TEXT NOT NULL DEFAULT 'none',
+                local_deleted_at TEXT,
+                delivered_at TEXT
             );
             CREATE TABLE wr_items (
                 order_id INTEGER NOT NULL,
@@ -145,7 +160,7 @@ def copy_database(source: Path, target: Path) -> Path:
 def make_uploads(path: Path, files: Optional[Dict[str, bytes]] = None) -> Path:
     path = Path(path)
     path.mkdir(parents=True, exist_ok=True)
-    for name, data in (files or {"1_photo.jpg": b"\xff\xd8\xffphoto"}).items():
+    for name, data in (files or {}).items():
         (path / name).write_bytes(data)
     return path
 
@@ -171,12 +186,26 @@ def make_set(live_db: Path, destination: Path, *,
              upload_files: Optional[Dict[str, bytes]] = None,
              mutate_manifest=None,
              corrupt: Optional[str] = None) -> Path:
-    """Produce a complete, checksum-valid Stage 1 backup set."""
+    """Produce a complete, checksum-valid Stage 1 backup set.
+
+    With ``upload_files=None`` the archive is derived from the database, so a fixture
+    that requires files must say so explicitly rather than accidentally shipping an
+    archive the contract would reject.
+    """
     destination = Path(destination)
     if destination.exists():
         shutil.rmtree(destination)
     destination.mkdir(parents=True)
     backup_db = copy_database(live_db, destination / backup_format.DB_FILE)
+
+    if upload_files is None:
+        required, groups, _errors, _stats = recovery_artifacts.required_sources(backup_db)
+        needed = sorted(set(required) | {g["candidates"][0] for g in groups})
+        if needed:
+            raise ValueError(
+                "this fixture requires recovery files; pass upload_files= explicitly: "
+                + ", ".join(needed))
+        upload_files = {}
 
     uploads = make_uploads(destination.parent / f"uploads-{destination.name}", upload_files)
     archive = uploads_tar(uploads, destination / backup_format.TAR_FILE)
@@ -271,7 +300,8 @@ def build_delivery_database(path: Path, uploads_dir: Path, *,
             """
             CREATE TABLE orders (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                payment_status TEXT
+                payment_status TEXT,
+                order_token_hash TEXT
             );
             CREATE TABLE delivery_jobs (
                 id TEXT PRIMARY KEY,
@@ -283,7 +313,8 @@ def build_delivery_database(path: Path, uploads_dir: Path, *,
                 content_size INTEGER,
                 cleanup_state TEXT DEFAULT 'pending',
                 cleanup_phase TEXT,
-                local_deleted_at TEXT
+local_deleted_at TEXT,
+                delivered_at TEXT
             );
             """
         )

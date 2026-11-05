@@ -4,6 +4,10 @@ This document describes the evidence contract implemented by
 `scripts/db_evidence.py`, `scripts/recovery_artifacts.py`, `scripts/backup_format.py`,
 `scripts/build_v2_set.py` and `scripts/evidence_gate.py`.
 
+The per-state requirements are specified in
+[RECOVERY_CONTRACT.md](RECOVERY_CONTRACT.md); that document is the authority for the
+file-selection and restore-path rules summarised here.
+
 It is **Stage 1** of the backup/deployment redesign: a read-only verification library, a
 format-2 backup set, an explicit producer, and a command-line gate. It does **not** freeze
 writers, start containers or perform any part of a cutover — that is Stage 2 (exclusion
@@ -115,28 +119,39 @@ from the evidence while still reporting PASS. Therefore:
 Header parsing is not evidence. A set can carry correct checksums and still hold a
 substituted file whose name and size match, leaving the job unrecoverable.
 
-`recovery_artifacts` therefore streams every member — no extraction, so no hostile path can
-touch the filesystem — and hashes it, then derives the **required recovery sources** from
-the backup database itself:
+`recovery_artifacts` streams every member — no extraction, so no hostile path can touch the
+filesystem — and hashes it, then derives the **required recovery sources** from the backup
+database itself, as specified in [RECOVERY_CONTRACT.md](RECOVERY_CONTRACT.md):
 
-* a job in `pending`, `processing` or `failed` needs its local original;
-* a delivered job with durable deletion evidence (`cleanup_state='completed'`,
-  `cleanup_phase in ('deleted','deleting')`, `local_deleted_at` set) does not;
-* any other state is refused, because it is not evidence that nothing is required;
-* a required job without a valid `content_sha256`/`content_size` is refused.
+* schema generation first: P1 is supported; P0 and mixed are refused unless an operator
+  opts into `--legacy-p0-policy include`, which requires the legacy candidates explicitly.
+  The absence of `delivery_jobs` is **never** read as "no customer files";
+* job kinds: `file`/`info` own uploads, `admin_email`/`paid_email` are database state and
+  must not carry a `local_path`, unknown kinds are refused;
+* **state wins over cleanup metadata**: `pending`/`processing`/`failed` always require the
+  original, and a contradictory `cleanup_state='completed'` / `cleanup_phase='deleted'` /
+  `local_deleted_at` on such a job is a refusal, not an exemption;
+* only a delivered job with durable evidence (completed cleanup, deletion phase, timestamp
+  that differs from `delivered_at`) is exempt.
 
-Each required file must appear exactly once and match the recorded SHA-256 and size.
-Missing, substituted, wrong-sized, truncated and ambiguous files are all refusals.
+Each required file must be a member at **exactly** `uploads/<basename>` with the recorded
+SHA-256 and size. A nested member, or the right bytes at the wrong path, does not satisfy
+the reference — a restore preserves the path, and the database looks directly in its
+uploads directory. Missing, substituted, wrong-sized, truncated, ambiguous and duplicate
+members are refusals.
+
+The archived file set must **equal** the derived set: an unneeded customer file is refused,
+because retaining a photo that was already deleted violates the zero-retention contract.
 
 Limits are explicit (`Limits`): member count, per-member bytes, total uncompressed bytes,
-path length. They exist so an archive cannot exhaust memory or time.
+path length.
 
-### Path policy
+### Path and stream policy
 
-POSIX semantics only, independent of the host OS. Rejected: absolute paths, `C:` drive
-prefixes, backslashes, empty/`.`/`..` components, duplicate names (case-insensitive), links,
-non-regular members, and anything outside the exact `uploads/` prefix. `Path.is_absolute()`
-was the wrong question: `/tmp/evil` reads as relative on Windows and absolute on Linux.
+POSIX semantics only, independent of the host OS: absolute paths, `C:` drive prefixes,
+backslashes, empty/`.`/`..` components, nesting below `uploads/`, duplicate names
+(case-insensitive), links and non-regular members are rejected. The gzip stream is then
+read to physical EOF so a truncated trailer (CRC and length) cannot pass.
 
 ## 8. Backup-set format (`FORMAT_VERSION = 2`)
 
@@ -153,10 +168,11 @@ Validation of every field, not just the hashes:
 |---|---|
 | `format_version` | exactly 2 |
 | `evidence_format` | exactly the supported evidence version |
-| `set_id` | present and well formed |
+| `set_id` | a UUID or 32 hex characters (a non-empty arbitrary string is refused) |
 | `artifacts` | disagree with the actual files → fatal |
 | `schema_digest`, `logical_digest` | recomputed from the database and compared |
-| `database_identity` | required keys present; digests compared; unknown keys refused |
+| `database_identity` | required keys present and **non-NULL**; both digests compared with recomputed values; unknown keys refused |
+| `trust_note` | must be the exact current text |
 | `uploads.members`, `uploads.uncompressed_bytes` | must equal the scanned archive |
 | unknown top-level fields | refused |
 
@@ -166,9 +182,10 @@ true. Both are now checked.
 ### Publication
 
 `publish_set()` refuses to overwrite an existing set — a set ID identifies one set forever —
-fsyncs every file and the parent directory where the platform allows it, and reports
-`fsync_supported` so an unsupported filesystem is visible rather than assumed safe. A
-`.tmp-*` staging directory is never a set and is refused by verification.
+and flushes every file before the rename. A **file** fsync failure aborts publication; only
+a genuinely unsupported handle is tolerated, and `fsync_supported` records it. The parent
+directory flush is best-effort and reported separately. A `.tmp-*` staging directory is
+never a set and is refused by verification.
 
 ## 9. Producer and version compatibility
 
@@ -182,7 +199,7 @@ set and refuses it with the exact command to migrate.
 ```bash
 # fresh set from the live database and uploads
 python3 scripts/build_v2_set.py --live-db /data/orders.db \
-    --uploads /data/uploads --output /backups/20260101T000000Z
+    --uploads /app/uploads --output /backups/20260101T000000Z
 
 # re-manifest an existing legacy set (every claim is recomputed, not copied)
 python3 scripts/build_v2_set.py --from-v1 /backups/OLD --output /backups/NEW

@@ -25,6 +25,7 @@ boundary, and the manifest says so in `trust_note`.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -62,6 +63,13 @@ PARTIAL_MARKER = ".incomplete"
 
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 EVIDENCE_FORMAT_VERSION = db_evidence.EVIDENCE_FORMAT_VERSION
+
+#: A set identifier must be a UUID or 32 hex characters. Anything else — including a
+#: non-empty arbitrary string, which an earlier boolean expression let through — is
+#: refused, because the identifier is what a journal or directory binding refers to.
+SET_ID_RE = re.compile(r"^(?:[0-9a-fA-F]{32}|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-"
+                       r"[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$")
+ALLOWED_UPLOAD_KEYS = {"members", "uncompressed_bytes"}
 
 #: Top-level manifest keys this version understands. An unknown key means the set
 #: was produced by a different contract, which must not be interpreted silently.
@@ -163,28 +171,54 @@ def staging_dir_for(final_dir: Path) -> Path:
     return final_dir.parent / f"{TMP_PREFIX}{final_dir.name}-{uuid.uuid4().hex[:12]}"
 
 
-def fsync_path(path: Path) -> bool:
-    """Flush a file or directory entry to stable storage where the OS supports it.
+#: errno values that mean "this platform cannot flush this kind of handle", as opposed
+#: to an I/O failure that must abort publication.
+_FSYNC_UNSUPPORTED_ERRNOS = {errno.EINVAL, errno.ENOSYS, errno.EBADF}
+if hasattr(errno, "ENOTSUP"):
+    _FSYNC_UNSUPPORTED_ERRNOS.add(errno.ENOTSUP)
+if hasattr(errno, "EOPNOTSUPP"):
+    _FSYNC_UNSUPPORTED_ERRNOS.add(errno.EOPNOTSUPP)
+if hasattr(errno, "EPERM"):
+    _FSYNC_UNSUPPORTED_ERRNOS.add(errno.EPERM)
 
-    Windows requires a handle with write access for ``FlushFileBuffers``, so a
-    writable open is attempted first and a read-only one is the fallback for
-    directories and write-protected files. A ``False`` return means the platform
-    could not honour the request; it is reported, never assumed away.
+
+def fsync_file(path: Path) -> str:
+    """Flush a file. Returns ``ok`` | ``unsupported``; raises on a real I/O failure.
+
+    A durability barrier that silently degrades is worse than none: on a platform that
+    supports ``fsync`` a failure must abort before the rename, so the caller never
+    publishes a set it could not flush. Only a genuine "cannot flush this handle here"
+    is reported as ``unsupported``.
     """
     binary = getattr(os, "O_BINARY", 0)
+    last: OSError | None = None
     for flags in (os.O_RDWR | binary, os.O_RDONLY | binary):
         try:
             handle = os.open(str(path), flags)
-        except OSError:
+        except OSError as exc:
+            last = exc
             continue
         try:
             os.fsync(handle)
-            return True
-        except OSError:
-            continue
+            return "ok"
+        except OSError as exc:
+            last = exc
+            if exc.errno in _FSYNC_UNSUPPORTED_ERRNOS:
+                continue
+            raise FormatError(f"cannot flush {path.name} to stable storage: {exc}") from exc
         finally:
             os.close(handle)
-    return False
+    if last is not None and last.errno not in _FSYNC_UNSUPPORTED_ERRNOS:
+        raise FormatError(f"cannot open {path.name} to flush it: {last}")
+    return "unsupported"
+
+
+def fsync_path(path: Path) -> bool:
+    """Best-effort directory flush: a filesystem may not support flushing directories."""
+    try:
+        return fsync_file(Path(path)) == "ok"
+    except FormatError:
+        return False
 
 
 def publish_set(staging: Path, final_dir: Path) -> Dict[str, Any]:
@@ -219,12 +253,16 @@ def publish_set(staging: Path, final_dir: Path) -> Dict[str, Any]:
         raise FormatError(f"staging set is incomplete, missing: {missing}")
 
     final_dir.parent.mkdir(parents=True, exist_ok=True)
+    # File data must reach stable storage before the rename is visible. A failure here
+    # aborts publication; only an unsupported platform is tolerated, and it is recorded.
+    statuses = []
     for name in REQUIRED_FILES:
-        if fsync_path(staging / name):
+        status = fsync_file(staging / name)
+        statuses.append(status)
+        if status == "ok":
             report["fsynced_files"] += 1
-    report["fsync_supported"] = report["fsynced_files"] == len(REQUIRED_FILES)
-    if fsync_path(staging):
-        report["fsync_directory"] = True
+    report["fsync_supported"] = all(status == "ok" for status in statuses)
+    report["fsync_directory"] = fsync_path(staging)
 
     try:
         os.replace(staging, final_dir)
@@ -305,7 +343,7 @@ def detect_format(directory: Path) -> str:
 
 def verify_set(directory: Path, *, expected_application_id: Optional[int] = None,
                require_verified: bool = True, deep: bool = True,
-               allow_staging: bool = False,
+               allow_staging: bool = False, legacy_p0_policy: str = "fail",
                limits: "recovery_artifacts.Limits" = recovery_artifacts.DEFAULT_LIMITS
                ) -> Tuple[bool, Dict[str, Any]]:
     """Verify a backup set's structure, checksums, metadata and recovery bytes."""
@@ -377,10 +415,16 @@ def verify_set(directory: Path, *, expected_application_id: Optional[int] = None
             f"unsupported evidence_format {manifest.get('evidence_format')!r} "
             f"(this tool understands {EVIDENCE_FORMAT_VERSION})")
     set_id = manifest.get("set_id")
-    if not isinstance(set_id, str) or not _is_hex64(set_id.replace("-", "")) and not set_id:
-        errors.append("the manifest set_id is missing or malformed")
+    if not isinstance(set_id, str) or not SET_ID_RE.match(set_id):
+        errors.append(
+            f"the manifest set_id is missing or malformed ({set_id!r}); expected a UUID or "
+            "32 hex characters")
     if manifest.get("upload_archive_sha256") is not None:
         errors.append("manifest uses a superseded field name; rebuild the set")
+    if manifest.get("trust_note") != TRUST_NOTE:
+        errors.append(
+            "the manifest trust_note is not the current text: it describes a boundary the "
+            "verifier does not rely on, so a modified note is refused")
 
     recorded = manifest.get("artifacts") or {}
     if not isinstance(recorded, dict):
@@ -432,6 +476,10 @@ def verify_set(directory: Path, *, expected_application_id: Optional[int] = None
     if not isinstance(recorded_uploads, dict):
         errors.append("manifest uploads is not an object")
         recorded_uploads = {}
+    else:
+        unknown_uploads = set(recorded_uploads) - ALLOWED_UPLOAD_KEYS
+        if unknown_uploads:
+            errors.append(f"manifest uploads has unknown fields: {sorted(unknown_uploads)}")
     if recorded_uploads.get("members") != archive_info["members"]:
         errors.append(
             "manifest upload member count disagrees with the archive: "
@@ -460,15 +508,23 @@ def verify_set(directory: Path, *, expected_application_id: Optional[int] = None
                     errors.append(
                         "the backup database application_id does not match the expected "
                         "application")
-            if identity.get("schema_digest") not in (None, recomputed.get("schema_digest")):
-                errors.append("database_identity.schema_digest disagrees with the database")
-            if identity.get("logical_digest") not in (None, recomputed.get("logical_digest")):
-                errors.append("database_identity.logical_digest disagrees with the database")
+            for label, expected_value in (("schema_digest", recomputed.get("schema_digest")),
+                                          ("logical_digest", recomputed.get("logical_digest"))):
+                recorded_value = identity.get(label)
+                if recorded_value is None:
+                    errors.append(
+                        f"database_identity.{label} is NULL; every recorded claim must be "
+                        "compared, so a missing value is a refusal")
+                elif recorded_value != expected_value:
+                    errors.append(
+                        f"database_identity.{label} disagrees with the database: "
+                        f"manifest={recorded_value} actual={expected_value}")
 
     # H3: the archive must be able to rebuild every file the backup database needs.
     if deep and database_ok:
         recovery_ok, recovery = recovery_artifacts.verify_recovery(
-            directory / DB_FILE, directory / TAR_FILE, limits)
+            directory / DB_FILE, directory / TAR_FILE, limits,
+            legacy_p0_policy=legacy_p0_policy)
         report["checks"]["recovery"] = recovery
         if not recovery_ok:
             errors.extend(recovery.get("errors", []))

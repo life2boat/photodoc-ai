@@ -137,6 +137,13 @@ docker run --rm \
 > [BACKUP_EVIDENCE.md](BACKUP_EVIDENCE.md). It is read-only and does not replace the
 > deployment gate below: it does not exclude writers.
 >
+> The uploads path must be the **Compose-derived mount**, not a guess: the backend
+> container mounts the uploads volume at `/app/uploads` (`docker-compose.yml`,
+> `docker-compose.staging*.yml`, `docker-compose.production.yml`), and `UPLOAD_DIR`
+> defaults to `/app/uploads` in `backend/delivery.py`. On the host, use the bind source
+> (`${PHOTODOC_UPLOADS_SOURCE:-/opt/photodoc/backend/uploads}`) or the volume's `_data`
+> directory. Any other path makes the producer refuse for the wrong reason.
+>
 > **Version note (important).** `scripts/create_backup.py` still produces **format 1**.
 > The Stage 1 gate accepts **format 2 only** and refuses a v1 set with an explicit message
 > rather than reinterpreting it, because a v1 manifest cannot express the evidence digests
@@ -144,7 +151,7 @@ docker run --rm \
 >
 > ```bash
 > python3 scripts/build_v2_set.py --live-db /data/orders.db \
->     --uploads /data/uploads --output "${BACKUP_ROOT}/${STAMP}"
+>     --uploads /app/uploads --output "${BACKUP_ROOT}/${STAMP}"
 > # or upgrade an existing legacy set (every claim is recomputed):
 > python3 scripts/build_v2_set.py --from-v1 "${BACKUP_ROOT}/OLD" \
 >     --output "${BACKUP_ROOT}/${STAMP}"

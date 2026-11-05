@@ -253,8 +253,11 @@ def _tampered_archive(good_set: Path, members) -> None:
 
 
 def test_an_archive_with_a_duplicate_member_is_refused(good_set):
-    member = tarfile.TarInfo("uploads/1_photo.jpg")
-    _tampered_archive(good_set, [(member, b"duplicate")])
+    # Duplicate the directory entry: it always exists, so the check is exercised
+    # regardless of which files the set requires.
+    member = tarfile.TarInfo("uploads")
+    member.type = tarfile.DIRTYPE
+    _tampered_archive(good_set, [(member, None)])
     ok, report = backup_format.verify_set(good_set)
     assert not ok
     assert any("duplicate archive member" in e for e in report["errors"])

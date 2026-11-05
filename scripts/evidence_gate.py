@@ -61,7 +61,8 @@ def parse_age_hours(raw: object) -> tuple[float | None, str | None]:
 
 def evaluate(live_db: Path, backup_dir: Path, *, expected_application_id: int,
              max_age_hours: float, policy: str = "normal",
-             require_verified: bool = True) -> tuple[int, dict]:
+             require_verified: bool = True,
+             legacy_p0_policy: str = "fail") -> tuple[int, dict]:
     report: dict = {
         "gate": "stage1-evidence",
         "policy": policy,
@@ -97,7 +98,8 @@ def evaluate(live_db: Path, backup_dir: Path, *, expected_application_id: int,
 
     format_ok, format_report = backup_format.verify_set(
         Path(backup_dir), expected_application_id=expected_application_id,
-        require_verified=require_verified, deep=True)
+        require_verified=require_verified, deep=True,
+        legacy_p0_policy=legacy_p0_policy)
     report["checks"]["format"] = format_report
     if not format_ok:
         errors.extend(format_report.get("errors", []))
@@ -139,6 +141,9 @@ def main(argv: list[str] | None = None) -> int:
                         help="expected SQLite application_id (default: PhotoDoc 'PDAI')")
     parser.add_argument("--max-age-hours", default="24")
     parser.add_argument("--policy", default="normal", choices=POLICIES)
+    parser.add_argument("--legacy-p0-policy", default="fail",
+                        choices=("fail", "include"),
+                        help="how to treat orders without delivery_jobs (default: fail)")
     parser.add_argument("--allow-unverified", action="store_true",
                         help="accept a manifest that does not record a PASS verification")
     parser.add_argument("--json", action="store_true")
@@ -154,7 +159,8 @@ def main(argv: list[str] | None = None) -> int:
     code, report = evaluate(args.live_db, args.backup_dir,
                             expected_application_id=args.application_id,
                             max_age_hours=age, policy=args.policy,
-                            require_verified=not args.allow_unverified)
+                            require_verified=not args.allow_unverified,
+                            legacy_p0_policy=args.legacy_p0_policy)
 
     if args.json:
         print(json.dumps(report, indent=2, default=str))
