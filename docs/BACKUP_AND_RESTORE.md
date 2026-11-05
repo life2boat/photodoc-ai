@@ -130,10 +130,28 @@ docker run --rm \
 
 > **Stage 1 addition.** `scripts/evidence_gate.py` verifies a set against the live
 > database with a canonical, bidirectional comparison (schema objects and their SQL,
-> complete row identity including `WITHOUT ROWID` and shadowed rowid aliases, type-tagged
-> values, `sqlite_sequence`) and a manifest contract that binds the metadata to the
-> artifacts. See [BACKUP_EVIDENCE.md](BACKUP_EVIDENCE.md). It is read-only and does not
-> replace the deployment gate below: it does not exclude writers.
+> complete row identity including `WITHOUT ROWID`, shadowed rowid aliases and the
+> `INTEGER PRIMARY KEY DESC` exception, type-tagged values, `sqlite_sequence`), a manifest
+> whose every field is validated rather than merely checksum-bound, and a recovery-byte
+> check that the archive really holds the files the database needs. See
+> [BACKUP_EVIDENCE.md](BACKUP_EVIDENCE.md). It is read-only and does not replace the
+> deployment gate below: it does not exclude writers.
+>
+> **Version note (important).** `scripts/create_backup.py` still produces **format 1**.
+> The Stage 1 gate accepts **format 2 only** and refuses a v1 set with an explicit message
+> rather than reinterpreting it, because a v1 manifest cannot express the evidence digests
+> or the recovery-byte contract. Build a v2 set with:
+>
+> ```bash
+> python3 scripts/build_v2_set.py --live-db /data/orders.db \
+>     --uploads /data/uploads --output "${BACKUP_ROOT}/${STAMP}"
+> # or upgrade an existing legacy set (every claim is recomputed):
+> python3 scripts/build_v2_set.py --from-v1 "${BACKUP_ROOT}/OLD" \
+>     --output "${BACKUP_ROOT}/${STAMP}"
+> ```
+>
+> A v2 set is not a deployment input on its own: Stage 2 must still exclude writers, and
+> the deployment gate below remains the cutover decision.
 
 ```bash
 docker run --rm \

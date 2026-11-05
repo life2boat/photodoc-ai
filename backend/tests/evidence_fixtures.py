@@ -240,6 +240,79 @@ def _edit_manifest(destination: Path, updates: Dict[str, Any], *, rebind: bool =
             "\n".join(lines) + "\n", encoding="utf-8")
 
 
+# --------------------------------------------------------------------- delivery sets
+GOOD_PHOTO = b"correct recovery original"
+OTHER_PHOTO = b"second recovery original"
+
+
+def build_delivery_database(path: Path, uploads_dir: Path, *,
+                            photo: bytes = GOOD_PHOTO,
+                            second: bytes = OTHER_PHOTO,
+                            cleaned: bool = True) -> Path:
+    """A database whose delivery jobs require verifiable recovery originals.
+
+    One pending ``file`` job, one ``info`` job, and (optionally) a delivered job with
+    durable deletion evidence whose file must *not* be required.
+    """
+    import hashlib
+
+    path = Path(path)
+    uploads_dir = Path(uploads_dir)
+    uploads_dir.mkdir(parents=True, exist_ok=True)
+    (uploads_dir / "photo.jpg").write_bytes(photo)
+    (uploads_dir / "info.pdf").write_bytes(second)
+
+    if path.exists():
+        path.unlink()
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute(f"PRAGMA application_id = {APPLICATION_ID}")
+        conn.executescript(
+            """
+            CREATE TABLE orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                payment_status TEXT
+            );
+            CREATE TABLE delivery_jobs (
+                id TEXT PRIMARY KEY,
+                order_id INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                state TEXT NOT NULL,
+                local_path TEXT,
+                content_sha256 TEXT,
+                content_size INTEGER,
+                cleanup_state TEXT DEFAULT 'pending',
+                cleanup_phase TEXT,
+                local_deleted_at TEXT
+            );
+            """
+        )
+        conn.execute("INSERT INTO orders (id, payment_status) VALUES (1,'paid')")
+        conn.execute("INSERT INTO orders (id, payment_status) VALUES (2,'paid')")
+        conn.execute(
+            "INSERT INTO delivery_jobs (id, order_id, kind, state, local_path, "
+            "content_sha256, content_size) VALUES (?,?,?,?,?,?,?)",
+            ("job-file", 1, "file", "pending", "/app/uploads/photo.jpg",
+             hashlib.sha256(photo).hexdigest(), len(photo)))
+        conn.execute(
+            "INSERT INTO delivery_jobs (id, order_id, kind, state, local_path, "
+            "content_sha256, content_size) VALUES (?,?,?,?,?,?,?)",
+            ("job-info", 2, "info", "pending", "/app/uploads/info.pdf",
+             hashlib.sha256(second).hexdigest(), len(second)))
+        if cleaned:
+            conn.execute(
+                "INSERT INTO delivery_jobs (id, order_id, kind, state, local_path, "
+                "content_sha256, content_size, cleanup_state, cleanup_phase, "
+                "local_deleted_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                ("job-cleaned", 1, "file", "delivered", "/app/uploads/gone.jpg",
+                 hashlib.sha256(b"deleted long ago").hexdigest(), 18,
+                 "completed", "deleted", "2026-01-01T00:10:00+00:00"))
+        conn.commit()
+    finally:
+        conn.close()
+    return path
+
+
 def _logical_digest(conn) -> str:
     """Same shape as db_evidence's logical digest, over one database."""
     import hashlib

@@ -83,9 +83,21 @@ def evaluate(live_db: Path, backup_dir: Path, *, expected_application_id: int,
         errors.append(f"backup directory not found: {backup_dir}")
         return EXIT_MISSING, report
 
+    # M3: a legacy v1 set is refused explicitly, never reinterpreted as v2.
+    detected = backup_format.detect_format(Path(backup_dir))
+    report["checks"]["detected_format"] = detected
+    if detected == "legacy-v1":
+        errors.append(
+            "this is a legacy format-1 backup set. The v2 contract binds the set to the "
+            "database state and to the recovery bytes, which a v1 manifest cannot express, "
+            "so it is not accepted as a deployment input. Upgrade it explicitly with: "
+            "python3 scripts/build_v2_set.py --from-v1 "
+            f"{Path(backup_dir)} --output <new-set>")
+        return EXIT_INVALID, report
+
     format_ok, format_report = backup_format.verify_set(
         Path(backup_dir), expected_application_id=expected_application_id,
-        require_verified=require_verified)
+        require_verified=require_verified, deep=True)
     report["checks"]["format"] = format_report
     if not format_ok:
         errors.extend(format_report.get("errors", []))
@@ -111,18 +123,8 @@ def evaluate(live_db: Path, backup_dir: Path, *, expected_application_id: int,
         errors.extend(evidence.reasons)
         return EXIT_INVALID, report
 
-    # Bind the manifest's recorded evidence digests to the content just verified.
-    manifest = format_report.get("checks", {}).get("manifest", {})
-    if manifest.get("schema_digest") != evidence.schema_digest:
-        errors.append(
-            "the manifest's schema_digest does not match the backup database: the set was "
-            "not produced from this state")
-    if manifest.get("logical_digest") != evidence.backup_logical_digest:
-        errors.append(
-            "the manifest's logical_digest does not match the backup database: the set was "
-            "not produced from this state")
-    if manifest.get("application_id") != expected_application_id:
-        errors.append("the manifest application_id does not match the expected application")
+    # The manifest's digests were already validated against the backup database by
+    # verify_set (M1); here the remaining question is live-versus-backup equality.
 
     report["ok"] = not errors
     return (EXIT_OK if report["ok"] else EXIT_INVALID), report

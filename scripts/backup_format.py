@@ -37,6 +37,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in __import__("sys").path:
+    __import__("sys").path.insert(0, str(SCRIPT_DIR))
+
+import db_evidence  # noqa: E402
+import recovery_artifacts  # noqa: E402
+
 FORMAT_VERSION = 2
 MANIFEST_FILE = "manifest.sha256"
 MANIFEST_JSON = "backup_manifest.json"
@@ -54,6 +61,18 @@ PREVIOUS_SUFFIX = ".previous"
 PARTIAL_MARKER = ".incomplete"
 
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
+EVIDENCE_FORMAT_VERSION = db_evidence.EVIDENCE_FORMAT_VERSION
+
+#: Top-level manifest keys this version understands. An unknown key means the set
+#: was produced by a different contract, which must not be interpreted silently.
+ALLOWED_MANIFEST_KEYS = {
+    "format_version", "set_id", "created_at", "artifacts", "application_id",
+    "evidence_format", "schema_digest", "logical_digest", "database_identity",
+    "uploads", "verification", "trust_note",
+}
+ALLOWED_IDENTITY_KEYS = {"application_id", "schema_digest", "logical_digest",
+                         "sqlite_version"}
+
 TRUST_NOTE = (
     "Hashes bind the set to itself. They do not authenticate the producer: storage "
     "writable by root remains a trust boundary.")
@@ -86,7 +105,8 @@ def build_manifest(*, artifacts: Dict[str, str], created_at: datetime,
                    database_identity: Dict[str, Any],
                    upload_members: int, upload_bytes: int,
                    verification: str = "PASS",
-                   evidence_format: int = 1) -> Dict[str, Any]:
+                   evidence_format: int = EVIDENCE_FORMAT_VERSION,
+                   set_id: Optional[str] = None) -> Dict[str, Any]:
     """Assemble the metadata document for a verified set."""
     for name in MANIFEST_ARTIFACTS:
         if not _is_hex64(artifacts.get(name)):
@@ -97,15 +117,30 @@ def build_manifest(*, artifacts: Dict[str, str], created_at: datetime,
             raise FormatError(f"{label} is not a sha256 digest")
     if verification not in ("PASS", "SKIPPED"):
         raise FormatError(f"verification must be PASS or SKIPPED, got {verification!r}")
+    if evidence_format != EVIDENCE_FORMAT_VERSION:
+        raise FormatError(
+            f"evidence_format must be {EVIDENCE_FORMAT_VERSION}, got {evidence_format!r}")
+    if not isinstance(upload_members, int) or upload_members < 0:
+        raise FormatError("upload_members must be a non-negative integer")
+    if not isinstance(upload_bytes, int) or upload_bytes < 0:
+        raise FormatError("upload_bytes must be a non-negative integer")
+    identity = dict(database_identity)
+    identity.setdefault("application_id", application_id)
+    identity.setdefault("schema_digest", schema_digest)
+    identity.setdefault("logical_digest", logical_digest)
+    unexpected = set(identity) - ALLOWED_IDENTITY_KEYS
+    if unexpected:
+        raise FormatError(f"database_identity has unknown keys: {sorted(unexpected)}")
     return {
         "format_version": FORMAT_VERSION,
+        "set_id": set_id or uuid.uuid4().hex,
         "created_at": created_at.astimezone(timezone.utc).isoformat(),
         "artifacts": {name: artifacts[name] for name in MANIFEST_ARTIFACTS},
         "application_id": application_id,
         "evidence_format": evidence_format,
         "schema_digest": schema_digest,
         "logical_digest": logical_digest,
-        "database_identity": database_identity,
+        "database_identity": identity,
         "uploads": {"members": upload_members, "uncompressed_bytes": upload_bytes},
         "verification": verification,
         "trust_note": TRUST_NOTE,
@@ -128,28 +163,77 @@ def staging_dir_for(final_dir: Path) -> Path:
     return final_dir.parent / f"{TMP_PREFIX}{final_dir.name}-{uuid.uuid4().hex[:12]}"
 
 
-def atomic_publish(staging: Path, final_dir: Path) -> Path:
-    """Rename a complete set into place, without ever exposing a partial one."""
+def fsync_path(path: Path) -> bool:
+    """Flush a file or directory entry to stable storage where the OS supports it.
+
+    Windows requires a handle with write access for ``FlushFileBuffers``, so a
+    writable open is attempted first and a read-only one is the fallback for
+    directories and write-protected files. A ``False`` return means the platform
+    could not honour the request; it is reported, never assumed away.
+    """
+    binary = getattr(os, "O_BINARY", 0)
+    for flags in (os.O_RDWR | binary, os.O_RDONLY | binary):
+        try:
+            handle = os.open(str(path), flags)
+        except OSError:
+            continue
+        try:
+            os.fsync(handle)
+            return True
+        except OSError:
+            continue
+        finally:
+            os.close(handle)
+    return False
+
+
+def publish_set(staging: Path, final_dir: Path) -> Dict[str, Any]:
+    """Publish a complete set under a never-reused identifier.
+
+    Differences from a plain rename, each one closing a review finding:
+
+    * the destination must not exist — a set ID identifies one set forever, so a
+      second publication never overwrites the first;
+    * every file is fsynced, and the parent directory where the platform allows it,
+      so a crash cannot leave a published set with unflushed contents;
+    * a crash mid-publication cannot destroy the destination, because the
+      destination is never moved away.
+
+    A leftover ``.tmp-*`` directory is never a set: it is skipped by discovery and
+    reported as an incomplete staging directory, so it cannot be mistaken for a
+    rollback point.
+    """
     staging, final_dir = Path(staging), Path(final_dir)
+    report: Dict[str, Any] = {"staging": str(staging), "final": str(final_dir),
+                              "fsynced_files": 0, "fsync_directory": False}
     if not staging.is_dir():
         raise FormatError(f"staging directory does not exist: {staging}")
-    if not final_dir.parent.exists():
-        final_dir.parent.mkdir(parents=True, exist_ok=True)
-    previous = final_dir.with_name(final_dir.name + PREVIOUS_SUFFIX)
-    moved = False
-    if final_dir.exists():
-        if previous.exists():
-            stamp = utc_now().strftime("%Y%m%dT%H%M%SZ")
-            os.replace(previous, previous.with_name(f"{previous.name}-{stamp}"))
-        os.replace(final_dir, previous)
-        moved = True
+    if staging.is_symlink():
+        raise FormatError("staging directory is a symlink")
+    if final_dir.exists() or final_dir.is_symlink():
+        raise FormatError(
+            f"refusing to publish over an existing set: {final_dir.name}. A set ID "
+            "identifies one set forever; choose a new name.")
+    missing = [name for name in REQUIRED_FILES if not (staging / name).is_file()]
+    if missing:
+        raise FormatError(f"staging set is incomplete, missing: {missing}")
+
+    final_dir.parent.mkdir(parents=True, exist_ok=True)
+    for name in REQUIRED_FILES:
+        if fsync_path(staging / name):
+            report["fsynced_files"] += 1
+    report["fsync_supported"] = report["fsynced_files"] == len(REQUIRED_FILES)
+    if fsync_path(staging):
+        report["fsync_directory"] = True
+
     try:
         os.replace(staging, final_dir)
     except OSError as exc:
-        if moved and not final_dir.exists():
-            os.replace(previous, final_dir)
         raise FormatError(f"failed to publish the backup set: {exc}") from exc
-    return final_dir
+
+    # Flush the parent so the rename itself survives a crash where supported.
+    report["fsync_parent"] = fsync_path(final_dir.parent)
+    return report
 
 
 # ------------------------------------------------------------------------ verification
@@ -176,40 +260,55 @@ def _read_checksums(path: Path) -> Tuple[Dict[str, str], List[str]]:
     return checksums, errors
 
 
-def inspect_archive(path: Path) -> Tuple[Dict[str, Any], List[str]]:
-    """Validate the upload archive without extracting it."""
-    info: Dict[str, Any] = {"members": 0, "files": 0, "directories": 0, "bytes": 0}
-    errors: List[str] = []
-    seen: set[str] = set()
-    try:
-        with tarfile.open(path, "r:gz") as tar:
-            for member in tar.getmembers():
-                info["members"] += 1
-                if member.name in seen:
-                    errors.append(f"duplicate archive member: {member.name!r}")
-                seen.add(member.name)
-                if member.issym() or member.islnk():
-                    errors.append(f"archive contains a link member: {member.name!r}")
-                    continue
-                if Path(member.name).is_absolute() or ".." in Path(member.name).parts:
-                    errors.append(f"archive member escapes the root: {member.name!r}")
-                    continue
-                if member.isdir():
-                    info["directories"] += 1
-                    continue
-                if not member.isreg():
-                    errors.append(f"archive member is not a regular file: {member.name!r}")
-                    continue
-                info["files"] += 1
-                info["bytes"] += member.size
-    except (OSError, tarfile.TarError) as exc:
-        errors.append(f"cannot read the upload archive: {exc}")
+def inspect_archive(path: Path,
+                   limits: "recovery_artifacts.Limits" = recovery_artifacts.DEFAULT_LIMITS
+                   ) -> Tuple[Dict[str, Any], List[str]]:
+    """Stream the archive: validate member paths, hash the bytes, enforce limits.
+
+    Header parsing alone is not evidence — a checksum-consistent archive can carry
+    substituted content — so this reads every member even when only structure is
+    reported.
+    """
+    members, info, errors = recovery_artifacts.scan_archive(Path(path), limits)
+    info = dict(info)
+    info["hashed_members"] = len(members)
     return info, errors
 
 
+#: Fields the legacy format-1 manifest used instead of ``artifacts``.
+LEGACY_HASH_KEYS = ("orders_db_sha256", "uploads_tar_sha256")
+
+
+def detect_format(directory: Path) -> str:
+    """``v2`` | ``legacy-v1`` | ``unknown``.
+
+    A legacy set is never interpreted as v2: the v2 contract binds the manifest to
+    the database state and to the recovery bytes, and a v1 manifest cannot express
+    either claim.
+    """
+    directory = Path(directory)
+    manifest_path = directory / MANIFEST_JSON
+    if manifest_path.is_file():
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return "unknown"
+        if isinstance(manifest, dict):
+            if manifest.get("format_version") == FORMAT_VERSION:
+                return "v2"
+            if any(key in manifest for key in LEGACY_HASH_KEYS):
+                return "legacy-v1"
+    if (directory / MANIFEST_FILE).is_file() and (directory / DB_FILE).is_file():
+        return "legacy-v1"
+    return "unknown"
+
+
 def verify_set(directory: Path, *, expected_application_id: Optional[int] = None,
-               require_verified: bool = True) -> Tuple[bool, Dict[str, Any]]:
-    """Verify a backup set's structure, checksums and metadata binding."""
+               require_verified: bool = True, deep: bool = True,
+               allow_staging: bool = False,
+               limits: "recovery_artifacts.Limits" = recovery_artifacts.DEFAULT_LIMITS
+               ) -> Tuple[bool, Dict[str, Any]]:
+    """Verify a backup set's structure, checksums, metadata and recovery bytes."""
     directory = Path(directory)
     report: Dict[str, Any] = {
         "directory": str(directory),
@@ -226,7 +325,7 @@ def verify_set(directory: Path, *, expected_application_id: Optional[int] = None
     if directory.is_symlink():
         errors.append("backup directory is a symlink")
         return False, report
-    if directory.name.startswith(TMP_PREFIX):
+    if directory.name.startswith(TMP_PREFIX) and not allow_staging:
         errors.append("backup directory is an unpublished staging directory")
         return False, report
     if (directory / PARTIAL_MARKER).exists():
@@ -260,31 +359,55 @@ def verify_set(directory: Path, *, expected_application_id: Optional[int] = None
         errors.append(f"cannot read {MANIFEST_JSON}: {exc}")
         return False, report
     report["checks"]["manifest"] = manifest
+    if not isinstance(manifest, dict):
+        errors.append("the manifest is not a JSON object")
+        return False, report
 
+    # M1: every claim is validated, not merely checksum-bound. A hash proves the
+    # manifest was not edited; it says nothing about whether each field is true.
+    unknown = set(manifest) - ALLOWED_MANIFEST_KEYS
+    if unknown:
+        errors.append(f"the manifest has unknown fields: {sorted(unknown)}")
     if manifest.get("format_version") != FORMAT_VERSION:
         errors.append(
             f"unsupported manifest format_version {manifest.get('format_version')!r} "
             f"(this tool understands {FORMAT_VERSION})")
+    if manifest.get("evidence_format") != EVIDENCE_FORMAT_VERSION:
+        errors.append(
+            f"unsupported evidence_format {manifest.get('evidence_format')!r} "
+            f"(this tool understands {EVIDENCE_FORMAT_VERSION})")
+    set_id = manifest.get("set_id")
+    if not isinstance(set_id, str) or not _is_hex64(set_id.replace("-", "")) and not set_id:
+        errors.append("the manifest set_id is missing or malformed")
     if manifest.get("upload_archive_sha256") is not None:
         errors.append("manifest uses a superseded field name; rebuild the set")
 
     recorded = manifest.get("artifacts") or {}
+    if not isinstance(recorded, dict):
+        errors.append("manifest artifacts is not an object")
+        recorded = {}
     for name in MANIFEST_ARTIFACTS:
         if recorded.get(name) != actual[name]:
             errors.append(
                 f"the manifest's recorded hash for {name} disagrees with the file: "
                 f"manifest={recorded.get(name)!r} actual={actual[name]}")
 
-    # The manifest is itself checksummed, so editing any field breaks manifest.sha256.
     if checksums.get(MANIFEST_JSON) != actual[MANIFEST_JSON]:
         errors.append("the manifest is not bound to manifest.sha256")
 
     for label in ("schema_digest", "logical_digest"):
         if not _is_hex64(manifest.get(label)):
             errors.append(f"manifest {label} is missing or not a sha256 digest")
-    identity = manifest.get("database_identity") or {}
-    if not isinstance(identity, dict) or "application_id" not in identity:
-        errors.append("manifest database_identity is missing")
+    identity = manifest.get("database_identity")
+    if not isinstance(identity, dict):
+        errors.append("manifest database_identity is missing or not an object")
+        identity = {}
+    unknown_identity = set(identity) - ALLOWED_IDENTITY_KEYS
+    if unknown_identity:
+        errors.append(f"database_identity has unknown fields: {sorted(unknown_identity)}")
+    for required_key in ("application_id", "schema_digest"):
+        if required_key not in identity:
+            errors.append(f"database_identity is missing {required_key}")
     if expected_application_id is not None:
         if manifest.get("application_id") != expected_application_id:
             errors.append(
@@ -292,9 +415,6 @@ def verify_set(directory: Path, *, expected_application_id: Optional[int] = None
                 f"expected {expected_application_id}")
         if identity.get("application_id") != expected_application_id:
             errors.append("manifest database_identity disagrees with application_id")
-    if require_verified and manifest.get("verification") != "PASS":
-        errors.append(
-            f"manifest verification is {manifest.get('verification')!r}, expected PASS")
 
     try:
         created = datetime.fromisoformat(str(manifest.get("created_at")))
@@ -305,18 +425,93 @@ def verify_set(directory: Path, *, expected_application_id: Optional[int] = None
     except (TypeError, ValueError):
         errors.append(f"manifest created_at is not ISO-8601: {manifest.get('created_at')!r}")
 
-    archive_info, archive_errors = inspect_archive(directory / TAR_FILE)
+    archive_info, archive_errors = inspect_archive(directory / TAR_FILE, limits)
     report["checks"]["archive"] = archive_info
     errors.extend(archive_errors)
-    recorded_uploads = manifest.get("uploads") or {}
-    if isinstance(recorded_uploads, dict) and recorded_uploads:
-        if recorded_uploads.get("members") != archive_info["members"]:
-            errors.append(
-                "manifest upload member count disagrees with the archive: "
-                f"{recorded_uploads.get('members')!r} vs {archive_info['members']}")
+    recorded_uploads = manifest.get("uploads")
+    if not isinstance(recorded_uploads, dict):
+        errors.append("manifest uploads is not an object")
+        recorded_uploads = {}
+    if recorded_uploads.get("members") != archive_info["members"]:
+        errors.append(
+            "manifest upload member count disagrees with the archive: "
+            f"{recorded_uploads.get('members')!r} vs {archive_info['members']}")
+    if recorded_uploads.get("uncompressed_bytes") != archive_info["bytes"]:
+        errors.append(
+            "manifest upload byte count disagrees with the archive: "
+            f"{recorded_uploads.get('uncompressed_bytes')!r} vs {archive_info['bytes']}")
+
+    database_ok = False
+    if (directory / DB_FILE).is_file():
+        database_ok = True
+        recomputed = _recompute_evidence(directory / DB_FILE, errors)
+        if recomputed is not None:
+            report["checks"]["evidence"] = recomputed
+            if manifest.get("schema_digest") != recomputed.get("schema_digest"):
+                errors.append(
+                    "manifest schema_digest does not match the backup database: the set "
+                    "was not produced from this state")
+            if manifest.get("logical_digest") != recomputed.get("logical_digest"):
+                errors.append(
+                    "manifest logical_digest does not match the backup database: the set "
+                    "was not produced from this state")
+            if expected_application_id is not None:
+                if recomputed.get("application_id") != expected_application_id:
+                    errors.append(
+                        "the backup database application_id does not match the expected "
+                        "application")
+            if identity.get("schema_digest") not in (None, recomputed.get("schema_digest")):
+                errors.append("database_identity.schema_digest disagrees with the database")
+            if identity.get("logical_digest") not in (None, recomputed.get("logical_digest")):
+                errors.append("database_identity.logical_digest disagrees with the database")
+
+    # H3: the archive must be able to rebuild every file the backup database needs.
+    if deep and database_ok:
+        recovery_ok, recovery = recovery_artifacts.verify_recovery(
+            directory / DB_FILE, directory / TAR_FILE, limits)
+        report["checks"]["recovery"] = recovery
+        if not recovery_ok:
+            errors.extend(recovery.get("errors", []))
+    elif deep and not database_ok:
+        errors.append("cannot deep-verify recovery files without the backup database")
+
+    if require_verified and manifest.get("verification") != "PASS":
+        errors.append(
+            f"manifest verification is {manifest.get('verification')!r}, expected PASS")
 
     report["ok"] = not errors
     return report["ok"], report
+
+
+def _recompute_evidence(db_path: Path, errors: List[str]) -> Optional[Dict[str, Any]]:
+    """Recompute the digests a manifest claims, so a claim can be checked."""
+    try:
+        conn = db_evidence.open_readonly(Path(db_path))
+    except Exception as exc:  # noqa: BLE001 - reported, never raised
+        errors.append(f"cannot open the backup database: {exc}")
+        return None
+    try:
+        conn.execute("BEGIN")
+        schema = db_evidence.canonical_schema(conn)
+        application_id = conn.execute("PRAGMA application_id").fetchone()[0]
+        logical = _logical_digest_of(conn)
+        return {"schema_digest": schema["digest"], "application_id": application_id,
+                "logical_digest": logical,
+                "sqlite_version": ".".join(str(p) for p in __import__("sqlite3").sqlite_version_info)}
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"cannot compute evidence for the backup database: {exc}")
+        return None
+    finally:
+        try:
+            conn.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+        conn.close()
+
+
+def _logical_digest_of(conn) -> str:
+    """Delegate to the single evidence implementation."""
+    return db_evidence.logical_state_digest(conn)
 
 
 def age_hours(manifest_created_at: str, *, now: Optional[datetime] = None) -> float:
@@ -325,3 +520,14 @@ def age_hours(manifest_created_at: str, *, now: Optional[datetime] = None) -> fl
     if created.tzinfo is None:
         created = created.replace(tzinfo=timezone.utc)
     return (now - created).total_seconds() / 3600.0
+
+
+def atomic_publish(staging: Path, final_dir: Path) -> Path:
+    """Deprecated alias for :func:`publish_set`.
+
+    Kept only so an outdated caller fails loudly instead of quietly overwriting a
+    published set: the old semantics (replace an existing directory) are exactly
+    what the review called a durability and immutability defect.
+    """
+    publish_set(staging, final_dir)
+    return Path(final_dir)

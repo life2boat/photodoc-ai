@@ -48,6 +48,11 @@ ROW_ENCODING_VERSION = 1
 #: that a restore would otherwise silently change.
 SQLITE_INTERNAL_PREFIX = "sqlite_"
 
+#: ``PRAGMA table_list`` arrived in 3.37. Below that, an *unknown* pragma returns an
+#: empty result instead of raising, which previously wiped every row from the
+#: evidence while still reporting PASS.
+MIN_SQLITE_VERSION = (3, 37, 0)
+
 #: Object types that participate in the row comparison.
 ROW_TABLES = ("table",)
 #: Every object type that participates in the schema description.
@@ -159,6 +164,18 @@ def table_inventory(conn: sqlite3.Connection) -> Dict[str, TableInfo]:
     return inventory
 
 
+def schema_table_names(conn: sqlite3.Connection) -> set[str]:
+    """Every ``table`` object recorded in ``sqlite_schema``."""
+    return {row[0] for row in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")}
+
+
+def sqlite_version_supported() -> Tuple[bool, str]:
+    version = sqlite3.sqlite_version_info
+    ok = tuple(version) >= MIN_SQLITE_VERSION
+    return ok, ".".join(str(part) for part in version)
+
+
 def table_columns(conn: sqlite3.Connection, table: str) -> List[Dict[str, Any]]:
     """``PRAGMA table_xinfo`` — includes hidden and generated columns."""
     rows = conn.execute(f"PRAGMA table_xinfo({quote_ident(table)})").fetchall()
@@ -184,6 +201,26 @@ def _user_column_names(columns: Sequence[Dict[str, Any]]) -> set[str]:
     return {c["name"].casefold() for c in columns if c["hidden"] in (0, 2, 3)}
 
 
+def declared_integer_pk_is_rowid_alias(conn: sqlite3.Connection, table: str,
+                                       columns: Sequence[Dict[str, Any]]) -> bool:
+    """Does a single declared ``INTEGER PRIMARY KEY`` alias the hidden rowid?
+
+    Not always: the historical ``INTEGER PRIMARY KEY DESC`` declaration is *not* an
+    alias — the column may be NULL and carries its own uniqueness index, so
+    ``rowid`` and the column differ. Reading that from SQL text is fragile, so the
+    proof is semantic: a real alias creates **no** primary-key index, while the
+    DESC form creates an automatic ``origin='pk'`` index.
+    """
+    pk = [c for c in columns if c["pk"]]
+    if len(pk) != 1 or (pk[0]["type"] or "").strip().upper() != "INTEGER":
+        return False
+    for row in conn.execute(f"PRAGMA index_list({quote_ident(table)})").fetchall():
+        origin = row[3]
+        if origin == "pk":
+            return False
+    return True
+
+
 def row_identity(table: str, info: TableInfo,
                  columns: Sequence[Dict[str, Any]]) -> RowIdentity:
     """Derive the unique row key, or refuse.
@@ -191,6 +228,13 @@ def row_identity(table: str, info: TableInfo,
     A composite key collapsed to its first column silently merges distinct rows —
     that was a real false PASS. So a ``WITHOUT ROWID`` table requires the complete
     ordered PK, and a shadowed rowid refuses rather than guessing.
+
+    Every rowid table is keyed by the **hidden rowid**, even when a declared
+    ``INTEGER PRIMARY KEY`` exists. That declaration is usually an alias, but not
+    for ``INTEGER PRIMARY KEY DESC``, where the column may be NULL while the rowid
+    stays distinct — two databases then produced identical evidence for different
+    rows. Using the hidden rowid needs no alias proof and is exact for both forms;
+    the declared columns are still compared as part of the row.
     """
     pk_columns = [c for c in columns if c["pk"]]
     visible = [c for c in columns if c["hidden"] in (0, 2, 3)]
@@ -208,14 +252,6 @@ def row_identity(table: str, info: TableInfo,
         expr = ", ".join(quote_ident(n) for n in names)
         return RowIdentity("pk", names, expr,
                            f"WITHOUT ROWID composite primary key {names}")
-
-    if len(pk_columns) == 1:
-        candidate = pk_columns[0]
-        declared = (candidate["type"] or "").strip().upper()
-        if declared == "INTEGER":
-            name = candidate["name"]
-            return RowIdentity("integer_pk", (name,), quote_ident(name),
-                               f"INTEGER PRIMARY KEY {name!r}")
 
     shadowed = {c["name"].casefold() for c in visible}
     for alias in ROWID_ALIASES:
@@ -275,11 +311,16 @@ def canonical_schema(conn: sqlite3.Connection) -> Dict[str, Any]:
     for name, info in sorted(inventory.items()):
         if info.type == "view":
             continue
+        table_cols = table_columns(conn, name)
         entry: Dict[str, Any] = {
             "type": info.type,
             "without_rowid": info.without_rowid,
             "strict": info.strict,
-            "columns": table_columns(conn, name),
+            # Recorded because the DESC declaration is not an alias; the row key
+            # uses the hidden rowid either way, but the distinction is evidence.
+            "integer_pk_aliases_rowid": declared_integer_pk_is_rowid_alias(
+                conn, name, table_cols),
+            "columns": table_cols,
             "indexes": [],
             "foreign_keys": [],
         }
@@ -530,6 +571,16 @@ def compare_databases(live_path: Path, backup_path: Path, *,
             result.reasons.append(f"{label} database not found: {path}")
             return result
 
+    supported, version = sqlite_version_supported()
+    result.checks["sqlite_version"] = version
+    if not supported:
+        result.reasons.append(
+            f"SQLite {version} is older than the required "
+            f"{'.'.join(str(p) for p in MIN_SQLITE_VERSION)}: PRAGMA table_list is "
+            "unavailable, and an unsupported pragma returns an empty result rather "
+            "than raising, which would erase every row from the evidence")
+        return result
+
     try:
         live = open_readonly(Path(live_path))
         backup = open_readonly(Path(backup_path))
@@ -538,6 +589,20 @@ def compare_databases(live_path: Path, backup_path: Path, *,
         return result
 
     try:
+        # H2: one explicit read transaction per side, held for the whole capture.
+        # Without BEGIN every PRAGMA/SELECT is its own transaction, so the gate can
+        # combine rows that never coexisted (two tables compared either side of an
+        # atomic writer commit). Each side is then internally consistent for the
+        # whole capture; the two sides are still not simultaneously frozen, which
+        # is exactly why Stage 2 must exclude writers.
+        for label, conn in (("live", live), ("backup", backup)):
+            try:
+                conn.execute("BEGIN")
+            except sqlite3.Error as exc:
+                result.reasons.append(
+                    f"cannot open a read transaction on the {label} database: {exc}")
+                return result
+
         for label, conn in (("live", live), ("backup", backup)):
             integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
             result.checks[f"{label}_integrity"] = integrity
@@ -566,6 +631,22 @@ def compare_databases(live_path: Path, backup_path: Path, *,
 
         live_inventory = table_inventory(live)
         backup_inventory = table_inventory(backup)
+        for label, conn, inventory in (("live", live, live_inventory),
+                                       ("backup", backup, backup_inventory)):
+            declared = schema_table_names(conn)
+            absent = sorted(declared - set(inventory))
+            if absent:
+                result.reasons.append(
+                    f"table introspection on the {label} database omitted "
+                    f"{len(absent)} table(s) present in sqlite_schema "
+                    f"({', '.join(absent[:3])}): the engine's metadata is incomplete, "
+                    "so no row evidence can be trusted")
+            if not inventory and declared:
+                result.reasons.append(
+                    f"PRAGMA table_list returned nothing for the {label} database "
+                    f"although sqlite_schema declares {len(declared)} table(s)")
+        if result.reasons:
+            return result
         if set(live_inventory) != set(backup_inventory):
             result.reasons.append("the two databases expose different tables")
             return result
@@ -620,6 +701,20 @@ def compare_databases(live_path: Path, backup_path: Path, *,
         result.backup_logical_digest = digest_bytes(b"".join(backup_logical))
         result.ok = not result.reasons
         return result
+    except (sqlite3.DatabaseError, sqlite3.Error, OSError, UnicodeError) as exc:
+        # M5: a corrupt or unreadable database is a *structured* refusal. Escaping
+        # as an exception gave a nonzero exit with no reason, and a caller that
+        # only checks `ok` would see the default False but no explanation.
+        result.ok = False
+        result.reasons.append(
+            f"the databases could not be read as SQLite evidence: "
+            f"{type(exc).__name__}: {exc}")
+        return result
     finally:
+        for conn in (live, backup):
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
         live.close()
         backup.close()

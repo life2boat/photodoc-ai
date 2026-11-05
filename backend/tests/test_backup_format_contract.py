@@ -92,8 +92,9 @@ def test_a_rebound_manifest_with_a_false_artifact_hash_is_refused(tmp_path, live
     assert any("disagrees with the file" in e for e in report["errors"])
 
 
-def test_a_rebound_manifest_with_a_false_digest_passes_format_but_fails_the_gate(tmp_path, live):
-    """Digests are bound to the *content* by the gate, not by the checksum alone."""
+def test_a_rebound_manifest_with_a_false_digest_is_refused(tmp_path, live):
+    """A checksum only proves the manifest was not edited. The digest is now
+    recomputed from the database, so a self-consistent lie is refused."""
     path = make_set(live, tmp_path / "backups" / "s1")
     manifest = json.loads((path / backup_format.MANIFEST_JSON).read_text())
     manifest["schema_digest"] = "b" * 64
@@ -102,14 +103,15 @@ def test_a_rebound_manifest_with_a_false_digest_passes_format_but_fails_the_gate
              for n in backup_format.CHECKSUMMED]
     (path / backup_format.MANIFEST_FILE).write_text("\n".join(lines) + "\n")
 
-    ok, _ = backup_format.verify_set(path, expected_application_id=APPLICATION_ID)
-    assert ok, "the checksum contract alone cannot see this"
+    ok, report = backup_format.verify_set(path, expected_application_id=APPLICATION_ID)
+    assert not ok, "a rebound manifest with a false digest was accepted"
+    assert any("schema_digest" in e for e in report["errors"])
 
     import evidence_gate
-    code, report = evidence_gate.evaluate(live, path, expected_application_id=APPLICATION_ID,
-                                          max_age_hours=48)
+    code, gate_report = evidence_gate.evaluate(
+        live, path, expected_application_id=APPLICATION_ID, max_age_hours=48)
     assert code == evidence_gate.EXIT_INVALID
-    assert any("schema_digest" in e for e in report["errors"])
+    assert any("schema_digest" in e for e in gate_report["errors"])
 
 
 # -------------------------------------------------------------------- file inventory
