@@ -36,7 +36,7 @@ CREATE TABLE orders (
 );
 CREATE TABLE delivery_jobs (
     id TEXT PRIMARY KEY, order_id INTEGER NOT NULL, kind TEXT NOT NULL,
-    local_path TEXT, content_sha256 TEXT, content_size INTEGER,
+    local_path TEXT, original_name TEXT, content_sha256 TEXT, content_size INTEGER,
     state TEXT NOT NULL DEFAULT 'pending', cleanup_state TEXT NOT NULL DEFAULT 'pending',
     cleanup_phase TEXT NOT NULL DEFAULT 'none', local_deleted_at TEXT, delivered_at TEXT
 );
@@ -58,8 +58,11 @@ def p1(path: Path, orders, jobs):
     return path
 
 
-def file_job(oid=1, name="/app/uploads/photo.jpg", data=GOOD, state="pending"):
+def file_job(oid=1, name="/app/uploads/1_photo.jpg", data=GOOD, state="pending"):
+    stored = Path(name).name
+    original = stored.split("_", 1)[1] if "_" in stored else stored
     return {"id": f"f{oid}", "order_id": oid, "kind": "file", "local_path": name,
+            "original_name": original,
             "content_sha256": hashlib.sha256(data).hexdigest(), "content_size": len(data),
             "state": state, "cleanup_state": "pending", "cleanup_phase": "none",
             "local_deleted_at": None, "delivered_at": None}
@@ -67,7 +70,7 @@ def file_job(oid=1, name="/app/uploads/photo.jpg", data=GOOD, state="pending"):
 
 def info_job(oid=1):
     return {"id": f"info{oid}", "order_id": oid, "kind": "info",
-            "local_path": f"/app/uploads/{oid}_info.txt",
+            "local_path": f"/app/uploads/{oid}_info.txt", "original_name": "info.txt",
             "content_sha256": hashlib.sha256(b"info").hexdigest(), "content_size": 4,
             "state": "delivered", "cleanup_state": "completed", "cleanup_phase": "deleted",
             "local_deleted_at": "2026-01-01T00:10:00+00:00",
@@ -75,18 +78,18 @@ def info_job(oid=1):
 
 
 def complete_order(oid, name):
-    return [(oid, f"C{oid}", name, "paid", f"tok{oid}")], [file_job(oid, f"/app/uploads/{name}"),
-                                                            info_job(oid)]
+    return ([(oid, f"C{oid}", name, "paid", f"tok{oid}")],
+            [file_job(oid, f"/app/uploads/{oid}_{name}"), info_job(oid)])
 
 
 # ================================================================ H1: missing jobs
 def test_missing_jobs_refuse_producer_and_verifier(tmp_path):
     orders = [(1, "C1", "photo.jpg", "paid", "tok1")]
-    jobs = [file_job(1, "/app/uploads/photo.jpg"), info_job(1)]
+    jobs = [file_job(1, "/app/uploads/1_photo.jpg"), info_job(1)]
     db = p1(tmp_path / "db.db", orders, jobs)
     uploads = tmp_path / "uploads"
     uploads.mkdir()
-    (uploads / "photo.jpg").write_bytes(GOOD)
+    (uploads / "1_photo.jpg").write_bytes(GOOD)
 
     # remove the file job (the original is now unaddressable)
     conn = sqlite3.connect(db)
@@ -96,7 +99,7 @@ def test_missing_jobs_refuse_producer_and_verifier(tmp_path):
 
     out = tmp_path / "out"
     assert build_v2_set.main(["--live-db", str(db), "--uploads", str(uploads),
-                              "--output", str(out)]) == build_v2_set.EXIT_FAILED
+                              "--output", str(out), "--restore-uploads-root", "/app/uploads"]) == build_v2_set.EXIT_FAILED
     assert not out.exists()
 
     required, _groups, errors, _stats = recovery_artifacts.required_sources(db)
@@ -118,7 +121,7 @@ def test_endpoint_generated_order_with_missing_jobs_is_refused(tmp_path):
     out = tmp_path / "out"
     assert build_v2_set.main(["--live-db", str(root / "orders.db"),
                               "--uploads", str(root / "uploads"),
-                              "--output", str(out)]) == build_v2_set.EXIT_FAILED
+                              "--output", str(out), "--restore-uploads-root", "/app/uploads"]) == build_v2_set.EXIT_FAILED
 
 
 # ================================================================ H2: root binding
@@ -138,11 +141,11 @@ def test_restore_root_is_recorded_and_bound(tmp_path):
     db = p1(tmp_path / "db.db", orders, jobs)
     uploads = tmp_path / "uploads"
     uploads.mkdir()
-    (uploads / "photo.jpg").write_bytes(GOOD)
+    (uploads / "1_photo.jpg").write_bytes(GOOD)
 
     out = tmp_path / "out"
     assert build_v2_set.main(["--live-db", str(db), "--uploads", str(uploads),
-                              "--output", str(out)]) == build_v2_set.EXIT_OK
+                              "--output", str(out), "--restore-uploads-root", "/app/uploads"]) == build_v2_set.EXIT_OK
 
     manifest = json.loads((out / "backup_manifest.json").read_text())
     root = manifest["restore_uploads_root"]
@@ -213,10 +216,10 @@ def test_unknown_artifact_key_is_refused(tmp_path):
     db = p1(tmp_path / "db.db", *complete_order(1, "photo.jpg"))
     uploads = tmp_path / "uploads"
     uploads.mkdir()
-    (uploads / "photo.jpg").write_bytes(GOOD)
+    (uploads / "1_photo.jpg").write_bytes(GOOD)
     out = tmp_path / "out"
     assert build_v2_set.main(["--live-db", str(db), "--uploads", str(uploads),
-                              "--output", str(out)]) == 0
+                              "--output", str(out), "--restore-uploads-root", "/app/uploads"]) == 0
     manifest = json.loads((out / "backup_manifest.json").read_text())
     manifest["artifacts"]["unrelated"] = "x"
     (out / "backup_manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True))
@@ -232,10 +235,10 @@ def test_malformed_sqlite_version_is_refused(tmp_path):
     db = p1(tmp_path / "db.db", *complete_order(1, "photo.jpg"))
     uploads = tmp_path / "uploads"
     uploads.mkdir()
-    (uploads / "photo.jpg").write_bytes(GOOD)
+    (uploads / "1_photo.jpg").write_bytes(GOOD)
     out = tmp_path / "out"
     assert build_v2_set.main(["--live-db", str(db), "--uploads", str(uploads),
-                              "--output", str(out)]) == 0
+                              "--output", str(out), "--restore-uploads-root", "/app/uploads"]) == 0
     manifest = json.loads((out / "backup_manifest.json").read_text())
     manifest["database_identity"]["sqlite_version"] = "bogus"
     (out / "backup_manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True))
@@ -251,7 +254,7 @@ def test_malformed_sqlite_version_is_refused(tmp_path):
 def test_missing_uploads_directory_is_refused(tmp_path):
     archive = tmp_path / "a.tar.gz"
     with tarfile.open(archive, "w:gz") as tar:
-        member = tarfile.TarInfo("uploads/photo.jpg")
+        member = tarfile.TarInfo("uploads/1_photo.jpg")
         member.size = 3
         tar.addfile(member, io.BytesIO(b"abc"))
     _members, info, errors = recovery_artifacts.scan_archive(archive)
@@ -264,7 +267,7 @@ def test_extra_directory_is_refused(tmp_path):
         root = tarfile.TarInfo("uploads")
         root.type = tarfile.DIRTYPE
         tar.addfile(root)
-        member = tarfile.TarInfo("uploads/photo.jpg")
+        member = tarfile.TarInfo("uploads/1_photo.jpg")
         member.size = 3
         tar.addfile(member, io.BytesIO(b"abc"))
         extra = tarfile.TarInfo("uploads/extra")
@@ -279,10 +282,10 @@ def test_eperm_fsync_aborts_publication(tmp_path, monkeypatch):
     db = p1(tmp_path / "db.db", *complete_order(1, "photo.jpg"))
     uploads = tmp_path / "uploads"
     uploads.mkdir()
-    (uploads / "photo.jpg").write_bytes(GOOD)
+    (uploads / "1_photo.jpg").write_bytes(GOOD)
     out = tmp_path / "out"
     assert build_v2_set.main(["--live-db", str(db), "--uploads", str(uploads),
-                              "--output", str(out)]) == 0
+                              "--output", str(out), "--restore-uploads-root", "/app/uploads"]) == 0
     staging = tmp_path / "staging"
     shutil.copytree(out, staging)
 

@@ -40,7 +40,7 @@ def backup_set(tmp_path, live) -> Path:
 
 # ------------------------------------------------------------------------ happy path
 def test_a_matching_set_passes(live, backup_set):
-    result = run_cli("--live-db", str(live), "--backup-dir", str(backup_set), "--json")
+    result = run_cli("--live-db", str(live), "--backup-dir", str(backup_set), "--restore-uploads-root", "/app/uploads", "--json")
     assert result.returncode == 0, result.stdout + result.stderr
     payload = json.loads(result.stdout)
     assert payload["ok"] is True
@@ -50,7 +50,7 @@ def test_a_matching_set_passes(live, backup_set):
 
 
 def test_the_human_output_names_the_evidence(live, backup_set):
-    result = run_cli("--live-db", str(live), "--backup-dir", str(backup_set))
+    result = run_cli("--live-db", str(live), "--backup-dir", str(backup_set), "--restore-uploads-root", "/app/uploads")
     assert result.returncode == 0
     assert "GATE: PASS" in result.stdout
     assert "sqlite_sequence" in result.stdout
@@ -59,7 +59,7 @@ def test_the_human_output_names_the_evidence(live, backup_set):
 # ----------------------------------------------------------------------------- refusals
 def test_a_changed_row_is_refused(tmp_path, live, backup_set):
     changed = build_database(tmp_path / "changed.db", variant="wr_row")
-    result = run_cli("--live-db", str(changed), "--backup-dir", str(backup_set), "--json")
+    result = run_cli("--live-db", str(changed), "--backup-dir", str(backup_set), "--restore-uploads-root", "/app/uploads", "--json")
     assert result.returncode == evidence_gate.EXIT_INVALID
     payload = json.loads(result.stdout)
     assert any("wr_items" in reason for reason in payload["errors"])
@@ -68,7 +68,7 @@ def test_a_changed_row_is_refused(tmp_path, live, backup_set):
 def test_an_extra_backup_row_is_refused(tmp_path, live):
     extra = build_database(tmp_path / "extra.db", variant="backup_only_row")
     path = make_set(extra, tmp_path / "backups" / "s1")
-    result = run_cli("--live-db", str(live), "--backup-dir", str(path), "--json")
+    result = run_cli("--live-db", str(live), "--backup-dir", str(path), "--restore-uploads-root", "/app/uploads", "--json")
     assert result.returncode == evidence_gate.EXIT_INVALID
     assert any("resurrect" in reason for reason in json.loads(result.stdout)["errors"])
 
@@ -76,7 +76,7 @@ def test_an_extra_backup_row_is_refused(tmp_path, live):
 def test_a_stale_set_is_refused(live, tmp_path):
     old = make_set(live, tmp_path / "backups" / "old",
                    created_at=NOW - timedelta(hours=100))
-    result = run_cli("--live-db", str(live), "--backup-dir", str(old),
+    result = run_cli("--live-db", str(live), "--backup-dir", str(old), "--restore-uploads-root", "/app/uploads",
                      "--max-age-hours", "24", "--json")
     assert result.returncode == evidence_gate.EXIT_STALE
 
@@ -84,7 +84,7 @@ def test_a_stale_set_is_refused(live, tmp_path):
 def test_a_future_timestamp_is_refused(live, tmp_path):
     future = make_set(live, tmp_path / "backups" / "future",
                       created_at=NOW + timedelta(hours=3))
-    result = run_cli("--live-db", str(live), "--backup-dir", str(future), "--json")
+    result = run_cli("--live-db", str(live), "--backup-dir", str(future), "--restore-uploads-root", "/app/uploads", "--json")
     assert result.returncode == evidence_gate.EXIT_INVALID
     assert any("future" in reason for reason in json.loads(result.stdout)["errors"])
 
@@ -94,7 +94,7 @@ def test_a_tampered_manifest_is_refused(live, backup_set):
     manifest = json.loads(path.read_text())
     manifest["verification"] = "SKIPPED"
     path.write_text(json.dumps(manifest, indent=2, sort_keys=True))
-    result = run_cli("--live-db", str(live), "--backup-dir", str(backup_set), "--json")
+    result = run_cli("--live-db", str(live), "--backup-dir", str(backup_set), "--restore-uploads-root", "/app/uploads", "--json")
     assert result.returncode == evidence_gate.EXIT_INVALID
     assert any("backup_manifest.json" in reason
                for reason in json.loads(result.stdout)["errors"])
@@ -102,7 +102,7 @@ def test_a_tampered_manifest_is_refused(live, backup_set):
 
 # ------------------------------------------------------------------- policy handling
 def test_pre_outbox_policy_passes_when_neither_side_has_the_table(live, backup_set):
-    result = run_cli("--live-db", str(live), "--backup-dir", str(backup_set),
+    result = run_cli("--live-db", str(live), "--backup-dir", str(backup_set), "--restore-uploads-root", "/app/uploads",
                      "--policy", "pre-outbox-transition", "--json")
     assert result.returncode == 0, result.stdout
 
@@ -116,18 +116,18 @@ def test_pre_outbox_policy_is_refused_once_the_table_exists(tmp_path, live):
     finally:
         conn.close()
     path = make_set(live, tmp_path / "backups" / "s1")
-    result = run_cli("--live-db", str(live), "--backup-dir", str(path),
+    result = run_cli("--live-db", str(live), "--backup-dir", str(path), "--restore-uploads-root", "/app/uploads",
                      "--policy", "pre-outbox-transition", "--json")
     assert result.returncode == evidence_gate.EXIT_INVALID
     assert any("paid_email_outbox" in reason for reason in json.loads(result.stdout)["errors"])
 
 
 def test_an_unknown_policy_is_a_config_error(live, backup_set):
-    result = run_cli("--live-db", str(live), "--backup-dir", str(backup_set),
+    result = run_cli("--live-db", str(live), "--backup-dir", str(backup_set), "--restore-uploads-root", "/app/uploads",
                      "--policy", "normal")
     assert result.returncode == 0
     # argparse rejects an unknown choice before the gate runs
-    bad = run_cli("--live-db", str(live), "--backup-dir", str(backup_set),
+    bad = run_cli("--live-db", str(live), "--backup-dir", str(backup_set), "--restore-uploads-root", "/app/uploads",
                   "--policy", "bogus")
     assert bad.returncode != 0
 
@@ -135,33 +135,33 @@ def test_an_unknown_policy_is_a_config_error(live, backup_set):
 # ------------------------------------------------------------------------ configuration
 @pytest.mark.parametrize("value", ["nan", "inf", "-inf", "0", "-1", "abc", "1e999"])
 def test_invalid_freshness_values_are_config_errors(live, backup_set, value):
-    result = run_cli("--live-db", str(live), "--backup-dir", str(backup_set),
+    result = run_cli("--live-db", str(live), "--backup-dir", str(backup_set), "--restore-uploads-root", "/app/uploads",
                      f"--max-age-hours={value}", "--json")
     assert result.returncode == evidence_gate.EXIT_CONFIG, f"{value!r} was accepted"
 
 
 def test_missing_live_database_is_reported(live, backup_set, tmp_path):
     result = run_cli("--live-db", str(tmp_path / "nope.db"),
-                     "--backup-dir", str(backup_set), "--json")
+                     "--backup-dir", str(backup_set), "--restore-uploads-root", "/app/uploads", "--json")
     assert result.returncode == evidence_gate.EXIT_MISSING
 
 
 def test_missing_backup_set_is_reported(live, tmp_path):
-    result = run_cli("--live-db", str(live), "--backup-dir", str(tmp_path / "no-such"),
+    result = run_cli("--live-db", str(live), "--backup-dir", str(tmp_path / "no-such"), "--restore-uploads-root", "/app/uploads",
                      "--json")
     assert result.returncode == evidence_gate.EXIT_MISSING
 
 
 def test_unverified_set_can_be_allowed(tmp_path, live):
     path = make_set(live, tmp_path / "backups" / "s1", verification="SKIPPED")
-    refused = run_cli("--live-db", str(live), "--backup-dir", str(path))
+    refused = run_cli("--live-db", str(live), "--backup-dir", str(path), "--restore-uploads-root", "/app/uploads")
     assert refused.returncode == evidence_gate.EXIT_INVALID
-    allowed = run_cli("--live-db", str(live), "--backup-dir", str(path), "--allow-unverified")
+    allowed = run_cli("--live-db", str(live), "--backup-dir", str(path), "--restore-uploads-root", "/app/uploads", "--allow-unverified")
     assert allowed.returncode == 0, allowed.stdout
 
 
 def test_wrong_application_id_is_refused(live, backup_set):
-    result = run_cli("--live-db", str(live), "--backup-dir", str(backup_set),
+    result = run_cli("--live-db", str(live), "--backup-dir", str(backup_set), "--restore-uploads-root", "/app/uploads",
                      "--application-id", "42", "--json")
     assert result.returncode == evidence_gate.EXIT_INVALID
     assert any("application_id" in reason for reason in json.loads(result.stdout)["errors"])
@@ -171,7 +171,7 @@ def test_wrong_application_id_is_refused(live, backup_set):
 def test_the_gate_does_not_modify_either_database(live, backup_set):
     before_live = live.read_bytes()
     before_backup = (backup_set / "orders.db").read_bytes()
-    assert run_cli("--live-db", str(live), "--backup-dir", str(backup_set)).returncode == 0
+    assert run_cli("--live-db", str(live), "--backup-dir", str(backup_set), "--restore-uploads-root", "/app/uploads").returncode == 0
     assert live.read_bytes() == before_live
     assert (backup_set / "orders.db").read_bytes() == before_backup
 
@@ -179,7 +179,7 @@ def test_the_gate_does_not_modify_either_database(live, backup_set):
 def test_a_refusal_leaves_no_side_effects(tmp_path, live, backup_set):
     changed = build_database(tmp_path / "changed.db", variant="wr_row")
     before = changed.read_bytes()
-    run_cli("--live-db", str(changed), "--backup-dir", str(backup_set))
+    run_cli("--live-db", str(changed), "--backup-dir", str(backup_set), "--restore-uploads-root", "/app/uploads")
     assert changed.read_bytes() == before
     assert sorted(p.name for p in backup_set.iterdir()) == sorted(
         [name for name in ("orders.db", "uploads.tar.gz", "backup_manifest.json",

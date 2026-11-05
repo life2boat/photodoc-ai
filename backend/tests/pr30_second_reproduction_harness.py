@@ -160,7 +160,7 @@ def hn1():
         uploads = write_uploads(tmp / "uploads", {"photo.jpg": b"legacy pending original"})
         out = tmp / "backups" / "s1"
         code = build_v2_set.main(["--live-db", str(db), "--uploads", str(uploads),
-                                  "--output", str(out)])
+                                  "--output", str(out), "--restore-uploads-root", str(uploads)])
         ok, report = backup_format.verify_set(out, expected_application_id=APP)
         gate, _ = run_gate(db, out)
         archived = report["checks"]["archive"]["files"] if ok else "n/a"
@@ -220,7 +220,7 @@ def hn4():
         out = tmp / "backups" / "real"
         code = build_v2_set.main(["--live-db", str(source / "orders.db"),
                                   "--uploads", str(source / "uploads"),
-                                  "--output", str(out)])
+                                  "--output", str(out), "--restore-uploads-root", str(source / "uploads")])
         record("HN4 real fixture refused by producer", code != 0,
                f"producer_exit={code}")
 
@@ -244,7 +244,7 @@ def hn5():
         tempfile.mkdtemp = tracking
         try:
             build_v2_set.main(["--live-db", str(db), "--uploads", str(uploads),
-                               "--output", str(tmp / "out")])
+                               "--output", str(tmp / "out"), "--restore-uploads-root", str(uploads)])
         finally:
             tempfile.mkdtemp = original
         leaked = [d for d in created if (d / "snapshot.db").exists()]

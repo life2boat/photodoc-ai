@@ -140,6 +140,10 @@ the reference — a restore preserves the path, and the database looks directly 
 uploads directory. Missing, substituted, wrong-sized, truncated, ambiguous and duplicate
 members are refusals.
 
+`--restore-uploads-root` is the **deployment's** uploads root, never a value read from
+the database: it is required whenever the set needs originals, and every recorded
+`local_path` must live under it.
+
 The archived file set must **equal** the derived set: an unneeded customer file is refused,
 because retaining a photo that was already deleted violates the zero-retention contract.
 
@@ -201,7 +205,8 @@ set and refuses it with the exact command to migrate.
 ```bash
 # fresh set from the live database and uploads
 python3 scripts/build_v2_set.py --live-db /data/orders.db \
-    --uploads /app/uploads --output /backups/20260101T000000Z
+    --uploads /app/uploads --restore-uploads-root /app/uploads \
+    --output /backups/20260101T000000Z
 
 # re-manifest an existing legacy set (every claim is recomputed, not copied)
 python3 scripts/build_v2_set.py --from-v1 /backups/OLD --output /backups/NEW
@@ -220,6 +225,7 @@ Neither producer is wired into deployment. Producing a set is not authorising a 
 python3 scripts/evidence_gate.py \
   --live-db /path/to/orders.db \
   --backup-dir /backups/20260101T000000Z \
+  --restore-uploads-root /app/uploads \
   --max-age-hours 24 --json
 ```
 

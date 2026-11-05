@@ -81,22 +81,56 @@ Additional contradictions, all refusals:
 * a `file`/`info` job with an empty `local_path`;
 * a required job without a valid `content_sha256` or `content_size`.
 
-### 3a. Order-to-job completeness (P1)
+### 3a. Order-to-file binding (P1)
 
-Being P1 does not by itself prove that every order still has its jobs. A partial migration
-or a missing row can leave an order with an `orders.filename` but no `file` job, in which
-case the original is unaddressable and must not be silently dropped. The application
-creates, atomically with each order, one `file` job per attachment name and exactly one
-`info` job. Both invariants are checked per order (including unpaid orders); a mismatch, or
-an empty `filename`, is a refusal — not "zero originals".
+Being P1 does not by itself prove that every order still has its jobs, and matching job
+*counts* do not prove that the jobs belong to that order. A substituted job can leave the
+count correct while pointing at another order's file. For every order (including unpaid
+ones) the selector therefore checks, from the authoritative order record:
 
-### 3b. Restore-root binding
+| Check | Rule |
+|---|---|
+| attachment inventory | `orders.filename` (sanitized names) must equal, as a multiset, the `original_name` of the order's `file` jobs (same sanitizer as `backend.main`) |
+| job count | one `file` job per listed attachment name |
+| stored-name ownership | each `local_path` basename must start with `{order_id}_` — the same guard `deliver_job` applies |
+| reference uniqueness | one `local_path` may be referenced by exactly one job |
+| info job | exactly one per order |
+| filename metadata | empty/NULL is refused; a non-text value is a structured refusal, not a traceback |
 
-Every required original must be restorable to the **exact path the application records**.
-All required `local_path` values must share one uploads root; it is recorded as
-`restore_uploads_root`, and the restore rehearsal extracts members to that root and verifies
-`local_path == <root>/<basename>`, not just the basename and hash. A target-root relocation
-therefore needs an explicit, verified path rewrite or is refused.
+Missing, extra, duplicated or mismatched file jobs all fail closed.
+
+### 3a.1 Notification records (M1)
+
+When the database contains any email job, every order must have exactly one `admin_email`
+job. When `paid_email_outbox` exists, every paid order must have exactly one `paid_email`
+job and an outbox row in a known state (`pending`, `retry`, `sending`, `sent`,
+`uncertain`). A paid order with no outbox row has no recorded email outcome and is refused.
+This only validates existing durable records; it never invents a resend.
+
+### 3a.2 Supported schema inventory (M2)
+
+The selector only guarantees coverage of the schema it knows: `user_version` must be `0`
+(the application never sets it), and any table that looks like it references originals
+(path-like column plus a hash/size column) but is not `delivery_jobs` is refused. An
+unknown future schema is not silently treated as "no additional originals".
+
+### 3b. Trusted restore-root binding
+
+Every required original must be restorable to the **exact path the application will use**.
+A root read out of the database being verified proves only that the set agrees with itself,
+so the root must come from the **deployment configuration**:
+
+* `build_v2_set.py --restore-uploads-root` and `evidence_gate.py --restore-uploads-root`
+  take the application's `UPLOAD_DIR` / Compose binding (for example `/app/uploads`).
+* The producer refuses when the database's recorded root differs from that root, and
+  records the deployment root as `restore_uploads_root`.
+* The verifier compares every required `local_path` parent with the supplied root; the gate
+  refuses a set that requires originals when no root was supplied.
+* The restore rehearsal extracts to the recorded root and verifies
+  `local_path == <root>/<basename>` plus the bytes.
+
+A target-root relocation therefore needs an explicit, verified path rewrite or is refused.
+For P0 sets the archive root maps onto the deployment root, which is recorded and required.
 
 ## 4. Archive path contract
 
@@ -129,8 +163,14 @@ The manifest's `schema_digest` and `logical_digest` are recomputed from the arch
 database and must match; `database_identity.application_id` and `schema_digest` must be
 present, non-NULL, and equal to the recomputed values; `uploads.members` and
 `uploads.uncompressed_bytes` must equal the scanned archive; `set_id` must be a UUID/hex
-identifier; unknown fields at the top level, under `database_identity` and under `uploads`
-are refused; `trust_note` must be the exact current text.
+identifier; unknown fields at the top level, under `database_identity`, under `artifacts`
+and under `uploads` are refused; `trust_note` must be the exact current text;
+`database_identity.sqlite_version`, when present, must be a well-formed `X.Y.Z` string
+(informational — a cross-version restore is allowed).
+
+`restore_uploads_root` must be **null exactly when the set requires no originals**, and a
+valid path naming an `uploads` directory otherwise. A non-null root on an empty set is
+refused: the verifier cannot check it and a future consumer could trust it.
 
 ## 7. Verification order
 

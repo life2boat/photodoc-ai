@@ -170,7 +170,7 @@ def _evidence(db_path: Path) -> dict:
 
 
 def _finalise(staging: Path, output: Path, evidence: dict, limits,
-              policy: str) -> dict:
+              policy: str, restore_uploads_root: str) -> dict:
     archive = staging / backup_format.TAR_FILE
     info, archive_errors = backup_format.inspect_archive(archive, limits)
     if archive_errors:
@@ -178,11 +178,35 @@ def _finalise(staging: Path, output: Path, evidence: dict, limits,
             "the produced archive failed inspection: " + "; ".join(archive_errors))
 
     ok, recovery = recovery_artifacts.verify_recovery(
-        staging / backup_format.DB_FILE, archive, limits, legacy_p0_policy=policy)
+        staging / backup_format.DB_FILE, archive, limits, legacy_p0_policy=policy,
+        expected_uploads_root=restore_uploads_root)
     if not ok:
         raise backup_format.FormatError(
             "the produced archive does not satisfy the database: "
             + "; ".join(recovery["errors"][:3]))
+    # H2: the recorded root must be the deployment's, not a value echoed from the database.
+    derived_root = recovery.get("required", {}).get("uploads_root")
+    generation = recovery.get("required", {}).get("generation")
+    if derived_root is None and generation == "P0" and recovery.get("p0_groups"):
+        # Legacy originals have no per-job absolute path; the archive root maps onto the
+        # deployment's own uploads root, so record that and skip the derived comparison.
+        if restore_uploads_root is None:
+            raise backup_format.FormatError(
+                "a P0 set requires --restore-uploads-root (the application's uploads root)")
+        derived_root = restore_uploads_root
+    elif derived_root is None:
+        # Nothing to place: the manifest records a null root and no root is required.
+        restore_uploads_root = None
+    elif restore_uploads_root is None:
+        raise backup_format.FormatError(
+            "the database requires originals but no --restore-uploads-root was supplied; "
+            "the application's uploads root must come from the deployment configuration, "
+            "not from the database")
+    if derived_root is not None and recovery_artifacts.normalise_root(derived_root) != \
+            recovery_artifacts.normalise_root(restore_uploads_root):
+        raise backup_format.FormatError(
+            f"the database records uploads root {derived_root!r} but the deployment root is "
+            f"{restore_uploads_root!r}; a restore would leave every recorded path wrong")
 
     manifest = backup_format.build_manifest(
         artifacts={backup_format.DB_FILE: _sha256_file(staging / backup_format.DB_FILE),
@@ -196,12 +220,14 @@ def _finalise(staging: Path, output: Path, evidence: dict, limits,
                            "sqlite_version": evidence["sqlite_version"]},
         upload_members=info["members"], upload_bytes=info["bytes"],
         verification="PASS",
-        restore_uploads_root=recovery["required"].get("uploads_root"))
+        restore_uploads_root=(None if restore_uploads_root is None
+                              else recovery_artifacts.normalise_root(restore_uploads_root)))
     backup_format.write_manifest_files(staging, manifest)
 
     verified, report = backup_format.verify_set(
         staging, expected_application_id=evidence["application_id"], deep=True,
-        limits=limits, allow_staging=True, legacy_p0_policy=policy)
+        limits=limits, allow_staging=True, legacy_p0_policy=policy,
+        expected_uploads_root=restore_uploads_root)
     if not verified:
         raise backup_format.FormatError(
             "the produced set does not verify: " + "; ".join(report["errors"][:3]))
@@ -215,7 +241,7 @@ def _finalise(staging: Path, output: Path, evidence: dict, limits,
 
 
 def build_from_live(live_db: Path, uploads_dir: Path, output: Path,
-                    limits, policy: str) -> dict:
+                    limits, policy: str, restore_uploads_root: str) -> dict:
     staging = backup_format.staging_dir_for(Path(output))
     staging.mkdir(parents=True)
     try:
@@ -226,14 +252,16 @@ def build_from_live(live_db: Path, uploads_dir: Path, output: Path,
             raise backup_format.FormatError(
                 "the live files do not match the live database: " + "; ".join(errors[:3]))
         _write_archive(copies, staging / backup_format.TAR_FILE)
-        return _finalise(staging, output, _evidence(target_db), limits, policy)
+        return _finalise(staging, output, _evidence(target_db), limits, policy,
+                         restore_uploads_root)
     except Exception:
         shutil.rmtree(staging, ignore_errors=True)
         raise
 
 
 # --------------------------------------------------------------------- v1 upgrade
-def upgrade_legacy(source: Path, output: Path, limits, policy: str) -> dict:
+def upgrade_legacy(source: Path, output: Path, limits, policy: str,
+                   restore_uploads_root: str) -> dict:
     """Re-manifest a legacy set as v2, recomputing every claim from the bytes."""
     source = Path(source)
     source_db = source / backup_format.DB_FILE
@@ -254,13 +282,15 @@ def upgrade_legacy(source: Path, output: Path, limits, policy: str) -> dict:
 
         # A legacy PASS is never inherited: the archive must satisfy this contract.
         recovery_ok, recovery = recovery_artifacts.verify_recovery(
-            target_db, target_tar, limits, legacy_p0_policy=policy)
+            target_db, target_tar, limits, legacy_p0_policy=policy,
+            expected_uploads_root=restore_uploads_root)
         if not recovery_ok:
             raise backup_format.FormatError(
                 "the legacy set cannot restore its own database: "
                 + "; ".join(recovery["errors"][:3]))
 
-        result = _finalise(staging, output, _evidence(target_db), limits, policy)
+        result = _finalise(staging, output, _evidence(target_db), limits, policy,
+                           restore_uploads_root)
         result["source_format"] = "legacy-v1"
         return result
     except Exception:
@@ -275,6 +305,11 @@ def main(argv: list[str] | None = None) -> int:
     source.add_argument("--from-v1", type=Path)
     parser.add_argument("--uploads", type=Path, help="uploads directory (with --live-db)")
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--restore-uploads-root", default=None,
+                        help="the APPLICATION's uploads root after restore (the container's "
+                             "UPLOAD_DIR / Compose binding), not a value read from the "
+                             "database; every recorded local_path must live under it. "
+                             "Required whenever the database requires any original.")
     parser.add_argument("--legacy-p0-policy", default="fail",
                         choices=recovery_artifacts.P0_POLICIES,
                         help="how to treat orders without delivery_jobs (default: fail)")
@@ -285,7 +320,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.from_v1 is not None:
             result = upgrade_legacy(args.from_v1, args.output, limits,
-                                    args.legacy_p0_policy)
+                                    args.legacy_p0_policy, args.restore_uploads_root)
         else:
             if args.uploads is None:
                 print("CONFIG ERROR: --uploads is required with --live-db", file=sys.stderr)
@@ -306,7 +341,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"CONFIG ERROR: output already exists: {args.output}", file=sys.stderr)
                 return EXIT_CONFIG
             result = build_from_live(args.live_db, args.uploads, args.output, limits,
-                                     args.legacy_p0_policy)
+                                     args.legacy_p0_policy, args.restore_uploads_root)
     except backup_format.FormatError as exc:
         print(f"REFUSED: {exc}", file=sys.stderr)
         return EXIT_FAILED

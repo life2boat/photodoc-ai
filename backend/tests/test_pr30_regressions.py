@@ -182,7 +182,7 @@ def test_substituted_recovery_bytes_are_refused(tmp_path, delivery):
     bad = b"wrong content same-size!!"
     assert len(bad) == len(GOOD_PHOTO)
     path = make_set(db, tmp_path / "set",
-                    upload_files={"photo.jpg": bad, "info.pdf": OTHER_PHOTO})
+                    upload_files={"1_photo.jpg": bad, "1_info.pdf": OTHER_PHOTO})
     ok, report = backup_format.verify_set(path, expected_application_id=APPLICATION_ID)
     assert not ok
     assert any("wrong content" in e for e in report["errors"])
@@ -190,7 +190,7 @@ def test_substituted_recovery_bytes_are_refused(tmp_path, delivery):
 
 def test_missing_recovery_original_is_refused(tmp_path, delivery):
     db, _ = delivery
-    path = make_set(db, tmp_path / "set", upload_files={"photo.jpg": GOOD_PHOTO})
+    path = make_set(db, tmp_path / "set", upload_files={"1_photo.jpg": GOOD_PHOTO})
     ok, report = backup_format.verify_set(path, expected_application_id=APPLICATION_ID)
     assert not ok
     assert any("missing from the archive" in e for e in report["errors"])
@@ -207,7 +207,7 @@ def test_wrong_size_recovery_original_is_refused(tmp_path, delivery):
 def test_a_faithful_recovery_set_passes(tmp_path, delivery):
     db, _ = delivery
     path = make_set(db, tmp_path / "set",
-                    upload_files={"photo.jpg": GOOD_PHOTO, "info.pdf": OTHER_PHOTO})
+                    upload_files={"1_photo.jpg": GOOD_PHOTO, "1_info.pdf": OTHER_PHOTO})
     ok, report = backup_format.verify_set(path, expected_application_id=APPLICATION_ID)
     assert ok, report["errors"]
     assert report["checks"]["recovery"]["required"]["required"] == 2
@@ -216,7 +216,7 @@ def test_a_faithful_recovery_set_passes(tmp_path, delivery):
 def test_a_cleaned_job_does_not_require_its_deleted_file(tmp_path, delivery):
     db, _ = delivery
     path = make_set(db, tmp_path / "set",
-                    upload_files={"photo.jpg": GOOD_PHOTO, "info.pdf": OTHER_PHOTO})
+                    upload_files={"1_photo.jpg": GOOD_PHOTO, "1_info.pdf": OTHER_PHOTO})
     ok, report = backup_format.verify_set(path, expected_application_id=APPLICATION_ID)
     assert ok
     assert report["checks"]["recovery"]["required"]["cleaned"] == 1
@@ -231,7 +231,7 @@ def test_a_job_without_content_hash_is_refused(tmp_path, delivery):
     finally:
         conn.close()
     path = make_set(db, tmp_path / "set",
-                    upload_files={"photo.jpg": GOOD_PHOTO, "info.pdf": OTHER_PHOTO})
+                    upload_files={"1_photo.jpg": GOOD_PHOTO, "1_info.pdf": OTHER_PHOTO})
     ok, report = backup_format.verify_set(path, expected_application_id=APPLICATION_ID)
     assert not ok
     assert any("content_sha256" in e for e in report["errors"])
@@ -398,7 +398,7 @@ def test_hostile_member_paths_are_refused(name):
 
 def test_the_uploads_root_directory_entry_is_allowed():
     assert not recovery_artifacts.path_errors("uploads")
-    assert not recovery_artifacts.path_errors("uploads/photo.jpg")
+    assert not recovery_artifacts.path_errors("uploads/1_photo.jpg")
 
 
 def test_a_file_named_uploads_is_refused(tmp_path):
@@ -506,7 +506,7 @@ def test_the_gate_reports_a_malformed_database_in_its_json(tmp_path):
     uploads = tmp_path / "uploads"
     db = build_delivery_database(tmp_path / "live.db", uploads)
     path = make_set(db, tmp_path / "set",
-                    upload_files={"photo.jpg": GOOD_PHOTO, "info.pdf": OTHER_PHOTO})
+                    upload_files={"1_photo.jpg": GOOD_PHOTO, "1_info.pdf": OTHER_PHOTO})
     (path / "orders.db").write_bytes(b"not a sqlite database")
     _rebind(path)
     code, report = evidence_gate.evaluate(db, path, expected_application_id=APPLICATION_ID,
@@ -521,7 +521,7 @@ def test_the_producer_builds_a_verifiable_v2_set(tmp_path):
     db = build_delivery_database(tmp_path / "live.db", uploads)
     out = tmp_path / "backups" / "20260101T000000Z"
     result = build_v2_set.main(["--live-db", str(db), "--uploads", str(uploads),
-                                "--output", str(out), "--json"])
+                                "--output", str(out), "--json", "--restore-uploads-root", str(uploads)])
     assert result == build_v2_set.EXIT_OK
     ok, report = backup_format.verify_set(out, expected_application_id=APPLICATION_ID)
     assert ok, report["errors"]
@@ -531,9 +531,9 @@ def test_the_producer_builds_a_verifiable_v2_set(tmp_path):
 def test_the_producer_refuses_when_the_files_do_not_match_the_database(tmp_path):
     uploads = tmp_path / "uploads"
     db = build_delivery_database(tmp_path / "live.db", uploads)
-    (uploads / "photo.jpg").write_bytes(b"tampered on disk!!")
+    (uploads / "1_photo.jpg").write_bytes(b"tampered on disk!!")
     result = build_v2_set.main(["--live-db", str(db), "--uploads", str(uploads),
-                                "--output", str(tmp_path / "out")])
+                                "--output", str(tmp_path / "out"), "--restore-uploads-root", str(uploads)])
     assert result == build_v2_set.EXIT_FAILED
 
 
@@ -542,9 +542,9 @@ def test_the_producer_refuses_to_overwrite(tmp_path):
     db = build_delivery_database(tmp_path / "live.db", uploads)
     out = tmp_path / "backups" / "s1"
     assert build_v2_set.main(["--live-db", str(db), "--uploads", str(uploads),
-                              "--output", str(out)]) == 0
+                              "--output", str(out), "--restore-uploads-root", str(uploads)]) == 0
     assert build_v2_set.main(["--live-db", str(db), "--uploads", str(uploads),
-                              "--output", str(out)]) == build_v2_set.EXIT_CONFIG
+                              "--output", str(out), "--restore-uploads-root", str(uploads)]) == build_v2_set.EXIT_CONFIG
 
 
 def _legacy_set(tmp_path, db, uploads_files):
@@ -568,7 +568,7 @@ def test_a_legacy_v1_set_is_detected_and_refused_by_the_gate(tmp_path):
     uploads = tmp_path / "uploads"
     db = build_delivery_database(tmp_path / "live.db", uploads)
     legacy = _legacy_set(tmp_path, db,
-                         {"photo.jpg": GOOD_PHOTO, "info.pdf": OTHER_PHOTO})
+                         {"1_photo.jpg": GOOD_PHOTO, "1_info.pdf": OTHER_PHOTO})
     assert backup_format.detect_format(legacy) == "legacy-v1"
     code, report = evidence_gate.evaluate(db, legacy, expected_application_id=APPLICATION_ID,
                                           max_age_hours=48)
@@ -580,9 +580,10 @@ def test_the_upgrade_path_produces_a_verifiable_v2_set(tmp_path):
     uploads = tmp_path / "uploads"
     db = build_delivery_database(tmp_path / "live.db", uploads)
     legacy = _legacy_set(tmp_path, db,
-                         {"photo.jpg": GOOD_PHOTO, "info.pdf": OTHER_PHOTO})
+                         {"1_photo.jpg": GOOD_PHOTO, "1_info.pdf": OTHER_PHOTO})
     out = tmp_path / "upgraded"
-    assert build_v2_set.main(["--from-v1", str(legacy), "--output", str(out)]) == 0
+    assert build_v2_set.main(["--from-v1", str(legacy), "--output", str(out),
+                              "--restore-uploads-root", str(uploads)]) == 0
     assert backup_format.detect_format(out) == "v2"
     ok, report = backup_format.verify_set(out, expected_application_id=APPLICATION_ID)
     assert ok, report["errors"]
@@ -591,7 +592,8 @@ def test_the_upgrade_path_produces_a_verifiable_v2_set(tmp_path):
 def test_the_upgrade_refuses_a_set_that_cannot_restore_its_own_database(tmp_path):
     uploads = tmp_path / "uploads"
     db = build_delivery_database(tmp_path / "live.db", uploads)
-    legacy = _legacy_set(tmp_path, db, {"photo.jpg": GOOD_PHOTO})  # info.pdf missing
+    legacy = _legacy_set(tmp_path, db, {"1_photo.jpg": GOOD_PHOTO})  # info.pdf missing
     result = build_v2_set.main(["--from-v1", str(legacy),
-                                "--output", str(tmp_path / "upgraded")])
+                                "--output", str(tmp_path / "upgraded"),
+                                "--restore-uploads-root", str(uploads)])
     assert result == build_v2_set.EXIT_FAILED

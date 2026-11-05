@@ -140,7 +140,7 @@ def h1_missing_jobs():
         up = uploads(tmp / "uploads", {"photo.jpg": b"correct recovery original"})
         out = tmp / "out"
         code = build_v2_set.main(["--live-db", str(db), "--uploads", str(up),
-                                  "--output", str(out)])
+                                  "--output", str(out), "--restore-uploads-root", str(up)])
         record("H1 missing jobs still pass", code == 0, f"producer_exit={code}")
 
 
@@ -154,7 +154,7 @@ def h2_wrong_root():
         up = uploads(tmp / "uploads", {"photo.jpg": b"correct recovery original"})
         out = tmp / "out"
         code = build_v2_set.main(["--live-db", str(db), "--uploads", str(up),
-                                  "--output", str(out)])
+                                  "--output", str(out), "--restore-uploads-root", str(up)])
         ok = False
         if code == 0:
             ok, _ = backup_format.verify_set(out, expected_application_id=APP)
@@ -172,7 +172,7 @@ def h3_blank_p0():
         up = uploads(tmp / "uploads", {})
         out = tmp / "out"
         code = build_v2_set.main(["--live-db", str(db), "--uploads", str(up),
-                                  "--output", str(out), "--legacy-p0-policy", "include"])
+                                  "--output", str(out), "--legacy-p0-policy", "include", "--restore-uploads-root", str(up)])
         ok = False
         if code == 0:
             ok, _ = backup_format.verify_set(out, expected_application_id=APP,
@@ -195,7 +195,7 @@ def m1_email_state():
         up = uploads(tmp / "uploads", {})
         out = tmp / "out"
         code = build_v2_set.main(["--live-db", str(tmp / "db.db"), "--uploads", str(up),
-                                  "--output", str(out)])
+                                  "--output", str(out), "--restore-uploads-root", str(up)])
         ok = False
         if code == 0:
             ok, _ = backup_format.verify_set(out, expected_application_id=APP)

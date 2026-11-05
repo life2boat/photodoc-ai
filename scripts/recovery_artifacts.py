@@ -57,6 +57,20 @@ KNOWN_CLEANUP_PHASES = ("none", "pending", "deleting", "deleted", "failed")
 #: there is no ``exclude``, because for a backup that means discarding the only copy.
 P0_POLICIES = ("fail", "include")
 
+#: The recovery schema this selector understands. The application never sets
+#: ``user_version``, so anything else is a schema the selector has not been taught.
+SUPPORTED_USER_VERSIONS = (0,)
+
+#: Tables whose file references the selector understands.
+KNOWN_FILE_TABLES = ("delivery_jobs",)
+#: Column names that indicate a table holds original-file references.
+PATH_LIKE_COLUMNS = {"local_path", "path", "filename", "original_path", "file_path"}
+HASH_LIKE_COLUMNS = {"content_sha256", "sha256"}
+SIZE_LIKE_COLUMNS = {"content_size", "size", "bytes"}
+
+#: Paid-email outbox states (mirror of backend/paid_email_outbox.py).
+OUTBOX_STATES = ("pending", "retry", "sending", "sent", "uncertain")
+
 _DRIVE_RE = re.compile(r"^[A-Za-z]:")
 
 
@@ -278,6 +292,58 @@ def _p0_candidates(order_id: Any, raw_name: str) -> List[str]:
     return members
 
 
+def app_sanitize_name(name: str) -> str:
+    """Mirror ``backend.main.sanitize_upload_filename`` exactly.
+
+    ``orders.filename`` stores names produced by that function, so reconciliation with a
+    job's raw ``original_name`` must use the same rules; a different sanitizer would fail
+    to match legitimate rows.
+    """
+    base = (name or "upload").replace("\\", "/").split("/")[-1]
+    cleaned = "".join(c for c in base if c.isalnum() or c in "._- ")
+    return cleaned.strip() or "upload"
+
+
+def filename_names(value: Any) -> Tuple[Optional[List[str]], Optional[str]]:
+    """Parse ``orders.filename`` into names, refusing malformed types (M3)."""
+    if value is None:
+        return [], None
+    if isinstance(value, bytes):
+        try:
+            value = value.decode("utf-8")
+        except UnicodeDecodeError:
+            return None, "is not valid UTF-8 text"
+    if not isinstance(value, str):
+        return None, f"has non-text type {type(value).__name__}"
+    return [n.strip() for n in value.split(",") if n.strip()], None
+
+
+def unknown_file_tables(conn: sqlite3.Connection) -> List[str]:
+    """Tables that appear to reference originals but are outside the known schema (M2)."""
+    tables = {row[0] for row in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'")}
+    unknown: List[str] = []
+    for table in sorted(tables):
+        if table in KNOWN_FILE_TABLES or table.startswith("sqlite_"):
+            continue
+        columns = {row[1].casefold() for row in conn.execute(f'PRAGMA table_info("{table}")')}
+        if columns & PATH_LIKE_COLUMNS and columns & (HASH_LIKE_COLUMNS | SIZE_LIKE_COLUMNS):
+            unknown.append(table)
+    return unknown
+
+
+def normalise_root(value: str) -> str:
+    """Normalise a path for comparison, independent of the host separator."""
+    text = str(value).replace("\\", "/").rstrip("/")
+    while "//" in text:
+        text = text.replace("//", "/")
+    return text
+
+
+def table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {row[1].casefold() for row in conn.execute(f'PRAGMA table_info("{table}")')}
+
+
 # --------------------------------------------------------------- required sources
 def _cleanup_exemption(cleanup_state: str, cleanup_phase: str,
                        local_deleted_at: Optional[str], delivered_at: Optional[str]
@@ -367,12 +433,18 @@ def required_sources(db_path: Path, *, legacy_p0_policy: str = "fail",
                 claimed: Dict[str, str] = {}
                 for order_id, filename in conn.execute(
                         "SELECT id, filename FROM orders ORDER BY id").fetchall():
-                    raw = (filename or "").strip()
-                    names = [n.strip() for n in raw.split(",") if n.strip()]
+                    # M3: a non-text filename must become a structured refusal, not a
+                    # traceback from .strip()/.split().
+                    names, name_error = filename_names(filename)
+                    if name_error:
+                        errors.append(
+                            f"P0 order {order_id} filename {name_error}; refusing to "
+                            "interpret it")
+                        continue
                     # H3: an order with no usable filename does not prove that no
                     # customer original ever existed — it is indistinguishable from a
                     # damaged legacy row.
-                    if not raw or not names:
+                    if not names:
                         errors.append(
                             f"P0 order {order_id} has an empty or unparseable filename; "
                             "refusing to treat it as an order with no original")
@@ -395,7 +467,8 @@ def required_sources(db_path: Path, *, legacy_p0_policy: str = "fail",
                             claimed.setdefault(candidate, group_key)
                         groups.append({"order_id": order_id, "name": name,
                                        "candidates": candidates, "group": group_key})
-            stats["uploads_root"] = UPLOAD_ROOT
+            # P0 has no per-job absolute path: the archive root maps onto whatever the
+            # deployment declares, so no root is derived here.
             return required, groups, errors, stats
 
         if generation == "mixed":
@@ -404,38 +477,152 @@ def required_sources(db_path: Path, *, legacy_p0_policy: str = "fail",
                 "The delivery records cannot be trusted to describe every order, so the "
                 "required file set cannot be derived. Migrate the schema first.")
 
-        # H1: being P1 does not by itself prove that every order still has its jobs.
-        # A partial migration or a missing row can leave an order with a filename but no
-        # file job, in which case the original is unaddressable and must not be silently
-        # dropped. The application creates, atomically with the order: one file job per
-        # attachment name, exactly one info job, and exactly one admin_email job.
-        by_order: Dict[int, Dict[str, int]] = {}
-        for order_id, kind, count in conn.execute(
-                "SELECT order_id, kind, COUNT(*) FROM delivery_jobs "
-                "GROUP BY order_id, kind").fetchall():
-            by_order.setdefault(order_id, {})[kind] = count
-        for order_id, filename in conn.execute(
-                "SELECT id, filename FROM orders ORDER BY id").fetchall():
-            names = [n.strip() for n in (filename or "").split(",") if n.strip()]
-            counts = by_order.get(order_id, {})
+        # M2: the selector only guarantees coverage of the schema it understands.
+        user_version = conn.execute("PRAGMA user_version").fetchone()[0]
+        if user_version not in SUPPORTED_USER_VERSIONS:
+            errors.append(
+                f"database user_version={user_version} is not in the supported recovery "
+                f"schema inventory {list(SUPPORTED_USER_VERSIONS)}: this selector has not "
+                "been taught that schema and must not assume it holds no required originals")
+        for table in unknown_file_tables(conn):
+            errors.append(
+                f"table {table!r} appears to reference originals (path plus hash/size "
+                "columns) but is not part of the supported recovery schema; refusing to "
+                "assume it holds no required files")
+
+        order_columns = table_columns(conn, "orders")
+        job_columns = table_columns(conn, "delivery_jobs")
+        for required_column in ("id", "filename"):
+            if required_column not in order_columns:
+                errors.append(f"orders has no {required_column!r} column")
+        for required_column in ("id", "order_id", "kind", "state"):
+            if required_column not in job_columns:
+                errors.append(f"delivery_jobs has no {required_column!r} column")
+
+        def _order_col(name: str) -> str:
+            return name if name in order_columns else "NULL AS " + name
+
+        def _job_col(name: str) -> str:
+            return name if name in job_columns else "NULL AS " + name
+
+        orders = conn.execute(
+            "SELECT id, " + _order_col("filename") + ", " + _order_col("payment_status")
+            + ", " + _order_col("paid_at") + " FROM orders ORDER BY id").fetchall()
+        rows = conn.execute(
+            "SELECT id, order_id, kind, state, " + _job_col("local_path") + ", "
+            + _job_col("original_name") + ", " + _job_col("content_sha256") + ", "
+            + _job_col("content_size") + ", " + _job_col("cleanup_state") + ", "
+            + _job_col("cleanup_phase") + ", " + _job_col("local_deleted_at") + ", "
+            + _job_col("delivered_at")
+            + " FROM delivery_jobs ORDER BY order_id, kind, id").fetchall()
+
+        has_outbox = "paid_email_outbox" in {row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        outbox: Dict[Any, Any] = {}
+        if has_outbox:
+            try:
+                outbox = {row[0]: row[1] for row in conn.execute(
+                    "SELECT order_id, state FROM paid_email_outbox")}
+            except sqlite3.Error as exc:
+                errors.append(f"paid_email_outbox exists but cannot be read: {exc}")
+
+        email_subsystem = any((job[2] or "").strip() in DATABASE_KINDS for job in rows)
+        jobs_by_order: Dict[Any, List[Any]] = {}
+        for job in rows:
+            jobs_by_order.setdefault(job[1], []).append(job)
+
+        # H1: matching counts are not proof of correspondence.
+        referenced: Dict[str, Tuple[Any, Any]] = {}
+        for order_id, filename, payment_status, paid_at in orders:
+            names, name_error = filename_names(filename)
+            if name_error:
+                errors.append(
+                    f"order {order_id} filename {name_error}; refusing to interpret it")
+                continue
+            jobs = jobs_by_order.get(order_id, [])
+            file_jobs = [job for job in jobs if (job[2] or "").strip() == "file"]
+            info_jobs = [job for job in jobs if (job[2] or "").strip() == "info"]
             if not names:
                 errors.append(
                     f"order {order_id} has an empty filename: an order with no recorded "
                     "attachment cannot be distinguished from a damaged one, so its original "
                     "cannot be assumed absent")
-            if counts.get("file", 0) != len(names):
+            if len(file_jobs) != len(names):
                 errors.append(
                     f"order {order_id} records {len(names)} attachment name(s) but has "
-                    f"{counts.get('file', 0)} file job(s); the original(s) cannot be selected")
-            if counts.get("info", 0) != 1:
+                    f"{len(file_jobs)} file job(s); the original(s) cannot be selected")
+            if len(info_jobs) != 1:
                 errors.append(
                     f"order {order_id} must have exactly one info job (has "
-                    f"{counts.get('info', 0)})")
+                    f"{len(info_jobs)})")
 
-        rows = conn.execute(
-            "SELECT id, order_id, kind, state, local_path, content_sha256, content_size, "
-            "cleanup_state, cleanup_phase, local_deleted_at, delivered_at "
-            "FROM delivery_jobs ORDER BY order_id, kind, id").fetchall()
+            job_names: List[str] = []
+            usable = True
+            for job in file_jobs:
+                original = job[5]
+                if original is None:
+                    errors.append(
+                        f"order {order_id} file job {job[0]!r} has no original_name, so it "
+                        "cannot be tied to an attachment")
+                    usable = False
+                    continue
+                if not isinstance(original, str):
+                    errors.append(
+                        f"order {order_id} file job {job[0]!r} original_name has non-text "
+                        f"type {type(original).__name__}")
+                    usable = False
+                    continue
+                job_names.append(app_sanitize_name(original))
+            if usable and sorted(job_names) != sorted(names):
+                errors.append(
+                    f"order {order_id} attachment names {sorted(names)} do not match its "
+                    f"file jobs' original names {sorted(job_names)}: the jobs do not "
+                    "correspond to this order's attachments")
+
+            if email_subsystem:
+                admin = [job for job in jobs if (job[2] or "").strip() == "admin_email"]
+                if len(admin) != 1:
+                    errors.append(
+                        f"order {order_id} must have exactly one admin_email job (has "
+                        f"{len(admin)})")
+            is_paid = (payment_status or "").strip() == "paid" or bool(paid_at)
+            if has_outbox and is_paid:
+                paid = [job for job in jobs if (job[2] or "").strip() == "paid_email"]
+                if len(paid) != 1:
+                    errors.append(
+                        f"paid order {order_id} must have exactly one paid_email job (has "
+                        f"{len(paid)})")
+                state = outbox.get(order_id)
+                if state is None:
+                    errors.append(
+                        f"paid order {order_id} has no paid_email_outbox row; the email "
+                        "outcome is not recorded")
+                elif state not in OUTBOX_STATES:
+                    errors.append(
+                        f"paid order {order_id} has unknown paid_email_outbox state "
+                        f"{state!r}")
+
+            for job in jobs:
+                kind = (job[2] or "").strip()
+                if kind not in UPLOAD_BACKED_KINDS:
+                    continue
+                local_path = job[4] or ""
+                if not local_path:
+                    continue
+                normalised = local_path.replace("\\", "/")
+                basename = Path(normalised).name
+                if not basename.startswith(str(order_id) + "_"):
+                    errors.append(
+                        f"order {order_id} job {job[0]!r} local_path basename {basename!r} "
+                        f"does not start with '{order_id}_': it does not belong to this order")
+                previous = referenced.get(normalised)
+                if previous is not None:
+                    errors.append(
+                        f"local_path {local_path!r} is referenced by job {previous[1]!r} "
+                        f"(order {previous[0]}) and job {job[0]!r} (order {order_id}): one "
+                        "file cannot serve two records")
+                else:
+                    referenced[normalised] = (order_id, job[0])
     except sqlite3.Error as exc:
         return {}, [], [f"cannot read delivery jobs from the backup database: {exc}"], stats
     finally:
@@ -449,7 +636,7 @@ def required_sources(db_path: Path, *, legacy_p0_policy: str = "fail",
     # per-job loop, so a single damaged database yields every reason rather than only the
     # first. A refused set stays refused.
 
-    for (job_id, order_id, kind, state, local_path, sha, size,
+    for (job_id, order_id, kind, state, local_path, _original_name, sha, size,
          cleanup_state, cleanup_phase, deleted_at, delivered_at) in rows:
         stats["jobs"] += 1
         kind = (kind or "").strip()
@@ -553,7 +740,8 @@ def required_sources(db_path: Path, *, legacy_p0_policy: str = "fail",
                         "layout cannot satisfy both")
                 continue
             required[member] = {"sha256": sha.lower(), "size": size, "job_id": job_id,
-                               "order_id": order_id, "kind": kind, "state": state}
+                               "order_id": order_id, "kind": kind, "state": state,
+                               "local_path": normalised}
             stats["required"] += 1
             continue
 
@@ -582,7 +770,9 @@ def required_sources(db_path: Path, *, legacy_p0_policy: str = "fail",
 # ------------------------------------------------------------------------ verify
 def verify_recovery(db_path: Path, archive_path: Path,
                     limits: Limits = DEFAULT_LIMITS, *,
-                    legacy_p0_policy: str = "fail") -> Tuple[bool, Dict[str, Any]]:
+                    legacy_p0_policy: str = "fail",
+                    expected_uploads_root: Optional[str] = None
+                    ) -> Tuple[bool, Dict[str, Any]]:
     """Prove the archive can rebuild every file the backup database still needs."""
     report: Dict[str, Any] = {
         "ok": False,
@@ -604,6 +794,23 @@ def verify_recovery(db_path: Path, archive_path: Path,
         Path(db_path), legacy_p0_policy=legacy_p0_policy, limits=limits)
     errors.extend(source_errors)
     report["required"] = stats
+
+    # H2: the restore root must be supplied by the deployment configuration, not inferred
+    # from the database being verified, or the check is self-referential.
+    if expected_uploads_root is not None and stats.get("generation") != "P0":
+        expected = normalise_root(expected_uploads_root)
+        derived = stats.get("uploads_root")
+        if derived is not None and normalise_root(derived) != expected:
+            errors.append(
+                f"the database records uploads root {derived!r} but the deployment expects "
+                f"{expected_uploads_root!r}; a restore to the configured root would leave "
+                "every recorded path wrong")
+        for member, spec in sorted(required.items()):
+            parent = normalise_root(str(Path(spec["local_path"]).parent))
+            if parent != expected:
+                errors.append(
+                    f"required original {member!r} is recorded under {parent!r}, not under "
+                    f"the deployment's uploads root {expected!r}")
 
     archived_files = {name for name in members if name.startswith(f"{UPLOAD_ROOT}/")}
     expected: set[str] = set()

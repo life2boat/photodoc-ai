@@ -42,7 +42,7 @@ def build_database(path: Path, *, variant: str = "base") -> Path:
     conn = sqlite3.connect(path)
     try:
         conn.execute(f"PRAGMA application_id = {APPLICATION_ID}")
-        conn.execute("PRAGMA user_version = 7")
+        conn.execute("PRAGMA user_version = 0")
         conn.execute("PRAGMA foreign_keys = ON")
         conn.executescript(
             """
@@ -59,6 +59,7 @@ def build_database(path: Path, *, variant: str = "base") -> Path:
                 order_id INTEGER NOT NULL,
                 kind TEXT NOT NULL,
                 local_path TEXT,
+                original_name TEXT,
                 content_sha256 TEXT,
                 content_size INTEGER,
                 state TEXT NOT NULL DEFAULT 'pending',
@@ -102,18 +103,18 @@ def build_database(path: Path, *, variant: str = "base") -> Path:
         for order_id, original in ((1, "ann.jpg"), (2, "bob.jpg")):
             conn.execute(
                 "INSERT INTO delivery_jobs (id, order_id, kind, state, local_path, "
-                "content_sha256, content_size, cleanup_state, cleanup_phase, "
-                "local_deleted_at, delivered_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                "original_name, content_sha256, content_size, cleanup_state, cleanup_phase, "
+                "local_deleted_at, delivered_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                 (f"file-{order_id}", order_id, "file", "delivered",
-                 f"/app/uploads/{order_id}_{original}", "0" * 64, 4,
+                 f"/app/uploads/{order_id}_{original}", original, "0" * 64, 4,
                  "completed", "deleted", "2026-01-01T00:10:00+00:00",
                  "2026-01-01T00:05:00+00:00"))
             conn.execute(
                 "INSERT INTO delivery_jobs (id, order_id, kind, state, local_path, "
-                "content_sha256, content_size, cleanup_state, cleanup_phase, "
-                "local_deleted_at, delivered_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                "original_name, content_sha256, content_size, cleanup_state, cleanup_phase, "
+                "local_deleted_at, delivered_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                 (f"info-{order_id}", order_id, "info", "delivered",
-                 f"/app/uploads/{order_id}_info.txt", "0" * 64, 4,
+                 f"/app/uploads/{order_id}_info.txt", "info.txt", "0" * 64, 4,
                  "completed", "deleted", "2026-01-01T00:10:00+00:00",
                  "2026-01-01T00:05:00+00:00"))
         conn.executemany("INSERT INTO wr_items VALUES (?,?,?)",
@@ -140,9 +141,9 @@ def build_database(path: Path, *, variant: str = "base") -> Path:
                          "VALUES ('eve','30.00','c','eve.jpg')")
             conn.execute(
                 "INSERT INTO delivery_jobs (id, order_id, kind, state, local_path, "
-                "content_sha256, content_size, cleanup_state, cleanup_phase, "
+                "original_name, content_sha256, content_size, cleanup_state, cleanup_phase, "
                 "local_deleted_at, delivered_at) VALUES ('file-3', 3, 'file', 'delivered', "
-                "'/app/uploads/3_eve.jpg', ?, 4, 'completed', 'deleted', "
+                "'/app/uploads/3_eve.jpg', 'eve.jpg', ?, 4, 'completed', 'deleted', "
                 "'2026-01-01T00:10:00+00:00', '2026-01-01T00:05:00+00:00')", ("0" * 64,))
             conn.execute(
                 "INSERT INTO delivery_jobs (id, order_id, kind, state, local_path, "
@@ -329,8 +330,8 @@ def build_delivery_database(path: Path, uploads_dir: Path, *,
     path = Path(path)
     uploads_dir = Path(uploads_dir)
     uploads_dir.mkdir(parents=True, exist_ok=True)
-    (uploads_dir / "photo.jpg").write_bytes(photo)
-    (uploads_dir / "info.pdf").write_bytes(second)
+    (uploads_dir / "1_photo.jpg").write_bytes(photo)
+    (uploads_dir / "1_info.pdf").write_bytes(second)
 
     if path.exists():
         path.unlink()
@@ -351,6 +352,7 @@ def build_delivery_database(path: Path, uploads_dir: Path, *,
                 kind TEXT NOT NULL,
                 state TEXT NOT NULL,
                 local_path TEXT,
+                original_name TEXT,
                 content_sha256 TEXT,
                 content_size INTEGER,
                 cleanup_state TEXT DEFAULT 'pending',
@@ -365,15 +367,17 @@ def build_delivery_database(path: Path, uploads_dir: Path, *,
             "VALUES (1,'paid','photo.jpg, gone.jpg','tok1')")
         conn.execute(
             "INSERT INTO delivery_jobs (id, order_id, kind, state, local_path, "
-            "content_sha256, content_size, cleanup_state, cleanup_phase) "
-            "VALUES (?,?,?,?,?,?,?,?,?)",
-            ("job-file", 1, "file", "pending", "/app/uploads/photo.jpg",
+            "original_name, content_sha256, content_size, cleanup_state, cleanup_phase) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            ("job-file", 1, "file", "pending",
+             str(uploads_dir / "1_photo.jpg"), "photo.jpg",
              hashlib.sha256(photo).hexdigest(), len(photo), "pending", "none"))
         conn.execute(
             "INSERT INTO delivery_jobs (id, order_id, kind, state, local_path, "
-            "content_sha256, content_size, cleanup_state, cleanup_phase) "
-            "VALUES (?,?,?,?,?,?,?,?,?)",
-            ("job-info", 1, "info", "pending", "/app/uploads/info.pdf",
+            "original_name, content_sha256, content_size, cleanup_state, cleanup_phase) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            ("job-info", 1, "info", "pending",
+             str(uploads_dir / "1_info.pdf"), "info.pdf",
              hashlib.sha256(second).hexdigest(), len(second), "pending", "none"))
         conn.execute(
             "INSERT INTO delivery_jobs (id, order_id, kind, state, cleanup_state, "
@@ -382,10 +386,11 @@ def build_delivery_database(path: Path, uploads_dir: Path, *,
         if cleaned:
             conn.execute(
                 "INSERT INTO delivery_jobs (id, order_id, kind, state, local_path, "
-                "content_sha256, content_size, cleanup_state, cleanup_phase, "
-                "local_deleted_at, delivered_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                ("job-cleaned", 1, "file", "delivered", "/app/uploads/gone.jpg",
-                 hashlib.sha256(b"deleted long ago").hexdigest(), 18,
+                "original_name, content_sha256, content_size, cleanup_state, cleanup_phase, "
+                "local_deleted_at, delivered_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                ("job-cleaned", 1, "file", "delivered",
+                 str(uploads_dir / "1_gone.jpg"),
+                 "gone.jpg", hashlib.sha256(b"deleted long ago").hexdigest(), 18,
                  "completed", "deleted", "2026-01-01T00:10:00+00:00",
                  "2026-01-01T00:05:00+00:00"))
         conn.commit()

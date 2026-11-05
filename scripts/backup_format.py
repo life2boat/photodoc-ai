@@ -353,6 +353,7 @@ def detect_format(directory: Path) -> str:
 def verify_set(directory: Path, *, expected_application_id: Optional[int] = None,
                require_verified: bool = True, deep: bool = True,
                allow_staging: bool = False, legacy_p0_policy: str = "fail",
+               expected_uploads_root: Optional[str] = None,
                limits: "recovery_artifacts.Limits" = recovery_artifacts.DEFAULT_LIMITS
                ) -> Tuple[bool, Dict[str, Any]]:
     """Verify a backup set's structure, checksums, metadata and recovery bytes."""
@@ -542,15 +543,24 @@ def verify_set(directory: Path, *, expected_application_id: Optional[int] = None
     if deep and database_ok:
         recovery_ok, recovery = recovery_artifacts.verify_recovery(
             directory / DB_FILE, directory / TAR_FILE, limits,
-            legacy_p0_policy=legacy_p0_policy)
+            legacy_p0_policy=legacy_p0_policy,
+            expected_uploads_root=expected_uploads_root)
         report["checks"]["recovery"] = recovery
         if not recovery_ok:
             errors.extend(recovery.get("errors", []))
         recorded_root = recovery.get("required", {}).get("uploads_root")
-        # H2: the restore root is bound only when there are originals to place. An empty
-        # set has no recorded path to bind, so its absence is not a defect.
+        has_originals = (bool((recovery.get("required") or {}).get("required"))
+                         or bool(recovery.get("p0_groups"))
+                         or (recovery.get("required") or {}).get("uploads_root") is not None)
         restore_root = manifest.get("restore_uploads_root")
-        if recorded_root is not None:
+        if not has_originals:
+            # M4: with nothing to place the field must be null; a non-null value is a
+            # claim the verifier cannot check and a future consumer could trust.
+            if restore_root is not None:
+                errors.append(
+                    f"the manifest records restore_uploads_root {restore_root!r} but the "
+                    "database requires no originals; the field must be null")
+        else:
             if not isinstance(restore_root, str) or not restore_root:
                 errors.append(
                     "the manifest does not record restore_uploads_root: the path the "
@@ -560,10 +570,16 @@ def verify_set(directory: Path, *, expected_application_id: Optional[int] = None
                     errors.append(
                         f"restore_uploads_root {restore_root!r} does not name an uploads "
                         "directory")
-                if restore_root != recorded_root:
+                if recorded_root is not None and restore_root != recorded_root:
                     errors.append(
                         f"restore_uploads_root {restore_root!r} disagrees with the "
                         f"database's recorded uploads root {recorded_root!r}")
+                if expected_uploads_root is not None:
+                    if recovery_artifacts.normalise_root(restore_root) != \
+                            recovery_artifacts.normalise_root(expected_uploads_root):
+                        errors.append(
+                            f"restore_uploads_root {restore_root!r} is not the deployment's "
+                            f"uploads root {expected_uploads_root!r}")
     elif deep and not database_ok:
         errors.append("cannot deep-verify recovery files without the backup database")
 

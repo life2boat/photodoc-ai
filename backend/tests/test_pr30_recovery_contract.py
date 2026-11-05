@@ -68,6 +68,7 @@ def p1_db(path: Path, *, jobs=(), orders=((1, "paid", "tok"),),
             order_id INTEGER NOT NULL,
             kind TEXT NOT NULL,
             local_path TEXT,
+            original_name TEXT,
             content_sha256 TEXT,
             content_size INTEGER,
             state TEXT NOT NULL DEFAULT 'pending',
@@ -88,8 +89,11 @@ def p1_db(path: Path, *, jobs=(), orders=((1, "paid", "tok"),),
                          and j.get("kind") == "file"]
             names = []
             for job in file_jobs:
-                lp = (job.get("local_path") or "").replace("\\", "/")
-                names.append(Path(lp).name if lp else f"{job['id']}.jpg")
+                original = job.get("original_name")
+                if not original:
+                    lp = (job.get("local_path") or "").replace("\\", "/")
+                    original = Path(lp).name
+                names.append(str(original))
             conn.execute("UPDATE orders SET filename=? WHERE id=?",
                          (", ".join(names), order_id))
             has_info = any(j.get("order_id", 1) == order_id and j.get("kind") == "info"
@@ -97,10 +101,11 @@ def p1_db(path: Path, *, jobs=(), orders=((1, "paid", "tok"),),
             if not has_info:
                 conn.execute(
                     "INSERT INTO delivery_jobs (id, order_id, kind, local_path, "
-                    "content_sha256, content_size, state, cleanup_state, cleanup_phase, "
-                    "local_deleted_at, delivered_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    "original_name, content_sha256, content_size, state, cleanup_state, "
+                    "cleanup_phase, local_deleted_at, delivered_at) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                     (f"info-{order_id}", order_id, "info",
-                     f"/app/uploads/{order_id}_info.txt",
+                     f"/app/uploads/{order_id}_info.txt", "info.txt",
                      hashlib.sha256(INFO_BYTES).hexdigest(), len(INFO_BYTES),
                      "delivered", "completed", "deleted",
                      "2026-01-01T00:10:00+00:00", "2026-01-01T00:05:00+00:00"))
@@ -133,11 +138,14 @@ def p0_db(path: Path, *, filename: str = "photo.jpg", with_jobs: bool = False) -
     return path
 
 
-def file_job(*, name="/app/uploads/photo.jpg", data: bytes = GOOD, state="pending",
+def file_job(*, name="/app/uploads/1_photo.jpg", data: bytes = GOOD, state="pending",
              cleanup_state="pending", cleanup_phase="none", deleted_at=None,
              delivered_at=None, sha=None, size=None):
+    stored = Path(name.replace("\\", "/")).name
+    original = stored.split("_", 1)[1] if "_" in stored else stored
     return {"id": f"job-{state}-{cleanup_state}-{cleanup_phase}",
             "order_id": 1, "kind": "file", "local_path": name,
+            "original_name": original,
             "content_sha256": sha if sha is not None else
             (hashlib.sha256(data).hexdigest() if data is not None else None),
             "content_size": size if size is not None else
@@ -209,9 +217,9 @@ def test_a_p0_original_cannot_be_silently_dropped(tmp_path):
     db = p0_db(tmp_path / "p0.db")
     uploads = tmp_path / "uploads"
     uploads.mkdir()
-    (uploads / "photo.jpg").write_bytes(b"legacy pending original")
+    (uploads / "1_photo.jpg").write_bytes(b"legacy pending original")
     code = build_v2_set.main(["--live-db", str(db), "--uploads", str(uploads),
-                              "--output", str(tmp_path / "out")])
+                              "--output", str(tmp_path / "out"), "--restore-uploads-root", "/app/uploads"])
     assert code == build_v2_set.EXIT_FAILED
     assert not (tmp_path / "out").exists()
 
@@ -223,7 +231,7 @@ def test_p0_include_requires_the_original(tmp_path):
     (uploads / "1_photo.jpg").write_bytes(b"legacy pending original")
     out = tmp_path / "out"
     code = build_v2_set.main(["--live-db", str(db), "--uploads", str(uploads),
-                              "--output", str(out), "--legacy-p0-policy", "include"])
+                              "--output", str(out), "--legacy-p0-policy", "include", "--restore-uploads-root", "/app/uploads"])
     assert code == build_v2_set.EXIT_OK, "a present P0 original must be archived"
     ok, report = backup_format.verify_set(
         out, expected_application_id=APPLICATION_ID, legacy_p0_policy="include")
@@ -237,7 +245,7 @@ def test_p0_include_refuses_a_missing_original(tmp_path):
     uploads.mkdir()
     code = build_v2_set.main(["--live-db", str(db), "--uploads", str(uploads),
                               "--output", str(tmp_path / "out"),
-                              "--legacy-p0-policy", "include"])
+                              "--legacy-p0-policy", "include", "--restore-uploads-root", "/app/uploads"])
     assert code == build_v2_set.EXIT_FAILED
 
 
@@ -249,7 +257,7 @@ def test_p0_include_refuses_an_ambiguous_original(tmp_path):
     (uploads / "photo.jpg").write_bytes(b"two")
     code = build_v2_set.main(["--live-db", str(db), "--uploads", str(uploads),
                               "--output", str(tmp_path / "out"),
-                              "--legacy-p0-policy", "include"])
+                              "--legacy-p0-policy", "include", "--restore-uploads-root", "/app/uploads"])
     assert code == build_v2_set.EXIT_FAILED
 
 
@@ -325,20 +333,20 @@ def test_a_delivered_uncleaned_job_is_not_required_but_must_not_be_archived(tmp_
     job = file_job(state="delivered", cleanup_state="pending", cleanup_phase="none",
                    delivered_at="2026-01-01T00:05:00+00:00")
     db = p1_db(tmp_path / "db.db", jobs=(job,))
-    setdir = build_set(db, tmp_path / "set", {"photo.jpg": GOOD})
+    setdir = build_set(db, tmp_path / "set", {"1_photo.jpg": GOOD})
     ok, report = backup_format.verify_set(setdir, expected_application_id=APPLICATION_ID)
     assert not ok
-    assert report["checks"]["recovery"]["unexpected"] == ["uploads/photo.jpg"]
+    assert report["checks"]["recovery"]["unexpected"] == ["uploads/1_photo.jpg"]
 
 
 # ======================================================= HN3: exact archive path
 def test_a_nested_member_does_not_satisfy_a_required_file(tmp_path):
-    job = file_job(name="/app/uploads/photo.jpg")
+    job = file_job(name="/app/uploads/1_photo.jpg")
     db = p1_db(tmp_path / "db.db", jobs=(job,))
     setdir = build_set(db, tmp_path / "set", {"uploads/nested/photo.jpg": GOOD})
     ok, report = backup_format.verify_set(setdir, expected_application_id=APPLICATION_ID)
     assert not ok
-    assert report["checks"]["recovery"]["missing"] == ["uploads/photo.jpg"]
+    assert report["checks"]["recovery"]["missing"] == ["uploads/1_photo.jpg"]
 
 
 class TestArchivePathContract:
@@ -347,7 +355,7 @@ class TestArchivePathContract:
         assert recovery_artifacts.path_errors(name)
 
     def test_exact_paths_are_accepted(self):
-        assert not recovery_artifacts.path_errors("uploads/photo.jpg")
+        assert not recovery_artifacts.path_errors("uploads/1_photo.jpg")
         assert not recovery_artifacts.path_errors("uploads")
 
 
@@ -372,7 +380,8 @@ def test_the_producer_accepts_a_real_application_database(real_fixture, tmp_path
     out = tmp_path / "backups" / "real"
     code = build_v2_set.main(["--live-db", str(real_fixture / "orders.db"),
                               "--uploads", str(real_fixture / "uploads"),
-                              "--output", str(out)])
+                              "--output", str(out),
+                              "--restore-uploads-root", str(real_fixture / "uploads")])
     assert code == build_v2_set.EXIT_OK, "the producer rejected a real application fixture"
     ok, report = backup_format.verify_set(out, expected_application_id=APPLICATION_ID)
     assert ok, report["errors"]
@@ -386,7 +395,8 @@ def test_the_v1_upgrade_accepts_a_real_application_database(real_fixture, tmp_pa
     legacy = tmp_path / "legacy"
     built, _ = _legacy_from_real(real_fixture, legacy)
     out = tmp_path / "upgraded"
-    code = build_v2_set.main(["--from-v1", str(built), "--output", str(out)])
+    code = build_v2_set.main(["--from-v1", str(built), "--output", str(out),
+                              "--restore-uploads-root", str(real_fixture / "uploads")])
     assert code == build_v2_set.EXIT_OK, "the upgrade rejected a real application fixture"
     ok, report = backup_format.verify_set(out, expected_application_id=APPLICATION_ID)
     assert ok, report["errors"]
@@ -422,7 +432,7 @@ def test_the_producer_leaves_no_database_copy_outside_the_set(tmp_path):
     db = p1_db(tmp_path / "db.db", jobs=(job,))
     uploads = tmp_path / "uploads"
     uploads.mkdir()
-    (uploads / "photo.jpg").write_bytes(GOOD)
+    (uploads / "1_photo.jpg").write_bytes(GOOD)
 
     created: list[Path] = []
     original = __import__("tempfile").mkdtemp
@@ -437,7 +447,7 @@ def test_the_producer_leaves_no_database_copy_outside_the_set(tmp_path):
     tempfile_module.mkdtemp = tracking
     try:
         code = build_v2_set.main(["--live-db", str(db), "--uploads", str(uploads),
-                                  "--output", str(tmp_path / "out")])
+                                  "--output", str(tmp_path / "out"), "--restore-uploads-root", "/app/uploads"])
     finally:
         tempfile_module.mkdtemp = original
     assert code == build_v2_set.EXIT_OK
@@ -451,7 +461,7 @@ def test_a_failed_production_removes_its_staging_copy(tmp_path):
     uploads = tmp_path / "uploads"
     uploads.mkdir()   # the required file is missing, so production fails
     code = build_v2_set.main(["--live-db", str(db), "--uploads", str(uploads),
-                              "--output", str(tmp_path / "out")])
+                              "--output", str(tmp_path / "out"), "--restore-uploads-root", "/app/uploads"])
     assert code == build_v2_set.EXIT_FAILED
     leftovers = list(tmp_path.glob(f"{backup_format.TMP_PREFIX}*"))
     assert not leftovers, f"staging directories were left behind: {leftovers}"
@@ -472,13 +482,13 @@ def test_email_jobs_are_database_backed(tmp_path):
     required, _groups, errors, stats = recovery_artifacts.required_sources(db)
     assert not errors
     # only the file job's original is required; email jobs own no file
-    assert set(required) == {"uploads/photo.jpg"}
+    assert set(required) == {"uploads/1_photo.jpg"}
     assert stats["email_jobs"] == 2
 
 
 def test_an_email_job_with_a_file_is_contradictory(tmp_path):
     job = {"id": "m1", "order_id": 1, "kind": "admin_email",
-           "local_path": "/app/uploads/photo.jpg", "content_sha256": None,
+           "local_path": "/app/uploads/1_photo.jpg", "content_sha256": None,
            "content_size": None, "state": "pending", "cleanup_state": "pending",
            "cleanup_phase": "none"}
     db = p1_db(tmp_path / "db.db", jobs=(job,))
@@ -497,14 +507,14 @@ def test_an_unknown_job_kind_is_refused(tmp_path):
 
 def test_info_jobs_are_upload_backed(tmp_path):
     data = OTHER
-    file = file_job(name="/app/uploads/photo.jpg", data=GOOD)
-    info = file_job(name="/app/uploads/info.pdf", data=data)
+    file = file_job(name="/app/uploads/1_photo.jpg", data=GOOD)
+    info = file_job(name="/app/uploads/1_info.pdf", data=data)
     info["id"] = "job-info"
     info["kind"] = "info"
     db = p1_db(tmp_path / "db.db", jobs=(file, info))
     required, _groups, errors, _stats = recovery_artifacts.required_sources(db)
     assert not errors
-    assert "uploads/info.pdf" in required
+    assert "uploads/1_info.pdf" in required
 
 
 # ============================================== unexpected contents / private files
@@ -512,17 +522,17 @@ def test_an_extra_archived_file_is_refused(tmp_path):
     job = file_job()
     db = p1_db(tmp_path / "db.db", jobs=(job,))
     setdir = build_set(db, tmp_path / "set",
-                       {"photo.jpg": GOOD, "deleted-private-photo.jpg": b"private"})
+                       {"1_photo.jpg": GOOD, "1_deleted-private-photo.jpg": b"private"})
     ok, report = backup_format.verify_set(setdir, expected_application_id=APPLICATION_ID)
     assert not ok
-    assert report["checks"]["recovery"]["unexpected"] == ["uploads/deleted-private-photo.jpg"]
+    assert report["checks"]["recovery"]["unexpected"] == ["uploads/1_deleted-private-photo.jpg"]
     assert any("must not retain" in e for e in report["errors"])
 
 
 def test_a_set_with_exactly_the_required_files_passes(tmp_path):
     job = file_job()
     db = p1_db(tmp_path / "db.db", jobs=(job,))
-    setdir = build_set(db, tmp_path / "set", {"photo.jpg": GOOD})
+    setdir = build_set(db, tmp_path / "set", {"1_photo.jpg": GOOD})
     ok, report = backup_format.verify_set(setdir, expected_application_id=APPLICATION_ID)
     assert ok, report["errors"]
 
@@ -617,7 +627,8 @@ def test_producer_verifier_restore_rehearsal(tmp_path):
     db = build_delivery_database(tmp_path / "live.db", uploads)
     out = tmp_path / "backups" / "rehearsal"
     assert build_v2_set.main(["--live-db", str(db), "--uploads", str(uploads),
-                              "--output", str(out)]) == build_v2_set.EXIT_OK
+                              "--output", str(out),
+                              "--restore-uploads-root", str(uploads)]) == build_v2_set.EXIT_OK
 
     ok, report = backup_format.verify_set(out, expected_application_id=APPLICATION_ID)
     assert ok, report["errors"]

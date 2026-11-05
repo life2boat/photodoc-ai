@@ -62,7 +62,8 @@ def parse_age_hours(raw: object) -> tuple[float | None, str | None]:
 def evaluate(live_db: Path, backup_dir: Path, *, expected_application_id: int,
              max_age_hours: float, policy: str = "normal",
              require_verified: bool = True,
-             legacy_p0_policy: str = "fail") -> tuple[int, dict]:
+             legacy_p0_policy: str = "fail",
+             expected_uploads_root: str | None = None) -> tuple[int, dict]:
     report: dict = {
         "gate": "stage1-evidence",
         "policy": policy,
@@ -99,7 +100,8 @@ def evaluate(live_db: Path, backup_dir: Path, *, expected_application_id: int,
     format_ok, format_report = backup_format.verify_set(
         Path(backup_dir), expected_application_id=expected_application_id,
         require_verified=require_verified, deep=True,
-        legacy_p0_policy=legacy_p0_policy)
+        legacy_p0_policy=legacy_p0_policy,
+        expected_uploads_root=expected_uploads_root)
     report["checks"]["format"] = format_report
     if not format_ok:
         errors.extend(format_report.get("errors", []))
@@ -125,6 +127,18 @@ def evaluate(live_db: Path, backup_dir: Path, *, expected_application_id: int,
         errors.extend(evidence.reasons)
         return EXIT_INVALID, report
 
+    # H2: a set that requires originals cannot be approved without the deployment's own
+    # uploads root; otherwise the manifest's self-declared root proves only that it agrees
+    # with itself.
+    recovery = (format_report.get("checks") or {}).get("recovery") or {}
+    derived_root = (recovery.get("required") or {}).get("uploads_root")
+    if derived_root is not None and expected_uploads_root is None:
+        errors.append(
+            "the set requires recovery originals but no --restore-uploads-root was "
+            "supplied; the application's uploads root must come from the deployment "
+            "configuration (UPLOAD_DIR / Compose binding), not from the database")
+        return EXIT_INVALID, report
+
     # The manifest's digests were already validated against the backup database by
     # verify_set (M1); here the remaining question is live-versus-backup equality.
 
@@ -141,6 +155,11 @@ def main(argv: list[str] | None = None) -> int:
                         help="expected SQLite application_id (default: PhotoDoc 'PDAI')")
     parser.add_argument("--max-age-hours", default="24")
     parser.add_argument("--policy", default="normal", choices=POLICIES)
+    parser.add_argument("--restore-uploads-root", default=None,
+                        help="the application's uploads root after restore (container "
+                             "UPLOAD_DIR / Compose binding), supplied independently of the "
+                             "database being verified. Required whenever the set requires "
+                             "originals.")
     parser.add_argument("--legacy-p0-policy", default="fail",
                         choices=("fail", "include"),
                         help="how to treat orders without delivery_jobs (default: fail)")
@@ -160,7 +179,8 @@ def main(argv: list[str] | None = None) -> int:
                             expected_application_id=args.application_id,
                             max_age_hours=age, policy=args.policy,
                             require_verified=not args.allow_unverified,
-                            legacy_p0_policy=args.legacy_p0_policy)
+                            legacy_p0_policy=args.legacy_p0_policy,
+                            expected_uploads_root=args.restore_uploads_root)
 
     if args.json:
         print(json.dumps(report, indent=2, default=str))
