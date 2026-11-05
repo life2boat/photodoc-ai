@@ -297,3 +297,192 @@ def test_eperm_fsync_aborts_publication(tmp_path, monkeypatch):
         backup_format.publish_set(staging, tmp_path / "published")
     assert not (tmp_path / "published").exists()
     assert staging.is_dir()
+
+
+# ============================================ fourth review: named regressions
+def test_same_count_substitution_is_refused(tmp_path):
+    """H1: one order's job retargeted at another order's file, counts unchanged."""
+    orders, jobs = complete_order(1, "photo.jpg")
+    jobs.append(file_job(2, "/app/uploads/2_second.jpg", data=b"second original"))
+    jobs.append(info_job(2))
+    orders.append((2, "C2", "second.jpg", "paid", "tok2"))
+    db = p1(tmp_path / "db.db", orders, jobs)
+    _r, _g, errors, _s = recovery_artifacts.required_sources(db)
+    assert not errors, errors
+
+    conn = sqlite3.connect(db)
+    donor = conn.execute("SELECT local_path, content_sha256, content_size FROM delivery_jobs "
+                         "WHERE order_id=1 AND kind='file'").fetchone()
+    conn.execute("UPDATE delivery_jobs SET local_path=?, content_sha256=?, content_size=? "
+                 "WHERE order_id=2 AND kind='file'", donor)
+    conn.commit()
+    conn.close()
+
+    _r, _g, errors, _s = recovery_artifacts.required_sources(db)
+    assert any("does not start with '2_'" in e for e in errors), errors
+    uploads = tmp_path / "uploads"
+    uploads.mkdir()
+    (uploads / "1_photo.jpg").write_bytes(GOOD)
+    assert build_v2_set.main(["--live-db", str(db), "--uploads", str(uploads),
+                              "--output", str(tmp_path / "out"),
+                              "--restore-uploads-root", "/app/uploads"]) == \
+        build_v2_set.EXIT_FAILED
+
+
+def test_duplicate_local_path_reference_is_refused(tmp_path):
+    """H1: one file cannot serve two records."""
+    orders = [(1, "C1", "photo.jpg", "paid", "tok1")]
+    a = file_job(1, "/app/uploads/1_photo.jpg")
+    b = file_job(1, "/app/uploads/1_photo.jpg")
+    b["id"] = "f1b"
+    db = p1(tmp_path / "db.db", orders, [a, b, info_job(1)])
+    _r, _g, errors, _s = recovery_artifacts.required_sources(db)
+    assert any("one file cannot serve two records" in e for e in errors), errors
+
+
+def test_original_name_must_match_the_order_inventory(tmp_path):
+    """H1: the job must describe this order's attachment, not another name."""
+    orders = [(1, "C1", "photo.jpg", "paid", "tok1")]
+    job = file_job(1, "/app/uploads/1_photo.jpg")
+    job["original_name"] = "different.jpg"
+    db = p1(tmp_path / "db.db", orders, [job, info_job(1)])
+    _r, _g, errors, _s = recovery_artifacts.required_sources(db)
+    assert any("do not match its file jobs" in e for e in errors), errors
+
+
+def test_missing_admin_email_job_is_refused(tmp_path):
+    """M1: a database with the email subsystem must have one admin job per order."""
+    orders, jobs = complete_order(1, "photo.jpg")
+    for job in ({"id": "e1", "order_id": 1, "kind": "admin_email", "local_path": None,
+                 "original_name": None, "content_sha256": None, "content_size": None,
+                 "state": "pending", "cleanup_state": "not_applicable",
+                 "cleanup_phase": "none", "local_deleted_at": None, "delivered_at": None},
+                {"id": "p1", "order_id": 1, "kind": "paid_email", "local_path": None,
+                 "original_name": None, "content_sha256": None, "content_size": None,
+                 "state": "pending", "cleanup_state": "not_applicable",
+                 "cleanup_phase": "none", "local_deleted_at": None, "delivered_at": None}):
+        jobs.append(job)
+    db = p1(tmp_path / "db.db", orders, jobs)
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE paid_email_outbox (order_id INTEGER PRIMARY KEY, state TEXT)")
+    conn.execute("INSERT INTO paid_email_outbox VALUES (1,'pending')")
+    conn.commit(); conn.close()
+    _r, _g, errors, _s = recovery_artifacts.required_sources(db)
+    assert not errors, errors
+
+    conn = sqlite3.connect(db)
+    conn.execute("DELETE FROM delivery_jobs WHERE kind='admin_email'")
+    conn.commit()
+    conn.close()
+    _r, _g, errors, _s = recovery_artifacts.required_sources(db)
+    assert any("admin_email job" in e for e in errors), errors
+
+
+def test_paid_order_without_paid_email_or_outbox_row_is_refused(tmp_path):
+    """M1: a paid order must carry its paid_email job and outbox record."""
+    orders, jobs = complete_order(1, "photo.jpg")
+    for job in ({"id": "e1", "order_id": 1, "kind": "admin_email", "local_path": None,
+                 "original_name": None, "content_sha256": None, "content_size": None,
+                 "state": "pending", "cleanup_state": "not_applicable",
+                 "cleanup_phase": "none", "local_deleted_at": None, "delivered_at": None},
+                {"id": "p1", "order_id": 1, "kind": "paid_email", "local_path": None,
+                 "original_name": None, "content_sha256": None, "content_size": None,
+                 "state": "pending", "cleanup_state": "not_applicable",
+                 "cleanup_phase": "none", "local_deleted_at": None, "delivered_at": None}):
+        jobs.append(job)
+    db = p1(tmp_path / "db.db", orders, jobs)
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE paid_email_outbox (order_id INTEGER PRIMARY KEY, state TEXT)")
+    conn.execute("INSERT INTO paid_email_outbox VALUES (1,'pending')")
+    conn.commit(); conn.close()
+    _r, _g, errors, _s = recovery_artifacts.required_sources(db)
+    assert not errors, errors
+
+    conn = sqlite3.connect(db)
+    conn.execute("DELETE FROM delivery_jobs WHERE kind='paid_email'")
+    conn.execute("DELETE FROM paid_email_outbox")
+    conn.commit(); conn.close()
+    _r, _g, errors, _s = recovery_artifacts.required_sources(db)
+    assert any("paid_email job" in e for e in errors), errors
+    assert any("paid_email_outbox row" in e for e in errors), errors
+
+
+def test_unknown_user_version_is_refused(tmp_path):
+    """M2: a schema the selector was not taught must not be treated as P1."""
+    db = p1(tmp_path / "db.db", *complete_order(1, "photo.jpg"))
+    conn = sqlite3.connect(db)
+    conn.execute("PRAGMA user_version=99")
+    conn.commit(); conn.close()
+    _r, _g, errors, _s = recovery_artifacts.required_sources(db)
+    assert any("user_version=99" in e for e in errors), errors
+
+
+def test_unknown_originals_table_is_refused(tmp_path):
+    """M2: a new durable table holding paths and hashes is not silently ignored."""
+    db = p1(tmp_path / "db.db", *complete_order(1, "photo.jpg"))
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE additional_originals (path TEXT, sha256 TEXT, size INTEGER)")
+    conn.commit(); conn.close()
+    _r, _g, errors, _s = recovery_artifacts.required_sources(db)
+    assert any("additional_originals" in e for e in errors), errors
+
+
+def test_non_text_filename_is_a_structured_refusal(tmp_path):
+    """M3: an INTEGER/BLOB filename must not raise."""
+    conn = sqlite3.connect(tmp_path / "p0.db")
+    conn.execute(f"PRAGMA application_id = {APPLICATION_ID}")
+    conn.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, filename INTEGER, "
+                 "payment_status TEXT)")
+    conn.execute("INSERT INTO orders VALUES (1, 12345, 'paid')")
+    conn.commit(); conn.close()
+    _r, _g, errors, _s = recovery_artifacts.required_sources(
+        tmp_path / "p0.db", legacy_p0_policy="include")
+    assert any("non-text type" in e for e in errors), errors
+
+
+def test_bogus_restore_root_on_an_empty_set_is_refused(tmp_path):
+    """M4: a non-null root with nothing to place is a refusal."""
+    conn = sqlite3.connect(tmp_path / "db.db")
+    conn.execute(f"PRAGMA application_id = {APPLICATION_ID}")
+    conn.executescript(P1_SCHEMA)
+    conn.commit(); conn.close()
+    uploads = tmp_path / "uploads"
+    uploads.mkdir()
+    out = tmp_path / "out"
+    assert build_v2_set.main(["--live-db", str(tmp_path / "db.db"),
+                              "--uploads", str(uploads),
+                              "--output", str(out)]) == build_v2_set.EXIT_OK
+    manifest = json.loads((out / "backup_manifest.json").read_text())
+    assert manifest["restore_uploads_root"] is None
+    manifest["restore_uploads_root"] = "attacker-controlled, not a path"
+    (out / "backup_manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True))
+    lines = [f"{backup_format.sha256_file(out / n)}  {n}"
+             for n in backup_format.CHECKSUMMED]
+    (out / "manifest.sha256").write_text("\n".join(lines) + "\n")
+    ok, report = backup_format.verify_set(out, expected_application_id=APPLICATION_ID)
+    assert not ok
+    assert any("must be null" in e for e in report["errors"]), report["errors"]
+
+
+def test_the_gate_requires_the_deployment_uploads_root(tmp_path):
+    """H2: without an independent root the gate must refuse a set with originals."""
+    db = p1(tmp_path / "db.db", *complete_order(1, "photo.jpg"))
+    uploads = tmp_path / "uploads"
+    uploads.mkdir()
+    (uploads / "1_photo.jpg").write_bytes(GOOD)
+    out = tmp_path / "out"
+    assert build_v2_set.main(["--live-db", str(db), "--uploads", str(uploads),
+                              "--output", str(out),
+                              "--restore-uploads-root", "/app/uploads"]) == 0
+
+    no_root, _ = evidence_gate.evaluate(db, out, expected_application_id=APPLICATION_ID,
+                                        max_age_hours=48)
+    assert no_root == evidence_gate.EXIT_INVALID
+    wrong_root, _ = evidence_gate.evaluate(db, out, expected_application_id=APPLICATION_ID,
+                                           max_age_hours=48,
+                                           expected_uploads_root="/somewhere/uploads")
+    assert wrong_root == evidence_gate.EXIT_INVALID
+    right_root, _ = evidence_gate.evaluate(db, out, expected_application_id=APPLICATION_ID,
+                                           max_age_hours=48,
+                                           expected_uploads_root="/app/uploads")
+    assert right_root == 0
