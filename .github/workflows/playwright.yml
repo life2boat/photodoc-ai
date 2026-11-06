@@ -59,7 +59,14 @@ jobs:
     - name: Install backend dependencies
       run: pip install -r requirements.txt
     - name: Install pytest and pyyaml
-      run: pip install pytest pyyaml
+      run: |
+        pip install pytest pyyaml
+        # The PR-A A1 host tests import the host-side package under ops/, whose dependency
+        # is declared in ops/receipts/requirements.txt. That file does not exist on branches
+        # without A1, so the step stays a no-op there.
+        if [ -f ../ops/receipts/requirements.txt ]; then
+          pip install -r ../ops/receipts/requirements.txt
+        fi
     - name: Run backend security, migration, and delivery tests
       run: pytest tests -v
     - name: Verify preflight scripts
