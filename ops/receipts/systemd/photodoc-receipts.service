@@ -20,7 +20,10 @@ ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes
 RestrictAddressFamilies=AF_UNIX
-ReadWritePaths=/var/lib/photodoc/receipts
+ReadWritePaths=/var/lib/photodoc/receipts /var/lib/photodoc/exports
+# The audit export directory is the only other writable path the service needs. A host whose
+# configured export_dir differs MUST adjust this line in the same drop-in that sets
+# ReadOnlyPaths; the writer refuses to publish an export outside it.
 # A host-specific drop-in MUST set ReadOnlyPaths for the actual app DB parent
 # and actual uploads volume; the writer also pins both device/inode identities.
 UMask=0077

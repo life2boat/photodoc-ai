@@ -26,7 +26,9 @@ from ops.receipts.receipt_protocol import (
 )
 from ops.receipts.receipt_source import ReservationVerifier, legacy_ids_digest
 from ops.receipts.receipt_source import secure_open, secure_root_open
-from ops.receipts.receipt_service import ReceiptService
+from ops.receipts.receipt_service import (
+    ReceiptService, is_unix_listener, resolve_socket_roles,
+)
 
 APP_ID = int.from_bytes(b"PDAI", "big")
 DOCKER_SUBMIT_UID = 1000
@@ -749,3 +751,85 @@ print(response.decode()); s.close()
         listener.close()
         thread.join(timeout=5)
         ledger.close()
+
+
+# ---------------------------------------------------------------- F-1: socket role mapping
+UNIT_DIR = Path(__file__).resolve().parents[2] / "ops" / "receipts" / "systemd"
+
+
+def _roles(names: str, *, count: str = "2", pid: int | None = None,
+           is_listener=lambda fd: True):
+    return resolve_socket_roles(str(os.getpid() if pid is None else pid), count, names,
+                                is_listener=is_listener)
+
+
+def test_socket_roles_resolve_by_name_in_either_order():
+    """systemd may hand over submit:audit or audit:submit; the role must follow the name."""
+    forward = _roles("submit:audit")
+    reverse = _roles("audit:submit")
+    assert forward == {"submit": 3, "audit": 4}
+    assert reverse == {"audit": 3, "submit": 4}
+    # A positional implementation would put audit on fd 3 in the reversed case.
+    assert reverse["submit"] == 4 and reverse["audit"] == 3
+
+
+def test_socket_roles_reject_duplicate_names():
+    assert_error("STORE_UNAVAILABLE", lambda: _roles("submit:submit"))
+    assert_error("STORE_UNAVAILABLE", lambda: _roles("audit:audit"))
+
+
+def test_socket_roles_reject_unexpected_or_missing_name():
+    assert_error("STORE_UNAVAILABLE", lambda: _roles("submit:admin"))
+    assert_error("STORE_UNAVAILABLE", lambda: _roles("submit:"))
+    assert_error("STORE_UNAVAILABLE", lambda: _roles(":audit"))
+    assert_error("STORE_UNAVAILABLE", lambda: _roles("submit"))
+
+
+def test_socket_roles_reject_wrong_pid_or_count():
+    assert_error("STORE_UNAVAILABLE", lambda: _roles("submit:audit", pid=os.getpid() + 1))
+    assert_error("STORE_UNAVAILABLE", lambda: _roles("submit:audit", count="1"))
+    assert_error("STORE_UNAVAILABLE", lambda: _roles("submit:audit", count="3"))
+    assert_error("STORE_UNAVAILABLE", lambda: _roles("submit:audit", count="two"))
+    assert_error("STORE_UNAVAILABLE", lambda: _roles("submit:audit", count=""))
+
+
+def test_socket_roles_reject_non_listening_descriptor():
+    """A descriptor that is not a listening Unix socket must never become a role."""
+    assert_error("STORE_UNAVAILABLE",
+                 lambda: _roles("submit:audit", is_listener=lambda fd: fd == 3))
+    assert_error("STORE_UNAVAILABLE",
+                 lambda: _roles("audit:submit", is_listener=lambda fd: False))
+
+
+def test_is_unix_listener_rejects_a_plain_file_descriptor(tmp_path):
+    target = tmp_path / "not-a-socket"
+    target.write_bytes(b"x")
+    fd = os.open(target, os.O_RDONLY)
+    try:
+        assert is_unix_listener(fd) is False
+    finally:
+        os.close(fd)
+
+
+# ------------------------------------------------------- F-2/F-3: unit provisioning
+def test_socket_units_allow_group_traversal():
+    """The parent directory must be traversable, while the node stays 0660 per group."""
+    for name in ("photodoc-receipts-submit.socket", "photodoc-receipts-audit.socket"):
+        text = (UNIT_DIR / name).read_text(encoding="utf-8")
+        assert "DirectoryMode=0755" in text, name
+        assert "SocketMode=0660" in text, name
+        assert "DirectoryMode=0777" not in text, name
+        assert "SocketMode=0666" not in text, name
+
+
+def test_service_unit_allows_the_audit_export_directory():
+    """ProtectSystem=strict must stay, and only receipts+exports may be writable."""
+    text = (UNIT_DIR / "photodoc-receipts.service").read_text(encoding="utf-8")
+    assert "ProtectSystem=strict" in text
+    writable = [line.split("=", 1)[1].split()
+                for line in text.splitlines() if line.startswith("ReadWritePaths=")]
+    assert writable, "ReadWritePaths missing"
+    paths = set(writable[0])
+    assert "/var/lib/photodoc/receipts" in paths
+    assert "/var/lib/photodoc/exports" in paths
+    assert len(paths) == 2, paths

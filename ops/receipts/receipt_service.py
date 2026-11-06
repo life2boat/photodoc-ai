@@ -9,6 +9,7 @@ import selectors
 import socket
 import stat
 import struct
+from typing import Callable
 from pathlib import Path
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
@@ -87,6 +88,66 @@ def peer_identity(connection: socket.socket) -> tuple[int, int, int]:
     return PEER.unpack(data)
 
 
+FIRST_LISTEN_FD = 3
+EXPECTED_ROLES = frozenset({"submit", "audit"})
+
+
+def is_unix_listener(fd: int) -> bool:
+    """True only for a listening SOCK_STREAM AF_UNIX descriptor."""
+    try:
+        candidate = socket.socket(fileno=os.dup(fd))
+    except OSError:
+        return False
+    try:
+        if candidate.family != socket.AF_UNIX:
+            return False
+        if candidate.getsockopt(socket.SOL_SOCKET, socket.SO_TYPE) != socket.SOCK_STREAM:
+            return False
+        return candidate.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN) == 1
+    except OSError:
+        return False
+    finally:
+        candidate.close()
+
+
+def resolve_socket_roles(
+    listen_pid: str | None,
+    listen_fds: str | None,
+    listen_fdnames: str | None,
+    *,
+    is_listener: Callable[[int], bool],
+    pid: int | None = None,
+) -> dict[str, int]:
+    """Map the inherited descriptors to submit/audit strictly by declared name.
+
+    systemd passes the descriptors in an order that follows socket registration, not the
+    ``Sockets=`` line of the unit, so the only safe contract is the name each socket unit
+    declares through ``FileDescriptorName=``. Position is never used to decide a role.
+    """
+    expected_pid = str(os.getpid() if pid is None else pid)
+    if listen_pid != expected_pid:
+        raise ReceiptError("STORE_UNAVAILABLE", "systemd socket activation required")
+    if listen_fds is None or not listen_fds.isdigit():
+        raise ReceiptError("STORE_UNAVAILABLE", "descriptor count missing")
+    count = int(listen_fds)
+    names = (listen_fdnames or "").split(":")
+    if count != len(EXPECTED_ROLES) or len(names) != count:
+        raise ReceiptError("STORE_UNAVAILABLE", "descriptor count mismatch")
+    if "" in names:
+        raise ReceiptError("STORE_UNAVAILABLE", "unnamed descriptor")
+    if len(set(names)) != len(names):
+        raise ReceiptError("STORE_UNAVAILABLE", "duplicate socket role")
+    if set(names) != EXPECTED_ROLES:
+        raise ReceiptError("STORE_UNAVAILABLE", "unexpected socket role")
+    roles: dict[str, int] = {}
+    for index, name in enumerate(names):
+        fd = FIRST_LISTEN_FD + index
+        if not is_listener(fd):
+            raise ReceiptError("STORE_UNAVAILABLE", "descriptor is not a listening socket")
+        roles[name] = fd
+    return roles
+
+
 class ReceiptService:
     def __init__(
         self, ledger: ReceiptLedger, *, submit_uid: int, audit_uid: int,
@@ -159,17 +220,17 @@ class ReceiptService:
             connection.close()
 
     def serve_inherited(self) -> None:
-        if os.environ.get("LISTEN_PID") != str(os.getpid()):
-            raise ReceiptError("STORE_UNAVAILABLE", "systemd socket activation required")
-        if os.environ.get("LISTEN_FDS") != "2":
-            raise ReceiptError("STORE_UNAVAILABLE", "both sockets required")
-        if os.environ.get("LISTEN_FDNAMES") != "submit:audit":
-            raise ReceiptError("STORE_UNAVAILABLE", "socket roles ambiguous")
+        roles = resolve_socket_roles(
+            os.environ.get("LISTEN_PID"),
+            os.environ.get("LISTEN_FDS"),
+            os.environ.get("LISTEN_FDNAMES"),
+            is_listener=is_unix_listener,
+        )
         selector = selectors.DefaultSelector()
         listeners = []
         try:
-            for fd, role in ((3, "submit"), (4, "audit")):
-                listener = socket.socket(fileno=fd)
+            for role in ("submit", "audit"):
+                listener = socket.socket(fileno=roles[role])
                 listener.setblocking(False)
                 listeners.append(listener)
                 selector.register(listener, selectors.EVENT_READ, role)

@@ -6,7 +6,11 @@ ListenStream=/run/photodoc-receipts/submit.sock
 SocketUser=photodoc-receipt
 SocketGroup=photodoc-receipt-submit
 SocketMode=0660
-DirectoryMode=0750
+# Traversal must be possible for the socket's own group, and systemd applies SocketGroup to
+# the socket node only, never to the parent directory it creates. 0755 lets an authorised
+# group member reach the node while the node itself stays 0660 and group-restricted; the
+# directory is traversable but not writable by anyone but root.
+DirectoryMode=0755
 FileDescriptorName=submit
 Service=photodoc-receipts.service
 RemoveOnStop=yes
