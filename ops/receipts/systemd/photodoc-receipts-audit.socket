@@ -1,0 +1,15 @@
+[Unit]
+Description=PhotoDoc receipt audit socket
+
+[Socket]
+ListenStream=/run/photodoc-receipts/audit.sock
+SocketUser=photodoc-receipt
+SocketGroup=photodoc-receipt-audit
+SocketMode=0660
+DirectoryMode=0750
+FileDescriptorName=audit
+Service=photodoc-receipts.service
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

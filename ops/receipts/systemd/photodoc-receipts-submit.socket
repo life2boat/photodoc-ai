@@ -1,0 +1,15 @@
+[Unit]
+Description=PhotoDoc receipt submission socket
+
+[Socket]
+ListenStream=/run/photodoc-receipts/submit.sock
+SocketUser=photodoc-receipt
+SocketGroup=photodoc-receipt-submit
+SocketMode=0660
+DirectoryMode=0750
+FileDescriptorName=submit
+Service=photodoc-receipts.service
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

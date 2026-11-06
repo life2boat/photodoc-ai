@@ -1,0 +1,29 @@
+[Unit]
+Description=PhotoDoc host receipt writer
+Requires=photodoc-receipts-submit.socket photodoc-receipts-audit.socket
+After=photodoc-receipts-submit.socket photodoc-receipts-audit.socket
+
+[Service]
+Type=simple
+User=photodoc-receipt
+Group=photodoc-receipt
+Sockets=photodoc-receipts-submit.socket photodoc-receipts-audit.socket
+WorkingDirectory=/opt/photodoc-receipts
+ExecStart=/opt/photodoc-receipts/venv/bin/python -m ops.receipts.receipt_service --config /etc/photodoc/receipts.json
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+RestrictAddressFamilies=AF_UNIX
+ReadWritePaths=/var/lib/photodoc/receipts
+# A host-specific drop-in MUST set ReadOnlyPaths for the actual app DB parent
+# and actual uploads volume; the writer also pins both device/inode identities.
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
