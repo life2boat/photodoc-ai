@@ -1,24 +1,19 @@
 """Secure operator workflow for Release 1 (contract PHOTODOC-R1-OPERATOR-CONTRACT 1.0).
 
-Authorization
--------------
-A single operator role, enforced server-side with a bearer token read from
-``OPERATOR_TOKEN``. There is no default: when the variable is absent the whole operator
-surface answers 503 and nothing is reachable. The comparison is constant-time, the token is
-never logged, and no cookie is used, so CSRF does not apply to this API.
+Artifacts
+---------
+Two distinct artifacts exist per order and they are never interchangeable:
 
-What the operator may do
-------------------------
-* list paid orders that still need processing;
-* read limited metadata for one order;
-* download the original image of a paid order;
-* upload a processed result (validated, atomic, order-scoped);
-* submit the result to the existing delivery queue;
-* read the delivery state.
+* **source** — the immutable original uploaded by the customer. It is stored under the
+  ``remote/`` namespace (``remote_path``) and is *never* handed to the customer delivery
+  worker; its only consumer is the operator.
+* **result** — the processed image the operator uploads. It is tracked in
+  ``order_results`` (one active row per order) and is the only artifact eligible for
+  delivery.
 
-Every operation re-checks authentication and the order state. Nothing here deletes or
-overwrites the original: the source file is read-only for this module, which preserves the
-C-01/C-02 guarantees of the retention engine.
+Authorization is a server-side bearer token from ``OPERATOR_TOKEN``; without it the whole
+surface answers 503. Every route re-checks authentication, the order state and the order
+ownership.
 """
 from __future__ import annotations
 
@@ -36,14 +31,26 @@ from fastapi import HTTPException, UploadFile
 
 OPERATOR_TOKEN_ENV = "OPERATOR_TOKEN"
 MAX_RESULT_BYTES = 25 * 1024 * 1024
+# A real image is never a handful of bytes; this rejects the "magic bytes only" trick.
+MIN_RESULT_BYTES = 16
 ALLOWED_RESULT_TYPES = {
     "image/jpeg": ("jpg", b"\xff\xd8\xff"),
     "image/png": ("png", b"\x89PNG\r\n\x1a\n"),
     "image/webp": ("webp", b"RIFF"),
 }
 SAFE_ORDER_ID = re.compile(r"^\d{1,9}$")
+SOURCE_NAMESPACE = "remote/"
+RESULT_SUFFIX = "_result_"
 
-AUDIT_SCHEMA = """
+RESULT_SCHEMA = """
+CREATE TABLE IF NOT EXISTS order_results (
+    order_id INTEGER PRIMARY KEY,
+    path TEXT NOT NULL,
+    sha256 TEXT NOT NULL,
+    size INTEGER NOT NULL,
+    version INTEGER NOT NULL DEFAULT 1,
+    updated_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS operator_audit (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     event TEXT NOT NULL,
@@ -60,7 +67,6 @@ def operator_token() -> str:
 
 
 def require_operator(authorization: str | None) -> str:
-    """Return the presented identity or raise. Default deny."""
     configured = operator_token()
     if not configured:
         raise HTTPException(status_code=503, detail="Operator access is not configured")
@@ -73,12 +79,11 @@ def require_operator(authorization: str | None) -> str:
 
 
 def initialize(conn: sqlite3.Connection) -> None:
-    conn.executescript(AUDIT_SCHEMA)
+    conn.executescript(RESULT_SCHEMA)
     conn.commit()
 
 
 def audit(conn: sqlite3.Connection, event: str, order_id: int | None = None, detail: str = "") -> None:
-    """Record an operator action without secrets, contact data or image bytes."""
     initialize(conn)
     conn.execute(
         "INSERT INTO operator_audit (event, order_id, detail, created_at) VALUES (?, ?, ?, ?)",
@@ -93,78 +98,12 @@ def _connect(db_path: Path) -> sqlite3.Connection:
     return conn
 
 
-def list_paid_orders(db_path: Path) -> list[dict[str, Any]]:
-    conn = _connect(db_path)
-    try:
-        rows = conn.execute(
-            "SELECT id, format, paper, crop, order_amount, payment_status, status, paid_at, created_at "
-            "FROM orders WHERE payment_status = 'paid' ORDER BY id"
-        ).fetchall()
-        result = []
-        for row in rows:
-            item = dict(row)
-            item["delivered"] = _has_delivered_job(conn, row["id"])
-            result.append(item)
-        return result
-    finally:
-        conn.close()
-
-
-def order_metadata(db_path: Path, order_id: int) -> dict[str, Any]:
-    conn = _connect(db_path)
-    try:
-        row = conn.execute(
-            "SELECT id, format, paper, crop, comment, order_amount, payment_status, status, paid_at, created_at "
-            "FROM orders WHERE id = ?", (order_id,)
-        ).fetchone()
-        if row is None:
-            raise HTTPException(status_code=404, detail="Order not found")
-        item = dict(row)
-        item["delivered"] = _has_delivered_job(conn, order_id)
-        item["source_available"] = _source_or_none(conn, order_id, uploads_dir()) is not None
-        return item
-    finally:
-        conn.close()
-
-
-def _has_delivered_job(conn: sqlite3.Connection, order_id: int) -> bool:
-    row = conn.execute(
-        "SELECT 1 FROM delivery_jobs WHERE order_id=? AND kind IN ('file','info') AND state='delivered' LIMIT 1",
-        (order_id,),
-    ).fetchone()
-    return row is not None
-
-
 def uploads_dir() -> Path:
     return Path(os.getenv("UPLOAD_DIR", "/app/uploads"))
 
 
-def _source_or_none(conn: sqlite3.Connection, order_id: int, uploads: Path) -> Path | None:
-    """The stored original for an order, verified to live inside the uploads directory."""
-    rows = conn.execute(
-        "SELECT local_path FROM delivery_jobs WHERE order_id=? AND kind='file' AND local_path IS NOT NULL",
-        (order_id,),
-    ).fetchall()
-    candidates = [row[0] for row in rows]
-    resolved_uploads = uploads.resolve()
-    for candidate in candidates:
-        try:
-            path = Path(candidate)
-            if path.is_symlink():
-                continue
-            resolved = path.resolve()
-        except (OSError, RuntimeError):
-            continue
-        if resolved.parent != resolved_uploads:
-            continue
-        if not resolved.name.startswith(f"{order_id}_"):
-            continue
-        if resolved.is_file():
-            return resolved
-    return None
-
-
-def require_paid(conn: sqlite3.Connection, order_id: int) -> dict[str, Any]:
+def require_processable(conn: sqlite3.Connection, order_id: int) -> dict[str, Any]:
+    """Paid, and not cancelled/refunded. The single state guard for all routes."""
     row = conn.execute(
         "SELECT id, payment_status, status FROM orders WHERE id=?", (order_id,)
     ).fetchone()
@@ -172,31 +111,137 @@ def require_paid(conn: sqlite3.Connection, order_id: int) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail="Order not found")
     if row["payment_status"] != "paid":
         raise HTTPException(status_code=409, detail="Order is not paid")
+    if (row["status"] or "") in ("cancelled", "refunded"):
+        raise HTTPException(status_code=409, detail="Order is cancelled or refunded")
     return dict(row)
 
 
-def source_for_download(db_path: Path, order_id: int) -> Path:
-    """Resolve the original for a paid order, or fail with an actionable status."""
-    uploads = uploads_dir()
+def _is_result_job(job) -> bool:
+    remote = job["remote_path"] or ""
+    local = job["local_path"] or ""
+    return remote.endswith("_result.bin") or RESULT_SUFFIX in local
+
+
+def _source_job(conn: sqlite3.Connection, order_id: int):
+    rows = conn.execute(
+        "SELECT id, local_path, remote_path FROM delivery_jobs "
+        "WHERE order_id=? AND kind='file' ORDER BY created_at, id",
+        (order_id,),
+    ).fetchall()
+    for row in rows:
+        if _is_result_job(row):
+            continue
+        return row
+    return None
+
+
+def _source_path(conn: sqlite3.Connection, order_id: int) -> Path | None:
+    job = _source_job(conn, order_id)
+    if job is None or not job["local_path"]:
+        return None
+    uploads = uploads_dir().resolve()
+    try:
+        path = Path(job["local_path"])
+        if path.is_symlink():
+            return None
+        resolved = path.resolve()
+    except (OSError, RuntimeError):
+        return None
+    if resolved.parent != uploads:
+        return None
+    if not resolved.name.startswith(f"{order_id}_"):
+        return None
+    return resolved if resolved.is_file() else None
+
+
+def _quarantine_for(conn: sqlite3.Connection, order_id: int) -> Path | None:
+    job = _source_job(conn, order_id)
+    if job is None:
+        return None
+    quarantine = uploads_dir() / ".quarantine"
+    if not quarantine.is_dir():
+        return None
+    for claim in quarantine.glob(f"{job['id']}.*.claim"):
+        return claim
+    return None
+
+
+def list_paid_orders(db_path: Path) -> list[dict[str, Any]]:
     conn = _connect(db_path)
     try:
-        require_paid(conn, order_id)
-        path = _source_or_none(conn, order_id, uploads)
+        rows = conn.execute(
+            "SELECT id, format, paper, crop, order_amount, payment_status, status, paid_at, created_at "
+            "FROM orders WHERE payment_status='paid' AND COALESCE(status,'') NOT IN ('cancelled','refunded') "
+            "ORDER BY id"
+        ).fetchall()
+        return [dict(row) | {"delivered": _has_result(db_path, row["id"])} for row in rows]
+    finally:
+        conn.close()
+
+
+def _has_result(db_path: Path, order_id: int) -> bool:
+    conn = _connect(db_path)
+    try:
+        row = conn.execute("SELECT 1 FROM order_results WHERE order_id=?", (order_id,)).fetchone()
+        return row is not None
+    except sqlite3.OperationalError:
+        return False
+    finally:
+        conn.close()
+
+
+def order_metadata(db_path: Path, order_id: int) -> dict[str, Any]:
+    conn = _connect(db_path)
+    try:
+        require_processable(conn, order_id)
+        row = conn.execute(
+            "SELECT id, format, paper, crop, comment, order_amount, payment_status, status, paid_at, created_at "
+            "FROM orders WHERE id=?", (order_id,)
+        ).fetchone()
+        item = dict(row)
+        item["source_available"] = _source_path(conn, order_id) is not None
+        item["result_ready"] = conn.execute(
+            "SELECT 1 FROM order_results WHERE order_id=?", (order_id,)
+        ).fetchone() is not None
+        return item
+    finally:
+        conn.close()
+
+
+def source_for_download(db_path: Path, order_id: int) -> Path:
+    conn = _connect(db_path)
+    try:
+        require_processable(conn, order_id)
+        path = _source_path(conn, order_id)
         if path is not None:
             return path
-        # Distinguish a missing file from a quarantined one (C-01 state).
-        quarantine = uploads / ".quarantine"
-        if quarantine.is_dir() and any(quarantine.glob(f"*.claim")):
+        if _quarantine_for(conn, order_id) is not None:
             raise HTTPException(status_code=409, detail="Source is in recovery; manual intervention required")
         raise HTTPException(status_code=410, detail="Source image is no longer available")
     finally:
         conn.close()
 
 
+def read_limited(upload: UploadFile, limit: int = MAX_RESULT_BYTES) -> bytes:
+    """Read at most limit+1 bytes so the memory bound does not depend on the client."""
+    chunks = []
+    total = 0
+    while True:
+        chunk = upload.file.read(65536)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > limit:
+            raise HTTPException(status_code=413, detail="Result exceeds the size limit")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 def validate_result(upload: UploadFile, payload: bytes) -> tuple[str, str]:
-    """Validate type, magic bytes and size; return (suffix, sha256)."""
     if len(payload) == 0:
         raise HTTPException(status_code=400, detail="Empty upload")
+    if len(payload) < MIN_RESULT_BYTES:
+        raise HTTPException(status_code=400, detail="Malformed image")
     if len(payload) > MAX_RESULT_BYTES:
         raise HTTPException(status_code=413, detail="Result exceeds the size limit")
     content_type = (upload.content_type or "").split(";")[0].strip().lower()
@@ -211,51 +256,113 @@ def validate_result(upload: UploadFile, payload: bytes) -> tuple[str, str]:
     return suffix, hashlib.sha256(payload).hexdigest()
 
 
+def _result_is_locked(conn: sqlite3.Connection, order_id: int) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM delivery_jobs WHERE order_id=? AND state IN ('processing','delivered') "
+        "AND (remote_path LIKE '%_result.bin')", (order_id,)
+    ).fetchone()
+    return row is not None
+
+
 def store_result(db_path: Path, order_id: int, suffix: str, payload: bytes, sha256: str,
                  *, replace: bool = False) -> Path:
-    """Atomically store a processed result for one order; never overwrite another order."""
+    """Publish exactly one active result per order; the loser of a race gets 409."""
     uploads = uploads_dir()
     uploads.mkdir(parents=True, exist_ok=True)
-    conn = _connect(db_path)
+    target = uploads / f"{order_id}_result_{uuid.uuid4().hex}.{suffix}"
+    tmp = uploads / f".{target.name}.part"
     try:
-        require_paid(conn, order_id)
-        if _has_delivered_job(conn, order_id):
-            raise HTTPException(status_code=409, detail="Order is already delivered")
-        existing = [p for p in uploads.iterdir()
-                    if p.is_file() and not p.is_symlink() and p.name.startswith(f"{order_id}_result_")]
-        if existing and not replace:
-            raise HTTPException(status_code=409, detail="Result already uploaded; use replace=true")
-        name = f"{order_id}_result_{uuid.uuid4().hex}.{suffix}"
-        target = uploads / name
-        tmp = uploads / f".{name}.part"
         with open(tmp, "wb") as handle:
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
-        if target.is_symlink():
-            tmp.unlink(missing_ok=True)
-            raise HTTPException(status_code=409, detail="Refusing to replace a symlink")
         os.replace(tmp, target)
-        audit(conn, "result_uploaded", order_id, f"bytes={len(payload)} sha256={sha256[:16]}")
-        return target
-    finally:
-        conn.close()
+
+        conn = _connect(db_path)
+        try:
+            initialize(conn)
+            require_processable(conn, order_id)
+            if _result_is_locked(conn, order_id):
+                raise HTTPException(status_code=409, detail="Result is already queued or delivered")
+            conn.execute("BEGIN IMMEDIATE")
+            existing = conn.execute(
+                "SELECT path FROM order_results WHERE order_id=?", (order_id,)
+            ).fetchone()
+            if existing and not replace:
+                conn.rollback()
+                raise HTTPException(status_code=409, detail="Result already uploaded; use replace=true")
+            now = datetime.now(timezone.utc).isoformat()
+            if existing:
+                conn.execute(
+                    "UPDATE order_results SET path=?, sha256=?, size=?, version=version+1, updated_at=? "
+                    "WHERE order_id=?", (str(target), sha256, len(payload), now, order_id))
+            else:
+                conn.execute(
+                    "INSERT INTO order_results (order_id, path, sha256, size, version, updated_at) "
+                    "VALUES (?, ?, ?, ?, 1, ?)", (order_id, str(target), sha256, len(payload), now))
+            conn.commit()
+            audit(conn, "result_uploaded", order_id, f"bytes={len(payload)} sha256={sha256[:16]}")
+            if existing and existing["path"] != str(target):
+                try:
+                    Path(existing["path"]).unlink()
+                except OSError:
+                    pass
+            return target
+        finally:
+            conn.close()
+    except BaseException:
+        # M-04: never leave an untracked partial copy behind.
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
+        if target.exists():
+            try:
+                target.unlink()
+            except OSError:
+                pass
+        raise
 
 
-def submit_delivery(db_path: Path, order_id: int, result_path: Path, sha256: str) -> str:
-    """Queue the processed result for the existing delivery worker."""
-    from delivery import enqueue
-
+def submit_delivery(db_path: Path, order_id: int) -> str:
+    """Queue the active result; a replaced result updates the same job in place (H-02)."""
     conn = _connect(db_path)
     try:
-        require_paid(conn, order_id)
-        if not result_path.is_file() or result_path.is_symlink():
+        initialize(conn)
+        require_processable(conn, order_id)
+        row = conn.execute("SELECT path, sha256, size FROM order_results WHERE order_id=?",
+                           (order_id,)).fetchone()
+        if row is None:
+            raise HTTPException(status_code=409, detail="No processed result uploaded yet")
+        path = Path(row["path"])
+        if not path.is_file() or path.is_symlink():
             raise HTTPException(status_code=409, detail="Result file is missing")
-        size = result_path.stat().st_size
+        conn.execute("BEGIN IMMEDIATE")
+        job = conn.execute(
+            "SELECT id, state FROM delivery_jobs WHERE order_id=? AND remote_path LIKE '%_result.bin'",
+            (order_id,),
+        ).fetchone()
+        if job is not None and job["state"] in ("processing", "delivered"):
+            conn.rollback()
+            raise HTTPException(status_code=409, detail="Result is already being delivered")
         remote_path = f"{os.getenv('YANDEX_DISK_ROOT_DIR', 'PhotoDoc_AI')}/{order_id}_result.bin"
-        job_id = enqueue(conn, order_id=order_id, kind="file", local_path=str(result_path),
-                         original_name=result_path.name, remote_path=remote_path,
-                         sha256=sha256, size=size)
+        if job is None:
+            from delivery import enqueue
+            job_id = uuid.uuid4().hex
+            now = datetime.now(timezone.utc).isoformat()
+            conn.execute(
+                "INSERT INTO delivery_jobs (id, order_id, kind, local_path, original_name, remote_path,"
+                " content_sha256, content_size, next_attempt_at, created_at, cleanup_state, cleanup_phase)"
+                " VALUES (?, ?, 'file', ?, ?, ?, ?, ?, ?, ?, 'pending', 'pending')",
+                (job_id, order_id, str(path), path.name, remote_path, row["sha256"], row["size"], now, now))
+        else:
+            job_id = job["id"]
+            conn.execute(
+                "UPDATE delivery_jobs SET local_path=?, original_name=?, content_sha256=?, content_size=?,"
+                " state='pending', attempts=0, next_attempt_at=?, last_error=NULL WHERE id=?",
+                (str(path), path.name, row["sha256"], row["size"],
+                 datetime.now(timezone.utc).isoformat(), job_id))
         conn.commit()
         audit(conn, "delivery_submitted", order_id, f"job={job_id}")
         return job_id
@@ -266,6 +373,7 @@ def submit_delivery(db_path: Path, order_id: int, result_path: Path, sha256: str
 def delivery_state(db_path: Path, order_id: int) -> list[dict[str, Any]]:
     conn = _connect(db_path)
     try:
+        require_processable(conn, order_id)
         rows = conn.execute(
             "SELECT id, kind, state, attempts, last_error, delivered_at, cleanup_state "
             "FROM delivery_jobs WHERE order_id=? ORDER BY created_at, id", (order_id,)

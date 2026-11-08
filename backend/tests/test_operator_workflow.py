@@ -103,7 +103,7 @@ def test_quarantined_source_requires_manual_recovery(env):
     path.unlink()
     quarantine = main.UPLOAD_DIR / ".quarantine"
     quarantine.mkdir()
-    (quarantine / "job-1.claim").write_bytes(JPEG)
+    (quarantine / "job-1.deadbeef.claim").write_bytes(JPEG)
     response = client.get("/api/operator/orders/1/source", headers=auth())
     assert response.status_code == 409
     assert "recovery" in response.json()["detail"].lower()
@@ -130,7 +130,7 @@ def test_unsupported_type_is_rejected(env):
     _, client = env
     add_order(1)
     response = client.post("/api/operator/orders/1/result", headers=auth(),
-                           files={"file": ("result.gif", b"GIF89a", "image/gif")})
+                           files={"file": ("result.gif", b"GIF89a" + b"0" * 32, "image/gif")})
     assert response.status_code == 415
 
 
@@ -157,13 +157,27 @@ def test_duplicate_upload_requires_explicit_replace(env):
     assert replaced.status_code == 200
 
 
-def test_delivered_order_cannot_be_reprocessed(env):
+def test_delivered_result_cannot_be_replaced(env):
+    _, client = env
+    add_order(1)
+    client.post("/api/operator/orders/1/result", headers=auth(),
+                files={"file": ("result.jpg", JPEG, "image/jpeg")})
+    client.post("/api/operator/orders/1/submit", headers=auth())
+    with sqlite3.connect(main.DB_PATH) as conn:
+        conn.execute("UPDATE delivery_jobs SET state='delivered' "
+                     "WHERE order_id=1 AND remote_path LIKE '%_result.bin'")
+    assert client.post("/api/operator/orders/1/result", headers=auth(),
+                       files={"file": ("result.jpg", JPEG, "image/jpeg")}).status_code == 409
+
+
+def test_delivered_source_does_not_block_result_upload(env):
+    """H-01 regression: a legacy delivered original must not complete the order."""
     _, client = env
     add_order(1)
     with sqlite3.connect(main.DB_PATH) as conn:
         conn.execute("UPDATE delivery_jobs SET state='delivered' WHERE order_id=1")
     assert client.post("/api/operator/orders/1/result", headers=auth(),
-                       files={"file": ("result.jpg", JPEG, "image/jpeg")}).status_code == 409
+                       files={"file": ("result.jpg", JPEG, "image/jpeg")}).status_code == 200
 
 
 def test_submit_requires_a_result(env):

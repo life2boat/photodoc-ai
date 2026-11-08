@@ -1477,14 +1477,16 @@ def operator_order(order_id: int, request: Request):
 def operator_source(order_id: int, request: Request):
     _require_operator(request)
     path = operator_service.source_for_download(DB_PATH, order_id)
-    return FileResponse(path, media_type="application/octet-stream", filename=path.name)
+    # M-03: a protected photograph must never be cached by a browser or a proxy.
+    return FileResponse(path, media_type="application/octet-stream", filename=path.name,
+                        headers={"Cache-Control": "no-store, private"})
 
 
 @app.post("/api/operator/orders/{order_id}/result")
 async def operator_upload_result(order_id: int, request: Request,
                                  file: UploadFile = File(...), replace: bool = False):
     _require_operator(request)
-    payload = await file.read()
+    payload = operator_service.read_limited(file)      # M-06: bounded read
     suffix, sha256 = operator_service.validate_result(file, payload)
     stored = operator_service.store_result(DB_PATH, order_id, suffix, payload, sha256, replace=replace)
     return {"ok": True, "order_id": order_id, "bytes": len(payload), "sha256": sha256[:16]}
@@ -1493,18 +1495,7 @@ async def operator_upload_result(order_id: int, request: Request,
 @app.post("/api/operator/orders/{order_id}/submit")
 def operator_submit(order_id: int, request: Request):
     _require_operator(request)
-    uploads = operator_service.uploads_dir()
-    candidates = sorted(
-        (p for p in uploads.iterdir()
-         if p.is_file() and not p.is_symlink() and p.name.startswith(f"{order_id}_result_")),
-        key=lambda item: item.stat().st_mtime,
-        reverse=True,
-    )
-    if not candidates:
-        raise HTTPException(status_code=409, detail="No processed result uploaded yet")
-    result = candidates[0]
-    sha256 = operator_service.hashlib.sha256(result.read_bytes()).hexdigest()
-    job_id = operator_service.submit_delivery(DB_PATH, order_id, result, sha256)
+    job_id = operator_service.submit_delivery(DB_PATH, order_id)
     return {"ok": True, "order_id": order_id, "job_id": job_id}
 
 
