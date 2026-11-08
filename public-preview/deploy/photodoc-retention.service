@@ -1,0 +1,17 @@
+[Unit]
+Description=PhotoDoc AI — удаление исходных файлов заказов старше 72 часов
+Documentation=file:/srv/photodoc/RETENTION.md
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+# Dry-run first: replace with the live command only after reviewing the audit rows.
+# Live:  --hours 72
+ExecStart=/usr/bin/docker exec photodoc-pr22-private-backend-1 \
+    python /app/retention.py --hours 72 --dry-run
+StandardOutput=journal
+StandardError=journal
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
