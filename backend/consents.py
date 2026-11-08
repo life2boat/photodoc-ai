@@ -12,6 +12,9 @@ Design notes
 * Only the order reference is stored; the customer identity is the order itself. No IP
   address, no user agent, no free text.
 * ``document_version`` and ``document_hash`` pin the exact text the customer saw.
+* Effective state is derived from the append order (rowid), never from a caller-supplied
+  timestamp, so a future-dated grant cannot shadow a later withdrawal (H-04).
+* Read paths never execute DDL and never commit the caller's transaction (H-07).
 * ``check_required()`` returns the purposes still missing a valid grant, so the caller can
   refuse to accept a photo until the mandatory consents exist.
 """
@@ -90,8 +93,20 @@ def document_hash(purpose: str) -> str:
 
 
 def initialize(conn: sqlite3.Connection) -> None:
+    """Create the schema. Writers call this; readers use ``_schema_ready`` instead."""
     conn.executescript(SCHEMA)
     conn.commit()
+
+
+def _schema_ready(conn: sqlite3.Connection) -> bool:
+    """Read-only check: never runs DDL and never commits the caller's transaction (H-07)."""
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='consent_records'"
+        ).fetchone()
+    except sqlite3.Error:
+        return False
+    return row is not None
 
 
 def record_consent(conn: sqlite3.Connection, *, order_ref: str, purpose: str,
@@ -130,9 +145,12 @@ def withdraw_consent(conn: sqlite3.Connection, *, order_ref: str, purpose: str,
 
 def current_state(conn: sqlite3.Connection, order_ref: str) -> dict[str, str]:
     """Latest action per purpose for an order."""
-    initialize(conn)
+    if not _schema_ready(conn):
+        return {}
+    # H-04: authoritative order is the immutable insertion order, not a caller-supplied
+    # timestamp. A future-dated grant can therefore never override a later withdrawal.
     rows = conn.execute(
-        "SELECT purpose, action FROM consent_records WHERE order_ref=? ORDER BY recorded_at, rowid",
+        "SELECT purpose, action FROM consent_records WHERE order_ref=? ORDER BY rowid",
         (order_ref,),
     ).fetchall()
     state: dict[str, str] = {}
@@ -159,9 +177,10 @@ def check_required(conn: sqlite3.Connection, order_ref: str,
 
 def evidence(conn: sqlite3.Connection, order_ref: str) -> list[dict[str, Any]]:
     """Full auditable history for an order (no personal data beyond the order reference)."""
-    initialize(conn)
+    if not _schema_ready(conn):
+        return []
     conn.row_factory = sqlite3.Row
     rows = conn.execute(
-        "SELECT * FROM consent_records WHERE order_ref=? ORDER BY recorded_at, rowid", (order_ref,)
+        "SELECT * FROM consent_records WHERE order_ref=? ORDER BY rowid", (order_ref,)
     ).fetchall()
     return [dict(row) for row in rows]
