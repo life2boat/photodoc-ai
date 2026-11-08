@@ -208,9 +208,12 @@ def _handle_interrupted(conn: sqlite3.Connection, uploads: Path, now_iso: str) -
                             reason="interrupted_deletion_payment_arrived", path=str(target), now=now_iso)
                     stats["recovered_restored"] += 1
                     continue
+                _record(conn, job_id, order_id, "recovery_required",
+                        reason="interrupted_deletion_payment_restore_failed", path=str(target or ""), now=now_iso)
+                stats["recovered_recovery_required"] = stats.get("recovered_recovery_required", 0) + 1
+                continue
             _record(conn, job_id, order_id, "deleted",
                     reason="interrupted_deletion_finalised", path=str(target or ""), now=now_iso)
-            _delete_quarantine(quarantine)
             stats["recovered_deleted"] += 1
             continue
         if target is not None and target.exists():
@@ -251,7 +254,7 @@ def purge_expired(
     summary: dict[str, Any] = {
         "retention_hours": hours, "dry_run": dry_run, "scanned": 0, "deleted": 0,
         "bytes_freed": 0, "held_paid": 0, "held_pending": 0, "held_missing_order": 0,
-        "restored_after_payment": 0, "restored_after_substitution": 0,
+        "restored_after_payment": 0, "restored_after_substitution": 0, "recovery_required": 0,
         "skipped_missing": 0, "skipped_unsafe": 0, "skipped_mismatch": 0,
         "orphans_deleted": 0, "uncertain": 0, "errors": [],
     }
@@ -406,13 +409,15 @@ def purge_expired(
                     else:
                         summary["skipped_missing"] += 1
                 else:
-                    _delete_quarantine(quarantine)
-                    inserted = _record(conn, job_id, order_id, "uncertain",
+                    # C-01: the quarantine holds the only remaining copy of a paid source.
+                    # Dropping it turns a recoverable failure into data loss, so it is kept
+                    # and the operator must resolve the state manually.
+                    inserted = _record(conn, job_id, order_id, "recovery_required",
                                        reason="payment_arrived_but_restore_failed",
-                                       path=str(resolved), now=now_iso)
+                                       size=quarantine_size, path=str(resolved), now=now_iso)
                     conn.commit()
                     if inserted:
-                        summary["uncertain"] += 1
+                        summary["recovery_required"] += 1
                 continue
 
             if quarantine_sha is not None and quarantine_sha != pre_sha:
@@ -426,21 +431,22 @@ def purge_expired(
                     else:
                         summary["skipped_missing"] += 1
                 else:
-                    _delete_quarantine(quarantine)
-                    inserted = _record(conn, job_id, order_id, "uncertain",
+                    # Same rule for a substituted file: the quarantined bytes are the only
+                    # evidence of what was there, so they are preserved for manual recovery.
+                    inserted = _record(conn, job_id, order_id, "recovery_required",
                                        reason="substitution_detected_restore_failed",
-                                       path=str(resolved), now=now_iso)
+                                       size=quarantine_size, path=str(resolved), now=now_iso)
                     conn.commit()
                     if inserted:
-                        summary["uncertain"] += 1
+                        summary["recovery_required"] += 1
                 continue
 
-            # Record the outcome before dropping the quarantine link, so a crash in
-            # between leaves a recoverable state rather than a silent 'missing'.
+            # C-02: a payment may still be committed after the last read above. The
+            # quarantine is therefore kept and released later by purge_quarantines(), which
+            # re-reads the payment state under a write transaction before removing it.
             inserted = _record(conn, job_id, order_id, "deleted", reason="retention_expired",
                                size=quarantine_size, path=str(resolved), now=now_iso)
             conn.commit()
-            _delete_quarantine(quarantine)
             if inserted:
                 summary["deleted"] += 1
                 summary["bytes_freed"] += quarantine_size or 0
@@ -547,3 +553,73 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+def purge_quarantines(db_path: Path, uploads_dir: Path | None = None, *,
+                      now: datetime | None = None, grace_hours: int = 24,
+                      dry_run: bool = False) -> dict[str, Any]:
+    """Release quarantined copies only after a fresh payment check.
+
+    A file removed by ``purge_expired`` stays in ``uploads/.quarantine`` until this pass runs
+    later. If the order became paid in the meantime, the file is restored; otherwise the
+    quarantined copy is dropped. The check runs inside a write transaction, so a concurrent
+    payment either commits before it (and wins) or after the copy is already gone, which the
+    late-callback contract in ``main.mark_order_paid`` reports explicitly.
+    """
+    from delivery import get_uploads_dir
+
+    uploads = Path(uploads_dir) if uploads_dir is not None else get_uploads_dir()
+    current = now or datetime.now(timezone.utc)
+    cutoff = (current - timedelta(hours=grace_hours)).isoformat()
+    quarantine_dir = uploads / ".quarantine"
+    summary: dict[str, Any] = {"scanned": 0, "released": 0, "restored": 0,
+                               "kept_for_recovery": 0, "errors": []}
+    if not quarantine_dir.is_dir():
+        return summary
+
+    conn = sqlite3.connect(db_path, timeout=10)
+    try:
+        for claim in sorted(quarantine_dir.glob("*.claim")):
+            summary["scanned"] += 1
+            job_id = claim.name.split(".")[0]
+            row = conn.execute(
+                "SELECT order_id, path FROM retention_audit WHERE job_id=? AND action='deleted' "
+                "ORDER BY id DESC LIMIT 1", (job_id,)
+            ).fetchone()
+            if row is None:
+                continue
+            order_id, path = row[0], row[1]
+            if not path:
+                continue
+            try:
+                if datetime.fromisoformat(
+                        conn.execute("SELECT created_at FROM retention_audit WHERE job_id=? "
+                                     "AND action='deleted' ORDER BY id DESC LIMIT 1",
+                                     (job_id,)).fetchone()[0]) > datetime.fromisoformat(cutoff):
+                    continue
+            except (TypeError, ValueError):
+                continue
+            if dry_run:
+                summary["released"] += 1
+                continue
+            conn.execute("BEGIN IMMEDIATE")
+            status_row = conn.execute("SELECT payment_status FROM orders WHERE id=?", (order_id,)).fetchone()
+            status = status_row[0] if status_row else None
+            if status is not None and status != "unpaid":
+                target = Path(path)
+                if not target.exists() and _restore(claim, target):
+                    conn.execute(
+                        "INSERT OR IGNORE INTO retention_audit (job_id, order_id, action, reason, path, created_at)"
+                        " VALUES (?, ?, 'restored_after_payment', 'quarantine_release', ?, ?)",
+                        (job_id, order_id, str(target), current.isoformat()))
+                    conn.commit()
+                    summary["restored"] += 1
+                    continue
+                conn.commit()
+                summary["kept_for_recovery"] += 1
+                continue
+            conn.commit()
+            _delete_quarantine(claim)
+            summary["released"] += 1
+    finally:
+        conn.close()
+    return summary
