@@ -117,17 +117,33 @@ def require_processable(conn: sqlite3.Connection, order_id: int) -> dict[str, An
 
 
 def _is_result_job(job) -> bool:
+    if "artifact_role" in job.keys():
+        role = job["artifact_role"]
+        if role == "result":
+            return True
+        if role == "source":
+            return False
     remote = job["remote_path"] or ""
     local = job["local_path"] or ""
     return remote.endswith("_result.bin") or RESULT_SUFFIX in local
 
 
 def _source_job(conn: sqlite3.Connection, order_id: int):
-    rows = conn.execute(
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(delivery_jobs)").fetchall()}
+    has_role = "artifact_role" in cols
+    query = (
+        "SELECT id, local_path, remote_path, artifact_role FROM delivery_jobs "
+        if has_role else
         "SELECT id, local_path, remote_path FROM delivery_jobs "
-        "WHERE order_id=? AND kind='file' ORDER BY created_at, id",
+    )
+    rows = conn.execute(
+        query + "WHERE order_id=? AND kind='file' ORDER BY created_at, id",
         (order_id,),
     ).fetchall()
+    if has_role:
+        for row in rows:
+            if row["artifact_role"] == "source":
+                return row
     for row in rows:
         if _is_result_job(row):
             continue
@@ -257,10 +273,18 @@ def validate_result(upload: UploadFile, payload: bytes) -> tuple[str, str]:
 
 
 def _result_is_locked(conn: sqlite3.Connection, order_id: int) -> bool:
-    row = conn.execute(
-        "SELECT 1 FROM delivery_jobs WHERE order_id=? AND state IN ('processing','delivered') "
-        "AND (remote_path LIKE '%_result.bin')", (order_id,)
-    ).fetchone()
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(delivery_jobs)").fetchall()}
+    has_role = "artifact_role" in cols
+    if has_role:
+        row = conn.execute(
+            "SELECT 1 FROM delivery_jobs WHERE order_id=? AND state IN ('processing','delivered') "
+            "AND (artifact_role='result' OR remote_path LIKE '%_result.bin')", (order_id,)
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT 1 FROM delivery_jobs WHERE order_id=? AND state IN ('processing','delivered') "
+            "AND (remote_path LIKE '%_result.bin')", (order_id,)
+        ).fetchone()
     return row is not None
 
 
@@ -339,30 +363,51 @@ def submit_delivery(db_path: Path, order_id: int) -> str:
         if not path.is_file() or path.is_symlink():
             raise HTTPException(status_code=409, detail="Result file is missing")
         conn.execute("BEGIN IMMEDIATE")
-        job = conn.execute(
-            "SELECT id, state FROM delivery_jobs WHERE order_id=? AND remote_path LIKE '%_result.bin'",
-            (order_id,),
-        ).fetchone()
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(delivery_jobs)").fetchall()}
+        has_role = "artifact_role" in cols
+        if has_role:
+            job = conn.execute(
+                "SELECT id, state FROM delivery_jobs WHERE order_id=? AND (artifact_role='result' OR remote_path LIKE '%_result.bin')",
+                (order_id,),
+            ).fetchone()
+        else:
+            job = conn.execute(
+                "SELECT id, state FROM delivery_jobs WHERE order_id=? AND remote_path LIKE '%_result.bin'",
+                (order_id,),
+            ).fetchone()
         if job is not None and job["state"] in ("processing", "delivered"):
             conn.rollback()
             raise HTTPException(status_code=409, detail="Result is already being delivered")
         remote_path = f"{os.getenv('YANDEX_DISK_ROOT_DIR', 'PhotoDoc_AI')}/{order_id}_result.bin"
         if job is None:
-            from delivery import enqueue
             job_id = uuid.uuid4().hex
             now = datetime.now(timezone.utc).isoformat()
-            conn.execute(
-                "INSERT INTO delivery_jobs (id, order_id, kind, local_path, original_name, remote_path,"
-                " content_sha256, content_size, next_attempt_at, created_at, cleanup_state, cleanup_phase)"
-                " VALUES (?, ?, 'file', ?, ?, ?, ?, ?, ?, ?, 'pending', 'pending')",
-                (job_id, order_id, str(path), path.name, remote_path, row["sha256"], row["size"], now, now))
+            if has_role:
+                conn.execute(
+                    "INSERT INTO delivery_jobs (id, order_id, kind, artifact_role, local_path, original_name, remote_path,"
+                    " content_sha256, content_size, next_attempt_at, created_at, cleanup_state, cleanup_phase)"
+                    " VALUES (?, ?, 'file', 'result', ?, ?, ?, ?, ?, ?, ?, 'pending', 'pending')",
+                    (job_id, order_id, str(path), path.name, remote_path, row["sha256"], row["size"], now, now))
+            else:
+                conn.execute(
+                    "INSERT INTO delivery_jobs (id, order_id, kind, local_path, original_name, remote_path,"
+                    " content_sha256, content_size, next_attempt_at, created_at, cleanup_state, cleanup_phase)"
+                    " VALUES (?, ?, 'file', ?, ?, ?, ?, ?, ?, ?, 'pending', 'pending')",
+                    (job_id, order_id, str(path), path.name, remote_path, row["sha256"], row["size"], now, now))
         else:
             job_id = job["id"]
-            conn.execute(
-                "UPDATE delivery_jobs SET local_path=?, original_name=?, content_sha256=?, content_size=?,"
-                " state='pending', attempts=0, next_attempt_at=?, last_error=NULL WHERE id=?",
-                (str(path), path.name, row["sha256"], row["size"],
-                 datetime.now(timezone.utc).isoformat(), job_id))
+            if has_role:
+                conn.execute(
+                    "UPDATE delivery_jobs SET local_path=?, original_name=?, content_sha256=?, content_size=?,"
+                    " artifact_role='result', state='pending', attempts=0, next_attempt_at=?, last_error=NULL WHERE id=?",
+                    (str(path), path.name, row["sha256"], row["size"],
+                     datetime.now(timezone.utc).isoformat(), job_id))
+            else:
+                conn.execute(
+                    "UPDATE delivery_jobs SET local_path=?, original_name=?, content_sha256=?, content_size=?,"
+                    " state='pending', attempts=0, next_attempt_at=?, last_error=NULL WHERE id=?",
+                    (str(path), path.name, row["sha256"], row["size"],
+                     datetime.now(timezone.utc).isoformat(), job_id))
         conn.commit()
         audit(conn, "delivery_submitted", order_id, f"job={job_id}")
         return job_id

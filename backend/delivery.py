@@ -19,6 +19,10 @@ DEFAULT_MAX_ATTEMPTS = int(os.getenv("DELIVERY_MAX_ATTEMPTS", "10"))
 DEFAULT_UPLOADS_DIR = Path(os.getenv("UPLOAD_DIR", "/app/uploads"))
 _UPLOADS_DIR = DEFAULT_UPLOADS_DIR
 
+ROLE_SOURCE = "source"
+ROLE_RESULT = "result"
+ROLE_INFO = "info"
+
 
 def set_uploads_dir(path: Path) -> None:
     global _UPLOADS_DIR
@@ -34,6 +38,7 @@ CREATE TABLE IF NOT EXISTS delivery_jobs (
     id TEXT PRIMARY KEY,
     order_id INTEGER NOT NULL REFERENCES orders(id),
     kind TEXT NOT NULL CHECK(kind IN ('file', 'info', 'admin_email', 'paid_email')),
+    artifact_role TEXT,
     local_path TEXT,
     original_name TEXT,
     remote_path TEXT,
@@ -76,7 +81,7 @@ def sha256_file(path: Path) -> str:
 def enqueue(conn: sqlite3.Connection, *, order_id: int, kind: str,
             local_path: str | None = None, original_name: str | None = None,
             remote_path: str | None = None, sha256: str | None = None,
-            size: int | None = None) -> str:
+            size: int | None = None, artifact_role: str | None = None) -> str:
     job_id = uuid.uuid4().hex
     now = utc_now()
     if kind in ("admin_email", "paid_email"):
@@ -85,13 +90,24 @@ def enqueue(conn: sqlite3.Connection, *, order_id: int, kind: str,
     else:
         cleanup_state = "pending"
         cleanup_phase = "pending"
-    conn.execute(
-        "INSERT OR IGNORE INTO delivery_jobs "
-        "(id, order_id, kind, local_path, original_name, remote_path, content_sha256, "
-        "content_size, next_attempt_at, created_at, cleanup_state, cleanup_phase) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (job_id, order_id, kind, local_path, original_name, remote_path, sha256, size, now, now, cleanup_state, cleanup_phase),
-    )
+    # artifact_role is explicitly set by callers (create_order: source, submit_delivery: result)
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(delivery_jobs)").fetchall()}
+    if "artifact_role" in cols:
+        conn.execute(
+            "INSERT OR IGNORE INTO delivery_jobs "
+            "(id, order_id, kind, artifact_role, local_path, original_name, remote_path, content_sha256, "
+            "content_size, next_attempt_at, created_at, cleanup_state, cleanup_phase) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (job_id, order_id, kind, artifact_role, local_path, original_name, remote_path, sha256, size, now, now, cleanup_state, cleanup_phase),
+        )
+    else:
+        conn.execute(
+            "INSERT OR IGNORE INTO delivery_jobs "
+            "(id, order_id, kind, local_path, original_name, remote_path, content_sha256, "
+            "content_size, next_attempt_at, created_at, cleanup_state, cleanup_phase) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (job_id, order_id, kind, local_path, original_name, remote_path, sha256, size, now, now, cleanup_state, cleanup_phase),
+        )
     if kind == "paid_email":
         conn.execute("INSERT OR IGNORE INTO paid_email_outbox(order_id,state,updated_at) VALUES(?,'pending',?)", (order_id, now))
     return job_id
@@ -120,9 +136,12 @@ def claim_due(db_path: Path, max_attempts: int = DEFAULT_MAX_ATTEMPTS) -> dict |
             WHERE state='sending' AND EXISTS (SELECT 1 FROM delivery_jobs j
                 WHERE j.kind='paid_email' AND j.order_id=paid_email_outbox.order_id
                 AND (j.lease_until IS NULL OR j.lease_until<=?))""", (now, now))
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(delivery_jobs)").fetchall()}
+        role_predicate = "(kind != 'file' OR COALESCE(artifact_role, '') != 'source')" if "artifact_role" in cols else "(kind != 'file' OR remote_path LIKE '%_result.bin')"
         row = conn.execute(
             "SELECT * FROM delivery_jobs WHERE "
             "COALESCE(remote_path,'') NOT LIKE 'remote/%' AND "
+            f"{role_predicate} AND "
             "((state IN ('pending', 'failed') AND attempts < ? AND next_attempt_at <= ?) OR "
             "(state = 'processing' AND attempts < ? AND lease_until <= ?)) "
             "AND (kind NOT IN ('file','info','paid_email') OR EXISTS "
@@ -314,14 +333,22 @@ def perform_job_cleanup(
     token = None
     try:
         conn.execute("BEGIN IMMEDIATE")
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(delivery_jobs)").fetchall()}
+        has_role = "artifact_role" in cols
         job = conn.execute(
             "SELECT id, order_id, kind, local_path, content_sha256, content_size, state, "
-            "cleanup_state, cleanup_phase, cleanup_attempts, cleanup_lease_until, cleanup_error "
-            "FROM delivery_jobs WHERE id=?",
+            "cleanup_state, cleanup_phase, cleanup_attempts, cleanup_lease_until, cleanup_error"
+            + (", artifact_role" if has_role else "") +
+            " FROM delivery_jobs WHERE id=?",
             (job_id,),
         ).fetchone()
 
         if not job:
+            conn.commit()
+            return False
+
+        # Invariant C: source copies must never be deleted by normal delivery cleanup
+        if has_role and job["artifact_role"] == "source" and job["cleanup_phase"] != "deleting":
             conn.commit()
             return False
 
@@ -676,9 +703,11 @@ def process_due_cleanups(
         cols = {row[1] for row in conn.execute("PRAGMA table_info(delivery_jobs)").fetchall()}
         if "cleanup_state" not in cols:
             return 0
+        role_predicate = "AND (kind != 'file' OR COALESCE(artifact_role, '') != 'source')" if "artifact_role" in cols else "AND (kind != 'file' OR remote_path LIKE '%_result.bin')"
         rows = conn.execute(
             "SELECT id FROM delivery_jobs "
             "WHERE state='delivered' AND kind IN ('file', 'info') "
+            f"{role_predicate} "
             # Eligibility, not just permission: an unpaid order's source must be
             # retained, so it must never occupy a slot in the sweep window.
             # Without this predicate a backlog of older unpaid jobs keeps
