@@ -6,10 +6,10 @@ Requires=docker.service
 
 [Service]
 Type=oneshot
-# Dry-run first: replace with the live command only after reviewing the audit rows.
-# Live:  --hours 72
+# The first manual run must be a dry run: `--dry-run` prints the plan without touching files.
+# The timer itself runs live; enable it only after that review and the owner's approval.
 ExecStart=/usr/bin/docker exec photodoc-pr22-private-backend-1 \
-    python /app/retention.py --hours 72 --dry-run
+    python /app/retention.py --hours 72
 StandardOutput=journal
 StandardError=journal
 Nice=10

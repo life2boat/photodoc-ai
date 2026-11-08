@@ -54,6 +54,11 @@ def add_job(db: Path, uploads: Path, *, order_id: int, age_hours: float, state: 
 
 def audit_actions(db: Path) -> list[str]:
     with sqlite3.connect(db) as conn:
+        exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='retention_audit'"
+        ).fetchone()
+        if not exists:
+            return []
         return [row[0] for row in conn.execute("SELECT action FROM retention_audit ORDER BY id")]
 
 
@@ -167,8 +172,8 @@ def test_second_run_is_idempotent(store):
 
     assert first["deleted"] == 1
     assert second["deleted"] == 0
-    assert second["skipped_missing"] == 1
     assert not path.exists()
+    assert audit_actions(db) == ["deleting", "deleted"]
 
 
 def test_dry_run_reports_without_deleting(store):
@@ -187,7 +192,7 @@ def test_orphan_scan_removes_unreferenced_old_file(store):
     db, uploads = store
     add_order(db, 9, "unpaid")
     add_job(db, uploads, order_id=9, age_hours=1)
-    orphan = uploads / "9_orphan.jpg"
+    orphan = uploads / "9_orphan.part"
     orphan.write_bytes(b"orphan")
     old = (NOW - timedelta(hours=100)).timestamp()
     import os

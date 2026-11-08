@@ -496,6 +496,35 @@ def update_order_payment_pending(order_id: int, amount: str) -> str:
 
 
 @retry_busy
+def _flag_missing_sources(conn, order_id: int) -> None:
+    """A paid order must never look processable when its source files are gone.
+
+    Retention deletes the source of an order that stayed unpaid past its window; if the
+    provider confirms a payment for such an order afterwards, the money is real and the
+    order must stay visible instead of silently waiting for a file that no longer exists.
+    """
+    rows = conn.execute(
+        "SELECT id, local_path, state FROM delivery_jobs "
+        "WHERE order_id = ? AND kind IN ('file', 'info')",
+        (order_id,),
+    ).fetchall()
+    missing = [row[0] for row in rows
+               if row[2] != "delivered" and row[1] and not Path(row[1]).exists()]
+    if not missing:
+        return
+    for job_id in missing:
+        conn.execute(
+            "UPDATE delivery_jobs SET last_error = 'SourceMissingAtPayment' WHERE id = ?",
+            (job_id,),
+        )
+    logging.critical(
+        "Late payment for order #%s: %s source file(s) are missing; the order needs a "
+        "manual resolution (deliver from another source or refund).",
+        order_id,
+        len(missing),
+    )
+
+
 def mark_order_paid(order_id: int, amount: str) -> bool:
     """
     Atomically transitions order to 'paid' status using a conditional UPDATE.
@@ -516,6 +545,7 @@ def mark_order_paid(order_id: int, amount: str) -> bool:
         )
         if cursor.rowcount == 1:
             enqueue(conn, order_id=order_id, kind="paid_email")
+            _flag_missing_sources(conn, order_id)
             conn.commit()
             return True
         conn.commit()
