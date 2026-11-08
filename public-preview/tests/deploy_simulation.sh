@@ -80,7 +80,7 @@ run_rollback() {
   LINK="$SB/nginx/sites-enabled/photodoc" BLOCKED_SITE="$SB/nginx/sites-available/photodoc.tls" \
   MARKER="$SB/DEPLOYMENT_BLOCKED" \
   NGINX_BIN="$WORK/bin/nginx" SYSTEMCTL_BIN="$WORK/bin/systemctl" CURL_BIN="$WORK/bin/curl" \
-  PUBLIC_IP=127.0.0.1 bash "$ROLLBACK" >"$SB/log" 2>&1
+  PUBLIC_IP=127.0.0.1 SITE_ROOT="/srv/photodoc/public-preview" bash "$ROLLBACK" >"$SB/log" 2>&1
 }
 target() { readlink -f "$SB/nginx/sites-enabled/photodoc" 2>/dev/null || true; }
 
@@ -138,6 +138,34 @@ if [ "$(target)" = "$SB/nginx/sites-available/included.conf" ]; then
   bad "include previous: configuration with include was reactivated"
 else
   ok "include previous: configuration with include NOT reactivated"
+fi
+
+echo "== rollback: previous config exposing /uploads via alias (M-04) =="
+sandbox candidate
+printf 'server { location /uploads/ { alias /srv/photodoc/uploads/; } }\n' > "$SB/nginx/sites-available/alias.conf"
+ln -sfn "$SB/nginx/sites-available/alias.conf" "$SB/nginx/sites-enabled/photodoc"
+printf '1' > "$SB/broken"
+SIM_BROKEN_BLOCKED="$SB/broken" run_rollback
+rc=$?
+[ "$rc" -ne 0 ] && ok "M-04 alias: exit nonzero" || bad "M-04 alias: exit 0"
+if [ "$(target)" = "$SB/nginx/sites-available/alias.conf" ]; then
+  bad "M-04 alias: configuration exposing /uploads was reactivated"
+else
+  ok "M-04 alias: configuration exposing /uploads NOT reactivated"
+fi
+
+echo "== rollback: previous config with a foreign root (M-04) =="
+sandbox candidate
+printf 'server { root /etc; }\n' > "$SB/nginx/sites-available/root.conf"
+ln -sfn "$SB/nginx/sites-available/root.conf" "$SB/nginx/sites-enabled/photodoc"
+printf '1' > "$SB/broken"
+SIM_BROKEN_BLOCKED="$SB/broken" run_rollback
+rc=$?
+[ "$rc" -ne 0 ] && ok "M-04 root: exit nonzero" || bad "M-04 root: exit 0"
+if [ "$(target)" = "$SB/nginx/sites-available/root.conf" ]; then
+  bad "M-04 root: foreign root was reactivated"
+else
+  ok "M-04 root: foreign root NOT reactivated"
 fi
 
 echo "== rollback: broken blocked + SAFE previous =="

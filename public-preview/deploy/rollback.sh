@@ -22,6 +22,7 @@ PUBLIC_IP="${PUBLIC_IP:-127.0.0.1}"
 NGINX_BIN="${NGINX_BIN:-nginx}"
 SYSTEMCTL_BIN="${SYSTEMCTL_BIN:-systemctl}"
 CURL_BIN="${CURL_BIN:-curl}"
+SITE_ROOT="${SITE_ROOT:-/srv/photodoc/public-preview}"
 BLOCKED_PATHS=(/ /services /api/health)
 FORBIDDEN_PATHS=(/api/health /api/payment/create /api/payment/robokassa/result /order-status /admin /uploads/1_x.jpg)
 
@@ -47,8 +48,11 @@ verify_no_backend_exposure() {
     local path code
     for path in "${FORBIDDEN_PATHS[@]}"; do
         code=$(http_code "$path")
-        [ "$code" != "200" ] || { log "  $path -> $code (backend exposure)"; return 1; }
-        log "  $path -> $code (not exposed)"
+        # M-04: a redirect is not proof of isolation — only 404/503 are acceptable here.
+        case "$code" in
+            404|503) log "  $path -> $code (not exposed)" ;;
+            *) log "  $path -> $code (exposure or redirect; refusing)"; return 1 ;;
+        esac
     done
     return 0
 }
@@ -73,8 +77,20 @@ is_safe_config() {
         case "$line" in
             \#*) continue ;;
         esac
-        if printf '%s\n' "$line" | grep -Eq '(^|[[:space:]])(proxy_pass|fastcgi_pass|uwsgi_pass|scgi_pass|grpc_pass|include)[[:space:]]'; then
+        if printf '%s\n' "$line" | grep -Eq '(^|[[:space:]])(proxy_pass|fastcgi_pass|uwsgi_pass|scgi_pass|grpc_pass|include|alias)[[:space:]]'; then
             return 1
+        fi
+        # M-04: a root outside the published site directory would expose arbitrary paths.
+        if printf '%s\n' "$line" | grep -Eq '(^|[[:space:]])root[[:space:]]+[^;]+;'; then
+            local root_path
+            root_path=$(printf '%s\n' "$line" | sed -E 's/.*root[[:space:]]+([^;]+);.*/\1/')
+            # Only the deployment tree may be served; anything else (/etc, /var, ...) is
+            # an arbitrary file read and must never be reactivated.
+            case "$root_path" in
+                /srv/photodoc/*) ;;          # deployment tree
+                /var/www/certbot) ;;         # ACME webroot only
+                *) return 1 ;;
+            esac
         fi
     done < "$resolved"
     return 0
