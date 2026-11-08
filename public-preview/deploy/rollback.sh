@@ -1,11 +1,17 @@
 #!/usr/bin/env bash
 # Roll the public site back to the blocked HTTPS 503 configuration — fail closed.
 #
-# Only one target is accepted: the known maintenance site that answers 503. The script
-# never follows a previous-target file and never restores an arbitrary configuration, so a
-# stray backup cannot reopen the backend. Success is asserted from the public entry point:
-# every check must return 503, otherwise the previous link is restored and the script exits
-# nonzero.
+# Only the approved maintenance configuration is a trusted target. Recovery after a failed
+# rollback never reactivates a partially published site blindly and never restores a
+# configuration that can proxy to the backend:
+#
+#   * a previous configuration is restored only when it passes a structural safety check
+#     (regular file inside the approved directory, no active proxy_pass/fastcgi_pass/
+#     uwsgi_pass/scgi_pass/grpc_pass, no include that could pull one in);
+#   * every recovery step is validated against the public entry point — either HTTPS 503 or
+#     "no backend exposure" (forbidden API routes must never answer 200);
+#   * a failed nginx reload is reported as an unknown loaded state, never as success;
+#   * the script exits nonzero whenever the blocked state cannot be confirmed.
 set -euo pipefail
 
 LINK="${LINK:-/etc/nginx/sites-enabled/photodoc}"
@@ -17,6 +23,7 @@ NGINX_BIN="${NGINX_BIN:-nginx}"
 SYSTEMCTL_BIN="${SYSTEMCTL_BIN:-systemctl}"
 CURL_BIN="${CURL_BIN:-curl}"
 BLOCKED_PATHS=(/ /services /api/health)
+FORBIDDEN_PATHS=(/api/health /api/payment/create /api/payment/robokassa/result /order-status /admin /uploads/1_x.jpg)
 
 log() { printf '%s\n' "$*"; }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
@@ -36,22 +43,98 @@ verify_blocked() {
     return 0
 }
 
+verify_no_backend_exposure() {
+    local path code
+    for path in "${FORBIDDEN_PATHS[@]}"; do
+        code=$(http_code "$path")
+        [ "$code" != "200" ] || { log "  $path -> $code (backend exposure)"; return 1; }
+        log "  $path -> $code (not exposed)"
+    done
+    return 0
+}
+
+# Structural safety of a candidate recovery configuration. This is deliberately stricter
+# than a text search: it rejects every directive that can hand a request to another
+# process, and rejects includes, because an included file could carry such a directive.
+is_safe_config() {
+    local candidate="$1" resolved config_dir lineno line
+    [ -n "$candidate" ] || return 1
+    [ -e "$candidate" ] || return 1
+    resolved=$(readlink -f "$candidate" 2>/dev/null || true)
+    [ -n "$resolved" ] || return 1
+    [ -f "$resolved" ] || return 1
+    config_dir=$(dirname "$(readlink -f "$BLOCKED_SITE" 2>/dev/null || printf '%s' "$BLOCKED_SITE")")
+    case "$resolved" in
+        "$config_dir"/*) ;;
+        *) return 1 ;;
+    esac
+    grep -Eq '(^|[[:space:]])(server[[:space:]]*\{)' "$resolved" || return 1
+    while IFS= read -r line; do
+        case "$line" in
+            \#*) continue ;;
+        esac
+        if printf '%s\n' "$line" | grep -Eq '(^|[[:space:]])(proxy_pass|fastcgi_pass|uwsgi_pass|scgi_pass|grpc_pass|include)[[:space:]]'; then
+            return 1
+        fi
+    done < "$resolved"
+    return 0
+}
+
 PREVIOUS_TARGET=""
 CHANGED=0
+RECOVERED=0
 
-restore_previous() {
-    if [ -n "$PREVIOUS_TARGET" ]; then
-        ln -sfn "$PREVIOUS_TARGET" "$LINK"
+reload_nginx() {
+    if ! "$SYSTEMCTL_BIN" reload nginx; then
+        log "  nginx reload failed; the loaded configuration is unknown"
+        return 1
     fi
+    return 0
+}
+
+# Fail-closed recovery. Never restores an unsafe configuration.
+recover() {
+    [ "$RECOVERED" -eq 1 ] && return 0
+    RECOVERED=1
+
+    log "== recovery: restoring the blocked configuration =="
+    ln -sfn "$BLOCKED_SITE" "$LINK"
+    if ! "$NGINX_BIN" -t >/dev/null 2>&1; then
+        "$NGINX_BIN" -t || true
+        log "  the blocked configuration does not pass nginx -t; nothing was activated"
+        return 0
+    fi
+    if ! reload_nginx; then
+        log "  blocked state is on disk but not confirmed in nginx"
+        return 0
+    fi
+    if verify_blocked; then
+        log "  blocked state confirmed"
+        return 0
+    fi
+
+    log "== recovery: blocked configuration does not answer 503 =="
+    if is_safe_config "$PREVIOUS_TARGET"; then
+        log "  previous configuration passed the safety check: $PREVIOUS_TARGET"
+        ln -sfn "$PREVIOUS_TARGET" "$LINK"
+        if "$NGINX_BIN" -t >/dev/null 2>&1 && reload_nginx && verify_no_backend_exposure; then
+            log "  published site restored; backend is not exposed; blocked state NOT confirmed"
+            return 0
+        fi
+    else
+        log "  previous configuration is missing, outside the approved directory or can proxy to the backend; it was NOT restored"
+    fi
+
+    log "  leaving the blocked configuration on disk; the effective state is unknown"
+    ln -sfn "$BLOCKED_SITE" "$LINK"
     "$NGINX_BIN" -t >/dev/null 2>&1 || true
-    "$SYSTEMCTL_BIN" reload nginx >/dev/null 2>&1 || true
+    return 0
 }
 
 on_exit() {
     local status=$?
     if [ "$status" -ne 0 ] && [ "$CHANGED" -eq 1 ]; then
-        log "Restoring the previous link after a failed check"
-        restore_previous
+        recover || true
     fi
     exit "$status"
 }
@@ -63,10 +146,8 @@ log "  safety marker present"
 
 [ -f "$BLOCKED_SITE" ] || die "blocked configuration not found: $BLOCKED_SITE"
 grep -q 'return 503' "$BLOCKED_SITE" || die "$BLOCKED_SITE does not contain a 503 response"
-if grep -Eq '(^|[[:space:]])proxy_pass[[:space:]]' "$BLOCKED_SITE"; then
-    die "$BLOCKED_SITE contains proxy_pass; refusing to use it as the blocked target"
-fi
-log "  blocked configuration verified (503, no proxy_pass)"
+is_safe_config "$BLOCKED_SITE" || die "$BLOCKED_SITE contains backend proxying or an include; refusing to use it"
+log "  blocked configuration verified (503, no backend proxying)"
 
 PREVIOUS_TARGET=$(readlink -f "$LINK" 2>/dev/null || true)
 log "  current target: ${PREVIOUS_TARGET:-<none>}"
@@ -85,15 +166,15 @@ ln -sfn "$BLOCKED_SITE" "$LINK"
 CHANGED=1
 if ! "$NGINX_BIN" -t >/dev/null 2>&1; then
     "$NGINX_BIN" -t || true
-    die "blocked configuration failed nginx -t; previous link restored"
+    die "blocked configuration failed nginx -t"
 fi
 log "  nginx -t passed"
 
-"$SYSTEMCTL_BIN" reload nginx || die "nginx reload failed"
+reload_nginx || die "nginx reload failed; the blocked state is not confirmed"
 
 log "== 3. verify the blocked state from the public entry point =="
 if ! verify_blocked; then
-    die "rollback verification failed; previous link will be restored"
+    die "rollback verification failed"
 fi
 CHANGED=0
 log "== rolled back: HTTPS 503 confirmed =="
