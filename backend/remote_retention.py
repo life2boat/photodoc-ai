@@ -104,7 +104,9 @@ def purge(
     """Delete owned remote files, recovering interrupted intents on the way."""
     current = now or datetime.now(timezone.utc)
     now_iso = _iso(current)
-    conn.executescript(SCHEMA)
+    if not dry_run:
+        # M-01: a dry run is a read-only planning mode and must not create schema.
+        conn.executescript(SCHEMA)
 
     summary: dict[str, Any] = {
         "dry_run": dry_run, "ttl_hours": ttl_hours, "root": root,
@@ -112,7 +114,7 @@ def purge(
         "recovered": 0, "skipped_unowned": 0, "errors": [],
     }
 
-    pending = conn.execute(
+    pending = [] if dry_run else conn.execute(
         "SELECT remote_path, order_id, attempts FROM remote_deletion_audit "
         "WHERE state='intent' AND (next_attempt_at IS NULL OR next_attempt_at <= ?)",
         (now_iso,),
@@ -120,7 +122,7 @@ def purge(
     summary["recovered"] = len(pending)
 
     planned = plan_candidates(jobs or [], now=current, root=root, ttl_hours=ttl_hours)
-    known = {row[0] for row in conn.execute("SELECT remote_path FROM remote_deletion_audit")}
+    known = set() if dry_run else {row[0] for row in conn.execute("SELECT remote_path FROM remote_deletion_audit")}
     candidates = [(row[0], row[1], row[2]) for row in pending]
     candidates += [(item["remote_path"], item["order_id"], 0) for item in planned
                    if item["remote_path"] not in known]

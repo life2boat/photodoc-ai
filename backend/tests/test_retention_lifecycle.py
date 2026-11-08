@@ -18,6 +18,15 @@ NOW = datetime(2026, 11, 8, 12, 0, tzinfo=timezone.utc)
 ROOT = "PhotoDoc_AI"
 
 
+def table_rows(conn, name):
+    """Rows in a table, or 0 when the table does not exist (dry-run must not create it)."""
+    exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
+    ).fetchone()
+    return 0 if not exists else conn.execute(f"SELECT COUNT(*) FROM {name}").fetchone()[0]
+
+
+
 class FakeDisk:
     def __init__(self, script=None):
         self.calls = []
@@ -97,7 +106,7 @@ def test_dry_run_plans_without_calling_or_writing(db):
                                 dry_run=True)
     assert result["planned"] == 1
     assert client.calls == []
-    assert db.execute("SELECT COUNT(*) FROM remote_deletion_audit").fetchone()[0] == 0
+    assert table_rows(db, "remote_deletion_audit") == 0, "dry run must not create the audit table"
 
 
 def test_unowned_path_is_refused(db):
@@ -293,4 +302,4 @@ def test_dry_run_writes_nothing(tmp_path):
     conn.commit()
 
     paid_hold.flag_escalations(conn, now=NOW, dry_run=True)
-    assert conn.execute("SELECT COUNT(*) FROM paid_hold_audit").fetchone()[0] == 0
+    assert table_rows(conn, "paid_hold_audit") == 0, "dry run must not create or write the audit table"

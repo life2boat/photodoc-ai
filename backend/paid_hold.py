@@ -76,7 +76,9 @@ def flag_escalations(
     """Record holds and escalate those past the window. Never deletes anything."""
     current = now or datetime.now(timezone.utc)
     now_iso = _iso(current)
-    conn.executescript(SCHEMA)
+    if not dry_run:
+        # M-01: escalation planning is read-only and must not create schema.
+        conn.executescript(SCHEMA)
     holds = list_holds(conn, now=current, hold_hours=hold_hours)
 
     summary = {"hold_hours": hold_hours, "dry_run": dry_run, "watching": 0,
@@ -116,7 +118,10 @@ def flag_escalations(
 
 def operator_queue(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     """Orders a human must resolve: deliver the files or refund the payment."""
-    conn.executescript(SCHEMA)
+    if not conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='paid_hold_audit'"
+    ).fetchone():
+        return []
     rows = conn.execute(
         "SELECT order_id, job_id, first_seen_at, age_hours, escalated_at, note "
         "FROM paid_hold_audit WHERE state='escalated' ORDER BY age_hours DESC"

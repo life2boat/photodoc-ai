@@ -1379,7 +1379,12 @@ async def robokassa_result(request: Request, background_tasks: BackgroundTasks):
     signature = payload.get("SignatureValue")
 
     if not out_sum or inv_id is None or not signature:
-        logging.error("Result URL: Отсутствуют обязательные параметры payload=%s", payload)
+        # M-05: never log the raw callback — a sender controls those fields and may embed
+        # contact data, tokens or signatures. Only the field names are safe.
+        logging.error(
+            "Result URL: отсутствуют обязательные параметры; получены поля: %s",
+            sorted(payload.keys()),
+        )
         raise HTTPException(status_code=400, detail="Missing Robokassa payload")
 
     try:

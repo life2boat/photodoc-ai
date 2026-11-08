@@ -214,7 +214,14 @@ def test_two_workers_do_not_report_spurious_unlink_failure(store, monkeypatch):
 
     def concurrent_unlink(self, *args, **kwargs):
         if self == path:
-            both_at_unlink.wait()
+            # The barrier is a harness device, not a system invariant: a fast worker may
+            # legitimately remove the file before the other reaches this point, in which
+            # case the loser skips the unlink. A timeout must not turn into a test error;
+            # the real assertions are the single deletion and the absence of errors.
+            try:
+                both_at_unlink.wait()
+            except threading.BrokenBarrierError:
+                pass
         return original_unlink(self, *args, **kwargs)
 
     def run():
