@@ -25,8 +25,9 @@ for _k in ("NO_PROXY", "no_proxy"):
     if _k in os.environ and "::1" in os.environ[_k] and "[::1]" not in os.environ[_k]:
         os.environ[_k] = os.environ[_k].replace("::1", "")
 
+import operator_workflow as operator_service
 from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks, HTTPException, Request
-from fastapi.responses import PlainTextResponse, JSONResponse
+from fastapi.responses import PlainTextResponse, JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -1484,3 +1485,57 @@ async def robokassa_success(request: Request):
         "status": "paid" if is_paid else "pending",
         "message": "Оплата подтверждена" if is_paid else "Ожидание подтверждения от платежной системы",
     })
+
+# ---------------------------------------------------------------------------
+# Operator workflow (contract PHOTODOC-R1-OPERATOR-CONTRACT 1.0).
+# Every route authenticates independently; without OPERATOR_TOKEN the whole
+# surface answers 503 and nothing is reachable.
+# ---------------------------------------------------------------------------
+
+def _require_operator(request: Request) -> None:
+    operator_service.require_operator(request.headers.get("authorization"))
+
+
+@app.get("/api/operator/orders")
+def operator_orders(request: Request):
+    _require_operator(request)
+    return {"ok": True, "orders": operator_service.list_paid_orders(DB_PATH)}
+
+
+@app.get("/api/operator/orders/{order_id}")
+def operator_order(order_id: int, request: Request):
+    _require_operator(request)
+    return {"ok": True, "order": operator_service.order_metadata(DB_PATH, order_id)}
+
+
+@app.get("/api/operator/orders/{order_id}/source")
+def operator_source(order_id: int, request: Request):
+    _require_operator(request)
+    path = operator_service.source_for_download(DB_PATH, order_id)
+    # M-03: a protected photograph must never be cached by a browser or a proxy.
+    return FileResponse(path, media_type="application/octet-stream", filename=path.name,
+                        headers={"Cache-Control": "no-store, private"})
+
+
+@app.post("/api/operator/orders/{order_id}/result")
+async def operator_upload_result(order_id: int, request: Request,
+                                 file: UploadFile = File(...), replace: bool = False):
+    _require_operator(request)
+    payload = operator_service.read_limited(file)      # M-06: bounded read
+    suffix, sha256 = operator_service.validate_result(file, payload)
+    stored = operator_service.store_result(DB_PATH, order_id, suffix, payload, sha256, replace=replace)
+    return {"ok": True, "order_id": order_id, "bytes": len(payload), "sha256": sha256[:16]}
+
+
+@app.post("/api/operator/orders/{order_id}/submit")
+def operator_submit(order_id: int, request: Request):
+    _require_operator(request)
+    job_id = operator_service.submit_delivery(DB_PATH, order_id)
+    return {"ok": True, "order_id": order_id, "job_id": job_id}
+
+
+@app.get("/api/operator/orders/{order_id}/delivery")
+def operator_delivery(order_id: int, request: Request):
+    _require_operator(request)
+    return {"ok": True, "order_id": order_id,
+            "jobs": operator_service.delivery_state(DB_PATH, order_id)}

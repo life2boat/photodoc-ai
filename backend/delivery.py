@@ -122,6 +122,7 @@ def claim_due(db_path: Path, max_attempts: int = DEFAULT_MAX_ATTEMPTS) -> dict |
                 AND (j.lease_until IS NULL OR j.lease_until<=?))""", (now, now))
         row = conn.execute(
             "SELECT * FROM delivery_jobs WHERE "
+            "COALESCE(remote_path,'') NOT LIKE 'remote/%' AND "
             "((state IN ('pending', 'failed') AND attempts < ? AND next_attempt_at <= ?) OR "
             "(state = 'processing' AND attempts < ? AND lease_until <= ?)) "
             "AND (kind NOT IN ('file','info','paid_email') OR EXISTS "
