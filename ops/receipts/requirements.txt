@@ -1,0 +1,2 @@
+# Install into a dedicated host virtual environment; never into the backend image.
+cryptography>=46.0,<47

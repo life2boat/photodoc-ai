@@ -1,0 +1,20 @@
+{
+  "ledger_root": "/var/lib/photodoc/receipts",
+  "export_dir": "/var/lib/photodoc/receipts/exports",
+  "app_db": "/OWNER-INSPECTED/ACTUAL/app.db",
+  "uploads_root": "/OWNER-INSPECTED/ACTUAL/uploads",
+  "application_id": 1346650441,
+  "instance_uuid": "00000000000040008000000000000000",
+  "epoch_id": "00000000000040008000000000000000",
+  "db_dev": 0,
+  "db_ino": 0,
+  "uploads_dev": 0,
+  "uploads_ino": 0,
+  "private_key_file": "/etc/photodoc/receipt-signing.key",
+  "public_key_files": {
+    "owner-key-v1": "/etc/photodoc/receipt-signing.pub"
+  },
+  "key_id": "owner-key-v1",
+  "submit_uid": 1000,
+  "audit_uid": 0
+}

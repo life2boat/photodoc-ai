@@ -1,0 +1,11 @@
+[Unit]
+Description=Ежедневный запуск очистки по сроку хранения PhotoDoc AI
+
+[Timer]
+OnCalendar=*-*-* 03:15:00
+Persistent=true
+RandomizedDelaySec=15m
+Unit=photodoc-retention.service
+
+[Install]
+WantedBy=timers.target
