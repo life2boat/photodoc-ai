@@ -16,9 +16,10 @@ from pathlib import Path
 from datetime import datetime
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from typing import List, Optional
+from typing import Any, List, Optional
 
 import httpx
+import json
 
 # Sanitize NO_PROXY on Windows against httpx unbracketed IPv6 ::1 parser issue
 for _k in ("NO_PROXY", "no_proxy"):
@@ -26,7 +27,11 @@ for _k in ("NO_PROXY", "no_proxy"):
         os.environ[_k] = os.environ[_k].replace("::1", "")
 
 import operator_workflow as operator_service
-from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks, HTTPException, Request
+import consents
+import retention_worker
+import backup_rotation
+import log_rotation
+from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks, HTTPException, Request, Query
 from fastapi.responses import PlainTextResponse, JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -120,20 +125,79 @@ def validate_staging_delivery_safety():
             )
 
 
+def validate_rotation_safety() -> None:
+    """Validate backup and log rotation configurations at application startup (M-03).
+
+    Fails closed with RuntimeError on invalid parameters or path safety violations
+    without exposing credentials or sensitive tokens in error messages.
+    """
+    if os.getenv("BACKUP_ROTATION_ENABLED", "0") == "1":
+        backup_dir = os.getenv("BACKUP_DIR")
+        if not backup_dir:
+            raise RuntimeError("BACKUP_ROTATION_ENABLED is 1 but BACKUP_DIR is not set")
+        try:
+            backup_rotation.validate_backup_dir_safety(backup_dir)
+            retention_days = int(os.getenv("BACKUP_RETENTION_DAYS", str(backup_rotation.DEFAULT_RETENTION_DAYS)))
+            keep_min = int(os.getenv("BACKUP_KEEP_MIN", str(backup_rotation.DEFAULT_KEEP_MIN)))
+            max_age_env = os.getenv("BACKUP_MAX_AGE_DAYS")
+            max_age = int(max_age_env) if max_age_env else None
+            backup_rotation.validate_backup_rotation_params(retention_days, keep_min, max_age)
+        except ValueError as err:
+            raise RuntimeError(f"Backup rotation configuration safety violation: {err}") from err
+
+    if os.getenv("LOG_ROTATION_VERIFICATION_ENABLED", "0") == "1":
+        log_dir = os.getenv("LOG_DIR")
+        if not log_dir:
+            raise RuntimeError("LOG_ROTATION_VERIFICATION_ENABLED is 1 but LOG_DIR is not set")
+        try:
+            log_rotation.validate_log_dir_safety(log_dir)
+            max_days = int(os.getenv("LOG_RETENTION_MAX_DAYS", str(log_rotation.DEFAULT_LOG_RETENTION_DAYS)))
+            if max_days > 15:
+                raise RuntimeError(
+                    f"Log retention policy violation: LOG_RETENTION_MAX_DAYS ({max_days}) "
+                    f"exceeds public policy commitment of 15 days (152FZ_PACKAGE.md:17)"
+                )
+            result = log_rotation.verify_log_retention_policy(log_dir, max_days=max_days, dry_run=True)
+            if not result["ok"]:
+                raise RuntimeError(
+                    f"Log retention policy failure: {result['expired']} expired log files found exceeding {max_days} days"
+                )
+        except ValueError as err:
+            raise RuntimeError(f"Log rotation configuration safety violation: {err}") from err
+
+
 @asynccontextmanager
 async def lifespan(_app):
+    validate_rotation_safety()
     stop = threading.Event()
     thread = None
     if os.getenv("DELIVERY_WORKER_ENABLED", "1") != "0":
         validate_staging_delivery_safety()
         thread = threading.Thread(target=worker_loop, args=(DB_PATH, deliver_job, stop), kwargs={"uploads_dir": UPLOAD_DIR}, daemon=True)
         thread.start()
+
+    retention_stop = threading.Event()
+    retention_thread = None
+    if os.getenv("RETENTION_WORKER_ENABLED", "0") == "1":
+        retention_worker.validate_retention_safety(DB_PATH, UPLOAD_DIR)
+        interval = float(os.getenv("RETENTION_WORKER_INTERVAL_SECONDS", "3600"))
+        retention_thread = threading.Thread(
+            target=retention_worker.retention_worker_loop,
+            args=(DB_PATH, retention_stop),
+            kwargs={"uploads_dir": UPLOAD_DIR, "interval_seconds": interval},
+            daemon=True,
+        )
+        retention_thread.start()
+
     try:
         yield
     finally:
         stop.set()
+        retention_stop.set()
         if thread is not None:
             thread.join(timeout=5)
+        if retention_thread is not None:
+            retention_thread.join(timeout=5)
 
 
 app = FastAPI(title="PhotoDoc AI API", lifespan=lifespan)
@@ -154,6 +218,17 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 set_uploads_dir(UPLOAD_DIR)
 
 
+def _parse_consent_flag(val: Any) -> bool:
+    if val is None:
+        return False
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, (int, float)):
+        return bool(val)
+    s = str(val).strip().lower()
+    return s in ("1", "true", "yes", "on")
+
+
 # --- Инициализация базы данных ---
 def init_db():
     """Create only a genuinely fresh DB; never bless an existing unknown DB."""
@@ -167,6 +242,9 @@ def init_db():
                 "run the controlled reconciliation migration"
             )
         paid_email_outbox.initialize(DB_PATH)
+        with sqlite3.connect(DB_PATH) as _c:
+            consents.initialize(_c)
+            retention_worker.initialize(_c)
         return
 
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -199,6 +277,12 @@ def init_db():
         )
         ''')
         for statement in DELIVERY_SCHEMA.split(";"):
+            if statement.strip():
+                conn.execute(statement)
+        for statement in consents.SCHEMA.split(";"):
+            if statement.strip():
+                conn.execute(statement)
+        for statement in retention_worker.SCHEMA.split(";"):
             if statement.strip():
                 conn.execute(statement)
         if read_application_id(conn) != APPLICATION_ID:
@@ -1191,9 +1275,72 @@ async def create_order(
     paper: str = Form("Не указана"),
     crop: str = Form("Не указано"),
     files: List[UploadFile] = File(...),
+    consent_service_terms: Optional[str] = Form(None),
+    consent_personal_data: Optional[str] = Form(None),
+    consent_third_party_images: Optional[str] = Form(None),
+    consent_minor_images: Optional[str] = Form(None),
+    consent_cross_border: Optional[str] = Form(None),
+    consent_doc_version: Optional[str] = Form(None),
+    consent_doc_hash: Optional[str] = Form(None),
+    consents_json: Optional[str] = Form(None),
 ):
     if not 1 <= len(files) <= MAX_FILES:
         raise HTTPException(status_code=400, detail="Invalid number of files")
+
+    parsed_json_consents = {}
+    if consents_json:
+        try:
+            parsed_json_consents = json.loads(consents_json)
+            if not isinstance(parsed_json_consents, dict):
+                raise ValueError("consents_json must be an object")
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid consents_json: {exc}")
+
+    st_flag = _parse_consent_flag(consent_service_terms) or _parse_consent_flag(
+        parsed_json_consents.get("service_terms")
+    )
+    pd_flag = _parse_consent_flag(consent_personal_data) or _parse_consent_flag(
+        parsed_json_consents.get("personal_data_processing")
+    )
+    tp_flag = _parse_consent_flag(consent_third_party_images) or _parse_consent_flag(
+        parsed_json_consents.get("third_party_images")
+    )
+    minor_flag = _parse_consent_flag(consent_minor_images) or _parse_consent_flag(
+        parsed_json_consents.get("minor_images")
+    )
+    cb_flag = _parse_consent_flag(consent_cross_border) or _parse_consent_flag(
+        parsed_json_consents.get("cross_border_transfer")
+    )
+
+    doc_ver = (consent_doc_version or parsed_json_consents.get("doc_version") or "").strip() or None
+    doc_hash = (consent_doc_hash or parsed_json_consents.get("doc_hash") or "").strip() or None
+
+    if consents.feature_enabled():
+        if not st_flag or not pd_flag:
+            raise HTTPException(
+                status_code=400,
+                detail="Mandatory consents (service terms and personal data processing) are required",
+            )
+        if tp_flag and not consents.DOCUMENTS[consents.PURPOSE_THIRD_PARTY_IMAGES].get("approved", False):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Consent for {consents.PURPOSE_THIRD_PARTY_IMAGES} is blocked pending legal approval",
+            )
+        if minor_flag and not consents.DOCUMENTS[consents.PURPOSE_MINOR_IMAGES].get("approved", False):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Consent for {consents.PURPOSE_MINOR_IMAGES} is blocked pending legal approval",
+            )
+        if cb_flag and not consents.DOCUMENTS[consents.PURPOSE_CROSS_BORDER].get("approved", False):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Consent for {consents.PURPOSE_CROSS_BORDER} is blocked pending legal approval",
+            )
+        if doc_ver and not consents.verify_document_version(consents.PURPOSE_SERVICE, doc_ver):
+            raise HTTPException(status_code=400, detail="Invalid consent document version")
+        if doc_hash and not consents.verify_document_hash(consents.PURPOSE_SERVICE, doc_hash):
+            raise HTTPException(status_code=400, detail="Invalid consent document hash")
+
     amount = format_robokassa_amount(calculate_authoritative_price(format, paper, crop, len(files)))
     staged = []
     finalized = []
@@ -1219,6 +1366,36 @@ async def create_order(
              amount, amount, datetime.utcnow().isoformat(), token_hash),
         )
         order_id = cursor.lastrowid
+
+        if consents.feature_enabled() or st_flag or pd_flag:
+            consents.record_consent(
+                conn,
+                order_ref=str(order_id),
+                purpose=consents.PURPOSE_SERVICE,
+                expected_hash=doc_hash,
+                expected_version=doc_ver,
+                auto_commit=False,
+            )
+            consents.record_consent(
+                conn,
+                order_ref=str(order_id),
+                purpose=consents.PURPOSE_PERSONAL_DATA,
+                expected_version=doc_ver,
+                auto_commit=False,
+            )
+            missing = consents.check_required(
+                conn,
+                str(order_id),
+                has_third_party_images=tp_flag,
+                has_minor_images=minor_flag,
+                requires_cross_border=cb_flag,
+            )
+            if missing:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Missing required consents: {', '.join(missing)}",
+                )
+
         folder = _join_yandex_path(
             get_yandex_disk_root(), f"Заказ_{order_id}_{_folder_component(name)}",
             f"{_folder_component(format)}_{_folder_component(paper)}_{_folder_component(crop)}",
@@ -1263,6 +1440,23 @@ async def create_order(
     finally:
         if conn is not None:
             conn.close()
+
+
+@app.get("/api/order/{order_id}/consents")
+async def get_order_consents(order_id: int, order_token: str = Query(...)):
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    try:
+        row = conn.execute(
+            "SELECT order_token_hash FROM orders WHERE id=?", (order_id,)
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Order not found")
+        expected_hash = hashlib.sha256(order_token.encode("utf-8")).hexdigest()
+        if not hmac.compare_digest(row[0], expected_hash):
+            raise HTTPException(status_code=403, detail="Forbidden: invalid order token")
+        return {"order_id": order_id, "consents": consents.evidence(conn, str(order_id))}
+    finally:
+        conn.close()
 
 
 # --- Эндпоинты платежной системы Robokassa ---

@@ -109,9 +109,13 @@ jobs:
           echo "Resolving workflow conflict explicitly in favor of PR #37 consolidated workflow"
           git -C "$REPO_ROOT" checkout HEAD -- .github/workflows/playwright.yml
           git -C "$REPO_ROOT" add .github/workflows/playwright.yml
-          git -C "$REPO_ROOT" commit -m "chore(ci): cleanly integrate PR #34"
+          if [ -n "$(git -C "$REPO_ROOT" status --porcelain)" ]; then
+            git -C "$REPO_ROOT" commit -m "chore(ci): cleanly integrate PR #34"
+          fi
         else
-          git -C "$REPO_ROOT" commit -m "chore(ci): cleanly integrate PR #34"
+          if [ -n "$(git -C "$REPO_ROOT" status --porcelain)" ]; then
+            git -C "$REPO_ROOT" commit -m "chore(ci): cleanly integrate PR #34"
+          fi
         fi
 
         echo "==> Installing ops dependencies if introduced by PR #34..."
@@ -133,9 +137,13 @@ jobs:
           echo "Resolving workflow conflict explicitly in favor of PR #37 consolidated workflow"
           git -C "$REPO_ROOT" checkout HEAD -- .github/workflows/playwright.yml
           git -C "$REPO_ROOT" add .github/workflows/playwright.yml
-          git -C "$REPO_ROOT" commit -m "chore(ci): cleanly integrate PR #35"
+          if [ -n "$(git -C "$REPO_ROOT" status --porcelain)" ]; then
+            git -C "$REPO_ROOT" commit -m "chore(ci): cleanly integrate PR #35"
+          fi
         else
-          git -C "$REPO_ROOT" commit -m "chore(ci): cleanly integrate PR #35"
+          if [ -n "$(git -C "$REPO_ROOT" status --porcelain)" ]; then
+            git -C "$REPO_ROOT" commit -m "chore(ci): cleanly integrate PR #35"
+          fi
         fi
 
         echo "==> Running combined test suites across all PRs:"
@@ -160,6 +168,13 @@ jobs:
                tests/test_delivery_concurrency.py \
                tests/test_migration_cleanup_backfill.py \
                tests/test_migration_reconciliation.py -v
+
+        echo "6. Stage 2 remediated tests (H-02, H-05, M-02, M-03)"
+        pytest tests/test_consent_order_flow.py \
+               tests/test_retention_worker.py \
+               tests/test_rotation_safety_enforcement.py \
+               tests/test_stage2_customer_journey.py -v
+
 
   docker-build:
     name: Docker Build

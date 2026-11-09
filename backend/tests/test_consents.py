@@ -87,3 +87,45 @@ def test_document_hash_changes_with_the_text(db, monkeypatch):
     original = consents.document_hash(consents.PURPOSE_SERVICE)
     monkeypatch.setitem(consents.DOCUMENTS[consents.PURPOSE_SERVICE], "text", "Изменённый текст")
     assert consents.document_hash(consents.PURPOSE_SERVICE) != original
+
+
+def test_m02_canonical_document_hashes_match_approved():
+    assert consents.document_hash(consents.PURPOSE_SERVICE) == consents.CANONICAL_OFFER_HASH
+    assert consents.document_hash(consents.PURPOSE_PERSONAL_DATA) == consents.CANONICAL_PRIVACY_HASH
+    assert consents.verify_document_hash(consents.PURPOSE_SERVICE, consents.CANONICAL_OFFER_HASH)
+    assert consents.verify_document_hash(consents.PURPOSE_PERSONAL_DATA, consents.CANONICAL_PRIVACY_HASH)
+    assert not consents.verify_document_hash(consents.PURPOSE_SERVICE, "deadbeef" * 8)
+
+
+def test_m02_conditional_purposes_are_blocked_pending_approval(db):
+    for cond_purpose in consents.CONDITIONAL_PURPOSES:
+        assert consents.DOCUMENTS[cond_purpose]["approved"] is False
+        assert consents.DOCUMENTS[cond_purpose]["legal_status"] == "BLOCKED_PENDING_LEGAL_APPROVAL"
+        with pytest.raises(ValueError, match="(?i)BLOCKED_PENDING_LEGAL_APPROVAL"):
+            consents.record_consent(db, order_ref="ord-blocked", purpose=cond_purpose)
+
+
+
+def test_m02_record_consent_validates_hash_and_version(db):
+    # Valid hash and version succeed
+    rec = consents.record_consent(
+        db, order_ref="ord-v", purpose=consents.PURPOSE_SERVICE,
+        expected_hash=consents.CANONICAL_OFFER_HASH,
+        expected_version="2026-11-08",
+    )
+    assert rec["document_hash"] == consents.CANONICAL_OFFER_HASH
+
+    # Hash mismatch fails
+    with pytest.raises(ValueError, match="document hash mismatch"):
+        consents.record_consent(
+            db, order_ref="ord-v", purpose=consents.PURPOSE_SERVICE,
+            expected_hash="0000000000000000000000000000000000000000000000000000000000000000",
+        )
+
+    # Version mismatch fails
+    with pytest.raises(ValueError, match="document version mismatch"):
+        consents.record_consent(
+            db, order_ref="ord-v", purpose=consents.PURPOSE_SERVICE,
+            expected_version="1999-01-01",
+        )
+

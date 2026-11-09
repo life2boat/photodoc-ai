@@ -59,6 +59,38 @@ def list_backups(backup_dir: Path, patterns: tuple[str, ...] = DEFAULT_PATTERNS)
     return sorted(entries, key=lambda item: item.stat().st_mtime, reverse=True)
 
 
+def validate_backup_rotation_params(
+    retention_days: int,
+    keep_min: int,
+    max_age_days: int | None = None,
+) -> None:
+    """Validate rotation parameters against safety bounds."""
+    if retention_days <= 0:
+        raise ValueError(f"retention_days must be > 0 (got {retention_days})")
+    if keep_min < 0:
+        raise ValueError(f"keep_min must be >= 0 (got {keep_min})")
+    if max_age_days is not None:
+        if max_age_days < retention_days:
+            raise ValueError(
+                f"max_age_days ({max_age_days}) cannot be less than retention_days ({retention_days})"
+            )
+
+
+def validate_backup_dir_safety(backup_dir: Path | str) -> Path:
+    """Strict validation for backup directory: exists, dir, not symlink, not root."""
+    path = Path(backup_dir)
+    if ".." in path.parts:
+        raise ValueError(f"Path traversal detected in backup directory: {backup_dir}")
+    if path.is_symlink():
+        raise ValueError(f"Backup directory cannot be a symlink: {backup_dir}")
+    if not path.is_dir():
+        raise ValueError(f"Backup directory does not exist or is not a directory: {backup_dir}")
+    resolved = path.resolve()
+    if resolved == resolved.parent:
+        raise ValueError(f"Backup directory cannot be filesystem root: {backup_dir}")
+    return resolved
+
+
 def rotate(
     backup_dir: Path,
     *,
@@ -70,8 +102,10 @@ def rotate(
     dry_run: bool = False,
 ) -> dict[str, Any]:
     """Remove expired backups, keeping the newest ``keep_min`` entries."""
+    validate_backup_rotation_params(retention_days=retention_days, keep_min=keep_min, max_age_days=max_age_days)
     if not backup_dir.is_dir():
         return {"ok": False, "reason": "backup directory does not exist", "removed": [], "kept": 0}
+    backup_dir = validate_backup_dir_safety(backup_dir)
 
     current = now or datetime.now(timezone.utc)
     cutoff = current - timedelta(days=retention_days)
