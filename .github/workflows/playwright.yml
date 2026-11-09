@@ -80,7 +80,7 @@ jobs:
         git config user.name "github-actions[bot]"
         git config user.email "github-actions[bot]@users.noreply.github.com"
         git fetch origin feat/retention-final
-        git merge --no-edit origin/feat/retention-final
+        git merge -X ours --no-edit origin/feat/retention-final
         pytest tests/test_retention_adversarial.py -k test_parent_symlink_replacement_cannot_delete_outside_uploads -v
         pytest tests/test_retention_recovery.py \
                tests/test_retention.py \
