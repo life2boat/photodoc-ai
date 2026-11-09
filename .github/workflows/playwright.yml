@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [ main, master, fix/p1-order-delivery-hardening, feat/p1-auto-photo-cleanup, infra/r4-prebuilt-staging-images, infra/r4-safe-staging-bootstrap, audit/r4-integrated-privacy-retention, fix/r4-backup-privacy-audit, fix/r4-archive-audit-hardening, fix/r4-audit-boundary-hardening, fix/r4-owner-authorized-archive-replacement, fix/r4-transaction-safe-archive-replacement, fix/r4-commit-failure-recovery ]
+    branches: [ main, master, fix/p1-order-delivery-hardening, feat/p1-auto-photo-cleanup, infra/r4-prebuilt-staging-images, infra/r4-safe-staging-bootstrap, audit/r4-integrated-privacy-retention, fix/r4-backup-privacy-audit, fix/r4-archive-audit-hardening, fix/r4-audit-boundary-hardening, fix/r4-owner-authorized-archive-replacement, fix/r4-transaction-safe-archive-replacement, fix/r4-commit-failure-recovery, fix/photodoc-r1-source-lifecycle-integration ]
   pull_request:
-    branches: [ main, master, fix/p0-production-readiness, infra/r2-public-https-preflight, feat/p1-auto-photo-cleanup, infra/r4-prebuilt-staging-images, infra/r4-safe-staging-bootstrap, audit/r4-integrated-privacy-retention, fix/r4-backup-privacy-audit, fix/r4-archive-audit-hardening, fix/r4-audit-boundary-hardening, fix/r4-owner-authorized-archive-replacement, fix/r4-transaction-safe-archive-replacement, fix/r4-commit-failure-recovery ]
+    branches: [ main, master, fix/p0-production-readiness, infra/r2-public-https-preflight, feat/p1-auto-photo-cleanup, infra/r4-prebuilt-staging-images, infra/r4-safe-staging-bootstrap, audit/r4-integrated-privacy-retention, fix/r4-backup-privacy-audit, fix/r4-archive-audit-hardening, fix/r4-audit-boundary-hardening, fix/r4-owner-authorized-archive-replacement, fix/r4-transaction-safe-archive-replacement, fix/r4-commit-failure-recovery, feat/operator-workflow ]
   workflow_dispatch:
 
 jobs:
@@ -53,6 +53,8 @@ jobs:
       ROBOKASSA_IS_TEST: "1"
     steps:
     - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
     - uses: actions/setup-python@v5
       with:
         python-version: "3.11"
@@ -66,6 +68,17 @@ jobs:
       run: |
         python ../scripts/production_preflight.py --db nonexistent.db || true
         python ../scripts/verify_staging_delivery_preflight.py
+    - name: Run combined retention protections (C-01/C-02) and Linux symlink protection
+      run: |
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+        git fetch origin feat/retention-final
+        git merge --no-edit origin/feat/retention-final
+        pytest tests/test_retention_adversarial.py -k test_parent_symlink_replacement_cannot_delete_outside_uploads -v
+        pytest tests/test_retention_recovery.py \
+               tests/test_retention.py \
+               tests/test_retention_adversarial.py \
+               tests/test_retention_payment_gate.py -v
 
   docker-build:
     name: Docker Build
