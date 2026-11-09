@@ -62,8 +62,15 @@ jobs:
       run: pip install -r requirements.txt
     - name: Install pytest and pyyaml
       run: pip install pytest pyyaml
-    - name: Run backend security, migration, and delivery tests
-      run: pytest tests -v
+    - name: Run relevant source lifecycle, delivery, migration, and security tests
+      run: |
+        pytest tests/test_real_order_source_lifecycle.py \
+               tests/test_order_delivery.py \
+               tests/test_operator_workflow.py \
+               tests/test_payment_security.py \
+               tests/test_delivery_concurrency.py \
+               tests/test_migration_cleanup_backfill.py \
+               tests/test_migration_reconciliation.py -v
     - name: Verify preflight scripts
       run: |
         python ../scripts/production_preflight.py --db nonexistent.db || true

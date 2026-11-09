@@ -28,6 +28,7 @@ def isolated(tmp_path, monkeypatch):
     uploads.mkdir()
     monkeypatch.setattr(main, "DB_PATH", db)
     monkeypatch.setattr(main, "UPLOAD_DIR", uploads)
+    monkeypatch.setenv("UPLOAD_DIR", str(uploads))
     monkeypatch.setenv("ROBOKASSA_MERCHANT_LOGIN", "test-merchant")
     monkeypatch.setenv("ROBOKASSA_PASSWORD1", "test-pass-1")
     monkeypatch.setenv("ROBOKASSA_PASSWORD2", "test-pass-2")
