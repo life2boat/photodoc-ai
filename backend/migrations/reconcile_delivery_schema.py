@@ -62,6 +62,7 @@ def reconcile(db_path: Path, apply: bool = False, uploads_dir: Path | None = Non
             "order_token_hash" not in columns
             or table is None
             or not REQUIRED_CLEANUP_COLUMNS <= delivery_cols
+            or "artifact_role" not in delivery_cols
             or not {"idx_delivery_due", "idx_cleanup_due", "idx_paid_email_once", "idx_admin_email_once"} <= indexes
             or unrepaired_count > 0
         )
@@ -88,6 +89,36 @@ def reconcile(db_path: Path, apply: bool = False, uploads_dir: Path | None = Non
                     conn.execute("ALTER TABLE delivery_jobs ADD COLUMN cleanup_attempts INTEGER NOT NULL DEFAULT 0")
                 if "cleanup_lease_until" not in delivery_cols:
                     conn.execute("ALTER TABLE delivery_jobs ADD COLUMN cleanup_lease_until TEXT")
+                if "artifact_role" not in delivery_cols:
+                    conn.execute("ALTER TABLE delivery_jobs ADD COLUMN artifact_role TEXT")
+
+                # Backfill artifact_role for existing rows
+                has_order_results = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='order_results'"
+                ).fetchone() is not None
+                if has_order_results:
+                    conn.execute(
+                        "UPDATE delivery_jobs SET artifact_role = 'result' "
+                        "WHERE (artifact_role IS NULL OR artifact_role = '') AND kind = 'file' AND ("
+                        "  remote_path LIKE '%_result.bin' OR "
+                        "  EXISTS (SELECT 1 FROM order_results r WHERE r.order_id=delivery_jobs.order_id)"
+                        ")"
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE delivery_jobs SET artifact_role = 'result' "
+                        "WHERE (artifact_role IS NULL OR artifact_role = '') AND kind = 'file' AND ("
+                        "  remote_path LIKE '%_result.bin'"
+                        ")"
+                    )
+                conn.execute(
+                    "UPDATE delivery_jobs SET artifact_role = 'source' "
+                    "WHERE (artifact_role IS NULL OR artifact_role = '') AND kind = 'file' AND state != 'delivered'"
+                )
+                conn.execute(
+                    "UPDATE delivery_jobs SET artifact_role = 'info' "
+                    "WHERE (artifact_role IS NULL OR artifact_role = '') AND kind = 'info'"
+                )
 
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_cleanup_due ON delivery_jobs(state, cleanup_state, cleanup_lease_until)")
                 conn.execute("UPDATE delivery_jobs SET cleanup_state='not_applicable', cleanup_phase='none' WHERE kind NOT IN ('file', 'info')")

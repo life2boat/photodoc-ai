@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [ main, master, fix/p1-order-delivery-hardening, feat/p1-auto-photo-cleanup, infra/r4-prebuilt-staging-images, infra/r4-safe-staging-bootstrap, audit/r4-integrated-privacy-retention, fix/r4-backup-privacy-audit, fix/r4-archive-audit-hardening, fix/r4-audit-boundary-hardening, fix/r4-owner-authorized-archive-replacement, fix/r4-transaction-safe-archive-replacement, fix/r4-commit-failure-recovery ]
+    branches: [ main, master, fix/p1-order-delivery-hardening, feat/p1-auto-photo-cleanup, infra/r4-prebuilt-staging-images, infra/r4-safe-staging-bootstrap, audit/r4-integrated-privacy-retention, fix/r4-backup-privacy-audit, fix/r4-archive-audit-hardening, fix/r4-audit-boundary-hardening, fix/r4-owner-authorized-archive-replacement, fix/r4-transaction-safe-archive-replacement, fix/r4-commit-failure-recovery, fix/photodoc-r1-source-lifecycle-integration ]
   pull_request:
-    branches: [ main, master, fix/p0-production-readiness, infra/r2-public-https-preflight, feat/p1-auto-photo-cleanup, infra/r4-prebuilt-staging-images, infra/r4-safe-staging-bootstrap, audit/r4-integrated-privacy-retention, fix/r4-backup-privacy-audit, fix/r4-archive-audit-hardening, fix/r4-audit-boundary-hardening, fix/r4-owner-authorized-archive-replacement, fix/r4-transaction-safe-archive-replacement, fix/r4-commit-failure-recovery ]
+    branches: [ main, master, fix/p0-production-readiness, infra/r2-public-https-preflight, feat/p1-auto-photo-cleanup, infra/r4-prebuilt-staging-images, infra/r4-safe-staging-bootstrap, audit/r4-integrated-privacy-retention, fix/r4-backup-privacy-audit, fix/r4-archive-audit-hardening, fix/r4-audit-boundary-hardening, fix/r4-owner-authorized-archive-replacement, fix/r4-transaction-safe-archive-replacement, fix/r4-commit-failure-recovery, feat/operator-workflow ]
   workflow_dispatch:
 
 jobs:
@@ -53,19 +53,113 @@ jobs:
       ROBOKASSA_IS_TEST: "1"
     steps:
     - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
     - uses: actions/setup-python@v5
       with:
         python-version: "3.11"
     - name: Install backend dependencies
       run: pip install -r requirements.txt
     - name: Install pytest and pyyaml
-      run: pip install pytest pyyaml
-    - name: Run backend security, migration, and delivery tests
-      run: pytest tests -v
+      run: |
+        pip install pytest pyyaml
+        # The PR-A A1 host tests import the host-side package under ops/, whose dependency
+        # is declared in ops/receipts/requirements.txt. That file does not exist on branches
+        # without A1, so the step stays a no-op there.
+        if [ -f ../ops/receipts/requirements.txt ]; then
+          pip install -r ../ops/receipts/requirements.txt
+        fi
+    - name: Run relevant source lifecycle, delivery, migration, and security tests
+      run: |
+        pytest tests/test_real_order_source_lifecycle.py \
+               tests/test_order_delivery.py \
+               tests/test_operator_workflow.py \
+               tests/test_payment_security.py \
+               tests/test_delivery_concurrency.py \
+               tests/test_migration_cleanup_backfill.py \
+               tests/test_migration_reconciliation.py -v
     - name: Verify preflight scripts
       run: |
         python ../scripts/production_preflight.py --db nonexistent.db || true
         python ../scripts/verify_staging_delivery_preflight.py
+    - name: Run reproducible multi-PR integration and combined test suite
+      run: |
+        set -eu
+        REPO_ROOT=$(git rev-parse --show-toplevel)
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+
+        PR34_HEAD="909eea829c69e72827fc578b34f774ba8b350e34"
+        PR35_HEAD="7e3291377c096e6656fdd153d9279537a6c9c822"
+
+        echo "==> Fetching exact heads for PR #34 ($PR34_HEAD) and PR #35 ($PR35_HEAD)..."
+        git -C "$REPO_ROOT" fetch origin "$PR34_HEAD" "$PR35_HEAD"
+
+        echo "==> Performing reproducible merge of PR #34 (retention)..."
+        if ! git -C "$REPO_ROOT" merge --no-ff --no-commit "$PR34_HEAD"; then
+          CONFLICTS=$(git -C "$REPO_ROOT" diff --name-only --diff-filter=U)
+          echo "Unmerged conflicts detected during PR #34 merge: $CONFLICTS"
+          for f in $CONFLICTS; do
+            if [ "$f" != ".github/workflows/playwright.yml" ]; then
+              echo "FATAL: Code conflict in $f - failing closed!"
+              git -C "$REPO_ROOT" merge --abort
+              exit 1
+            fi
+          done
+          echo "Resolving workflow conflict explicitly in favor of PR #37 consolidated workflow"
+          git -C "$REPO_ROOT" checkout HEAD -- .github/workflows/playwright.yml
+          git -C "$REPO_ROOT" add .github/workflows/playwright.yml
+          git -C "$REPO_ROOT" commit -m "chore(ci): cleanly integrate PR #34"
+        else
+          git -C "$REPO_ROOT" commit -m "chore(ci): cleanly integrate PR #34"
+        fi
+
+        echo "==> Installing ops dependencies if introduced by PR #34..."
+        if [ -f "$REPO_ROOT/ops/receipts/requirements.txt" ]; then
+          pip install -r "$REPO_ROOT/ops/receipts/requirements.txt"
+        fi
+
+        echo "==> Performing reproducible merge of PR #35 (consents)..."
+        if ! git -C "$REPO_ROOT" merge --no-ff --no-commit "$PR35_HEAD"; then
+          CONFLICTS=$(git -C "$REPO_ROOT" diff --name-only --diff-filter=U)
+          echo "Unmerged conflicts detected during PR #35 merge: $CONFLICTS"
+          for f in $CONFLICTS; do
+            if [ "$f" != ".github/workflows/playwright.yml" ]; then
+              echo "FATAL: Code conflict in $f - failing closed!"
+              git -C "$REPO_ROOT" merge --abort
+              exit 1
+            fi
+          done
+          echo "Resolving workflow conflict explicitly in favor of PR #37 consolidated workflow"
+          git -C "$REPO_ROOT" checkout HEAD -- .github/workflows/playwright.yml
+          git -C "$REPO_ROOT" add .github/workflows/playwright.yml
+          git -C "$REPO_ROOT" commit -m "chore(ci): cleanly integrate PR #35"
+        else
+          git -C "$REPO_ROOT" commit -m "chore(ci): cleanly integrate PR #35"
+        fi
+
+        echo "==> Running combined test suites across all PRs:"
+        echo "1. PR #34 Linux symlink protection"
+        pytest tests/test_retention_adversarial.py -k test_parent_symlink_replacement_cannot_delete_outside_uploads -v
+
+        echo "2. PR #34 Retention protections (C-01/C-02)"
+        pytest tests/test_retention_recovery.py \
+               tests/test_retention.py \
+               tests/test_retention_adversarial.py \
+               tests/test_retention_payment_gate.py -v
+
+        echo "3. PR #35 Consent evidence tests"
+        pytest tests/test_consents.py tests/test_consents_integrity.py -v
+
+        echo "4. PR #36 Operator workflow tests"
+        pytest tests/test_operator_workflow.py -v
+
+        echo "5. PR #37 Source lifecycle & delivery tests"
+        pytest tests/test_real_order_source_lifecycle.py \
+               tests/test_order_delivery.py \
+               tests/test_delivery_concurrency.py \
+               tests/test_migration_cleanup_backfill.py \
+               tests/test_migration_reconciliation.py -v
 
   docker-build:
     name: Docker Build

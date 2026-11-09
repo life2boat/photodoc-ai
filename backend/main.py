@@ -44,6 +44,8 @@ from yandex_paths import (
 )
 from delivery import (
     DELIVERY_SCHEMA,
+    ROLE_SOURCE,
+    ROLE_INFO,
     cleanup_orphaned_temporary_files,
     enqueue,
     perform_job_cleanup,
@@ -1199,7 +1201,7 @@ async def create_order(
             finalized.append(final_path)
             enqueue(conn, order_id=order_id, kind="file", local_path=str(final_path),
                     original_name=item["original_name"], remote_path=f"{folder}/{stored_name}",
-                    sha256=item["sha256"], size=item["size"])
+                    sha256=item["sha256"], size=item["size"], artifact_role=ROLE_SOURCE)
 
         info_path = UPLOAD_DIR / f"{order_id}_{uuid.uuid4().hex}_info.txt"
         info = order_info_bytes(order_id, name, phone, format, paper, crop, comment)
@@ -1210,7 +1212,7 @@ async def create_order(
         finalized.append(info_path)
         enqueue(conn, order_id=order_id, kind="info", local_path=str(info_path),
                 original_name="info.txt", remote_path=f"{folder}/info.txt",
-                sha256=hashlib.sha256(info).hexdigest(), size=len(info))
+                sha256=hashlib.sha256(info).hexdigest(), size=len(info), artifact_role=ROLE_INFO)
         enqueue(conn, order_id=order_id, kind="admin_email")
         commit_started = True
         conn.commit()
