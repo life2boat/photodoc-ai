@@ -85,6 +85,7 @@ jobs:
     - name: Run reproducible multi-PR integration and combined test suite
       run: |
         set -eu
+        REPO_ROOT=$(git rev-parse --show-toplevel)
         git config user.name "github-actions[bot]"
         git config user.email "github-actions[bot]@users.noreply.github.com"
 
@@ -92,49 +93,49 @@ jobs:
         PR35_HEAD="7e3291377c096e6656fdd153d9279537a6c9c822"
 
         echo "==> Fetching exact heads for PR #34 ($PR34_HEAD) and PR #35 ($PR35_HEAD)..."
-        git fetch origin "$PR34_HEAD" "$PR35_HEAD"
+        git -C "$REPO_ROOT" fetch origin "$PR34_HEAD" "$PR35_HEAD"
 
         echo "==> Performing reproducible merge of PR #34 (retention)..."
-        if ! git merge --no-ff --no-commit "$PR34_HEAD"; then
-          CONFLICTS=$(git diff --name-only --diff-filter=U)
+        if ! git -C "$REPO_ROOT" merge --no-ff --no-commit "$PR34_HEAD"; then
+          CONFLICTS=$(git -C "$REPO_ROOT" diff --name-only --diff-filter=U)
           echo "Unmerged conflicts detected during PR #34 merge: $CONFLICTS"
           for f in $CONFLICTS; do
             if [ "$f" != ".github/workflows/playwright.yml" ]; then
               echo "FATAL: Code conflict in $f - failing closed!"
-              git merge --abort
+              git -C "$REPO_ROOT" merge --abort
               exit 1
             fi
           done
           echo "Resolving workflow conflict explicitly in favor of PR #37 consolidated workflow"
-          git checkout HEAD -- .github/workflows/playwright.yml
-          git add .github/workflows/playwright.yml
-          git commit -m "chore(ci): cleanly integrate PR #34"
+          git -C "$REPO_ROOT" checkout HEAD -- .github/workflows/playwright.yml
+          git -C "$REPO_ROOT" add .github/workflows/playwright.yml
+          git -C "$REPO_ROOT" commit -m "chore(ci): cleanly integrate PR #34"
         else
-          git commit -m "chore(ci): cleanly integrate PR #34"
+          git -C "$REPO_ROOT" commit -m "chore(ci): cleanly integrate PR #34"
         fi
 
         echo "==> Installing ops dependencies if introduced by PR #34..."
-        if [ -f ../ops/receipts/requirements.txt ]; then
-          pip install -r ../ops/receipts/requirements.txt
+        if [ -f "$REPO_ROOT/ops/receipts/requirements.txt" ]; then
+          pip install -r "$REPO_ROOT/ops/receipts/requirements.txt"
         fi
 
         echo "==> Performing reproducible merge of PR #35 (consents)..."
-        if ! git merge --no-ff --no-commit "$PR35_HEAD"; then
-          CONFLICTS=$(git diff --name-only --diff-filter=U)
+        if ! git -C "$REPO_ROOT" merge --no-ff --no-commit "$PR35_HEAD"; then
+          CONFLICTS=$(git -C "$REPO_ROOT" diff --name-only --diff-filter=U)
           echo "Unmerged conflicts detected during PR #35 merge: $CONFLICTS"
           for f in $CONFLICTS; do
             if [ "$f" != ".github/workflows/playwright.yml" ]; then
               echo "FATAL: Code conflict in $f - failing closed!"
-              git merge --abort
+              git -C "$REPO_ROOT" merge --abort
               exit 1
             fi
           done
           echo "Resolving workflow conflict explicitly in favor of PR #37 consolidated workflow"
-          git checkout HEAD -- .github/workflows/playwright.yml
-          git add .github/workflows/playwright.yml
-          git commit -m "chore(ci): cleanly integrate PR #35"
+          git -C "$REPO_ROOT" checkout HEAD -- .github/workflows/playwright.yml
+          git -C "$REPO_ROOT" add .github/workflows/playwright.yml
+          git -C "$REPO_ROOT" commit -m "chore(ci): cleanly integrate PR #35"
         else
-          git commit -m "chore(ci): cleanly integrate PR #35"
+          git -C "$REPO_ROOT" commit -m "chore(ci): cleanly integrate PR #35"
         fi
 
         echo "==> Running combined test suites across all PRs:"
