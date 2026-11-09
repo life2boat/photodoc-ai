@@ -14,6 +14,7 @@ BACKEND = Path(__file__).resolve().parents[1]
 if str(BACKEND) not in sys.path:
     sys.path.insert(0, str(BACKEND))
 import main  # noqa: E402
+import operator_workflow as operator_service  # noqa: E402
 from delivery import claim_due, finish, process_due, utc_now  # noqa: E402
 from migrations.reconcile_delivery_schema import reconcile  # noqa: E402
 
@@ -108,30 +109,63 @@ def test_failed_partial_delivery_and_restart_retry_keep_sources(isolated):
     order_id = result["order_id"]
     with sqlite3.connect(db) as conn:
         conn.execute("UPDATE orders SET payment_status='paid' WHERE id=?", (order_id,))
+
+    # Contract invariant: original customer images are source artifacts
     initial = jobs(db, order_id)
     file_jobs = [job for job in initial if job["kind"] == "file"]
-    first_file = file_jobs[0]["id"]
+    assert len(file_jobs) == 2
+    assert all(job.get("artifact_role") == "source" for job in file_jobs)
+    assert all(job["state"] == "pending" for job in file_jobs)
+
+    # Contract invariant: payment does NOT trigger delivery of originals
+    claimed_before_result = claim_due(db)
+    if claimed_before_result:
+        assert claimed_before_result["kind"] != "file", "Raw source images must not be claimed for delivery"
+        with sqlite3.connect(db) as conn:
+            conn.execute("UPDATE delivery_jobs SET state='pending', attempts=0, lease_until=NULL WHERE id=?", (claimed_before_result["id"],))
+
+    # Contract invariant: only operator-submitted processed results are deliverable
+    result_bytes = b"\xff\xd8\xffsynthetic-processed-result"
+    result_sha = hashlib.sha256(result_bytes).hexdigest()
+    operator_service.store_result(db, order_id, "jpg", result_bytes, result_sha)
+    result_job_id = operator_service.submit_delivery(db, order_id)
+
     delivered = []
 
     def partial(job):
-        if job["id"] == first_file:
+        if job["id"] == result_job_id:
             delivered.append(job["id"])
         elif job["kind"] in ("file", "info"):
             raise TimeoutError("synthetic Yandex timeout")
 
     process_due(db, partial)
     current = jobs(db, order_id)
-    assert next(job for job in current if job["id"] == first_file)["state"] == "delivered"
+    assert next(job for job in current if job["id"] == result_job_id)["state"] == "delivered"
     assert any(job["state"] == "failed" for job in current)
-    assert all(Path(job["local_path"]).exists() for job in current if job["kind"] in ("file", "info"))
+
+    # Contract invariant: delivery cleanup must not delete the original
+    source_jobs = [job for job in current if job.get("artifact_role") == "source"]
+    assert len(source_jobs) == 2
+    assert all(job["state"] == "pending" for job in source_jobs)
+    assert all(Path(job["local_path"]).exists() for job in source_jobs)
+
+    # Contract invariant: source and result remain distinguishable
+    res_job = next(job for job in current if job["id"] == result_job_id)
+    assert res_job["artifact_role"] == "result"
+    assert res_job["state"] == "delivered"
 
     # Simulate a new backend process after its backoff elapsed: same persisted DB.
     with sqlite3.connect(db) as conn:
         conn.execute("UPDATE delivery_jobs SET next_attempt_at=? WHERE state='failed'", (utc_now(),))
     retried = []
     process_due(db, lambda job: retried.append(job["id"]))
-    assert len(retried) >= 2
-    assert all(job["state"] == "delivered" for job in jobs(db, order_id))
+    assert len(retried) >= 1
+
+    # Deliverable jobs reached delivered state; source jobs remain intact as pending inputs
+    final_jobs = jobs(db, order_id)
+    assert all(job["state"] == "delivered" for job in final_jobs if job.get("artifact_role") in ("result", "info"))
+    assert all(job["state"] == "pending" for job in final_jobs if job.get("artifact_role") == "source")
+    assert all(Path(job["local_path"]).exists() for job in final_jobs if job.get("artifact_role") == "source")
 
 
 def test_expired_lease_recovered_after_crash(isolated):
@@ -139,14 +173,30 @@ def test_expired_lease_recovered_after_crash(isolated):
     order_id = create(client).json()["order_id"]
     with sqlite3.connect(db) as conn:
         conn.execute("UPDATE orders SET payment_status='paid' WHERE id=?", (order_id,))
+
+    # Operator submits processed result
+    result_bytes = b"\xff\xd8\xffsynthetic-processed-result"
+    result_sha = hashlib.sha256(result_bytes).hexdigest()
+    operator_service.store_result(db, order_id, "jpg", result_bytes, result_sha)
+    result_job_id = operator_service.submit_delivery(db, order_id)
+
+    # Claim due deliverable task
     claimed = claim_due(db)
     assert claimed is not None
+    assert claimed.get("artifact_role") != "source", "Customer original must not be claimed"
+
     with sqlite3.connect(db) as conn:
         conn.execute("UPDATE delivery_jobs SET lease_until='2000-01-01T00:00:00+00:00' WHERE id=?", (claimed["id"],))
     seen = []
     process_due(db, lambda job: seen.append(job["id"]), limit=10)
     assert claimed["id"] in seen
-    assert all(job["state"] == "delivered" for job in jobs(db, order_id))
+
+    current_jobs = jobs(db, order_id)
+    # Deliverable tasks (result, info) reach delivered; customer source stays preserved as pending
+    assert all(job["state"] == "delivered" for job in current_jobs if job.get("artifact_role") in ("result", "info"))
+    source_job = next(job for job in current_jobs if job.get("artifact_role") == "source")
+    assert source_job["state"] == "pending"
+    assert Path(source_job["local_path"]).exists()
 
 
 def test_backend_startup_worker_resumes_persisted_jobs(isolated, monkeypatch):
@@ -154,15 +204,32 @@ def test_backend_startup_worker_resumes_persisted_jobs(isolated, monkeypatch):
     order_id = create(client).json()["order_id"]
     with sqlite3.connect(db) as conn:
         conn.execute("UPDATE orders SET payment_status='paid' WHERE id=?", (order_id,))
+
+    # Operator submits processed result
+    result_bytes = b"\xff\xd8\xffsynthetic-processed-result"
+    result_sha = hashlib.sha256(result_bytes).hexdigest()
+    operator_service.store_result(db, order_id, "jpg", result_bytes, result_sha)
+    result_job_id = operator_service.submit_delivery(db, order_id)
+
     seen = []
     monkeypatch.setenv("DELIVERY_WORKER_ENABLED", "1")
     with patch.object(main, "deliver_job", side_effect=lambda job: seen.append(job["id"])):
         with TestClient(main.app):
             deadline = time.monotonic() + 5
-            while time.monotonic() < deadline and any(job["state"] != "delivered" for job in jobs(db, order_id)):
+            while time.monotonic() < deadline and any(
+                job["state"] != "delivered" for job in jobs(db, order_id)
+                if job.get("artifact_role") in ("result", "info") or job["kind"] == "admin_email"
+            ):
                 time.sleep(0.05)
+    # 3 deliverable jobs: admin_email, info, result
     assert len(seen) == 3
-    assert all(job["state"] == "delivered" for job in jobs(db, order_id))
+    current_jobs = jobs(db, order_id)
+    # Deliverable tasks are delivered; source artifact was never claimed/delivered by worker
+    assert all(job["state"] == "delivered" for job in current_jobs if job["id"] in seen)
+    source_job = next(job for job in current_jobs if job.get("artifact_role") == "source")
+    assert source_job["id"] not in seen
+    assert source_job["state"] == "pending"
+    assert Path(source_job["local_path"]).exists()
 
 
 def test_wrong_token_foreign_order_underpayment_paid_terminal(isolated):
