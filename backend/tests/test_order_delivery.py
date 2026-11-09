@@ -214,6 +214,9 @@ def test_backend_startup_worker_resumes_persisted_jobs(isolated, monkeypatch):
 
     seen = []
     monkeypatch.setenv("DELIVERY_WORKER_ENABLED", "1")
+    monkeypatch.setenv("YANDEX_DISK_ROOT_DIR", "PhotoDoc_Staging_Test")
+    monkeypatch.setenv("YANDEX_DISK_STAGING_TOKEN", "synthetic_staging_token_valid")
+    monkeypatch.setenv("PHOTODOC_TEST_MOCK_TOKEN_ALLOWED", "1")
     with patch.object(main, "deliver_job", side_effect=lambda job: seen.append(job["id"])):
         with TestClient(main.app):
             deadline = time.monotonic() + 5
@@ -231,6 +234,19 @@ def test_backend_startup_worker_resumes_persisted_jobs(isolated, monkeypatch):
     assert source_job["id"] not in seen
     assert source_job["state"] == "pending"
     assert Path(source_job["local_path"]).exists()
+
+
+def test_staging_guard_rejects_production_root_when_worker_enabled(isolated, monkeypatch):
+    """Fail-closed staging guard: starting worker targeting production root in staging raises RuntimeError."""
+    client, db, _ = isolated
+    monkeypatch.setenv("PHOTODOC_STAGING", "1")
+    monkeypatch.setenv("DELIVERY_WORKER_ENABLED", "1")
+    monkeypatch.setenv("YANDEX_DISK_ROOT_DIR", "PhotoDoc_Orders")
+    monkeypatch.setenv("YANDEX_DISK_STAGING_TOKEN", "synthetic_staging_token_valid")
+    monkeypatch.setenv("PHOTODOC_TEST_MOCK_TOKEN_ALLOWED", "1")
+    with pytest.raises(RuntimeError, match="forbidden to target production root"):
+        with TestClient(main.app):
+            pass
 
 
 def test_wrong_token_foreign_order_underpayment_paid_terminal(isolated):
