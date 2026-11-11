@@ -75,9 +75,9 @@ def build_database(
     uploads_dir.mkdir(parents=True, exist_ok=True)
 
     saved = {name: os.environ.get(name) for name in
-             ("ROBOKASSA_MERCHANT_LOGIN", "ROBOKASSA_PASSWORD1", "ROBOKASSA_PASSWORD2",
+              ("ROBOKASSA_MERCHANT_LOGIN", "ROBOKASSA_PASSWORD1", "ROBOKASSA_PASSWORD2",
               "DELIVERY_WORKER_ENABLED", "YANDEX_DISK_ROOT_DIR", "SMTP_SERVER", "SMTP_USER",
-              "SMTP_PASSWORD", "EMAIL_TO")}
+              "SMTP_PASSWORD", "EMAIL_TO", "CONSENT_FEATURE_ENABLED")}
     original = (main.DB_PATH, main.UPLOAD_DIR)
     try:
         os.environ.update({
@@ -86,6 +86,7 @@ def build_database(
             "ROBOKASSA_PASSWORD2": PASSWORD2,
             "DELIVERY_WORKER_ENABLED": "0",
             "YANDEX_DISK_ROOT_DIR": "PhotoDoc_Synthetic",
+            "CONSENT_FEATURE_ENABLED": "1",
         })
         for name in ("SMTP_SERVER", "SMTP_USER", "SMTP_PASSWORD", "EMAIL_TO"):
             os.environ.pop(name, None)
@@ -98,8 +99,15 @@ def build_database(
         for index, (customer_name, data) in CUSTOMER_FILES.items():
             response = client.post(
                 "/api/order",
-                data={"name": f"Synthetic {index}", "phone": "+79990000000",
-                      "format": "10x15", "paper": "Matte", "crop": "None"},
+                data={
+                    "name": f"Synthetic {index}",
+                    "phone": "+79990000000",
+                    "format": "10x15",
+                    "paper": "Matte",
+                    "crop": "None",
+                    "consent_service_terms": "true",
+                    "consent_personal_data": "true",
+                },
                 files=[("files", (customer_name, data, "image/jpeg"))],
             )
             assert response.status_code == 200, response.text

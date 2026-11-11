@@ -29,8 +29,19 @@ def isolated(tmp_path, monkeypatch):
     monkeypatch.setenv("ROBOKASSA_PASSWORD1", "test-pass-1")
     monkeypatch.setenv("ROBOKASSA_PASSWORD2", "test-pass-2")
     monkeypatch.setenv("DELIVERY_WORKER_ENABLED", "0")
+    monkeypatch.setenv("CONSENT_FEATURE_ENABLED", "1")
     main.init_db()
-    yield TestClient(main.app), db, uploads
+    client = TestClient(main.app)
+    orig_post = client.post
+
+    def consent_post(url, *args, **kwargs):
+        if url == "/api/order" and "data" in kwargs and isinstance(kwargs["data"], dict):
+            kwargs["data"].setdefault("consent_service_terms", "true")
+            kwargs["data"].setdefault("consent_personal_data", "true")
+        return orig_post(url, *args, **kwargs)
+
+    client.post = consent_post
+    yield client, db, uploads
 
 
 def test_1_small_file_succeeds(isolated):

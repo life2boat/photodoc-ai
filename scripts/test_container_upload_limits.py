@@ -29,6 +29,9 @@ def encode_multipart_formdata(fields: dict[str, str], files: list[tuple[str, str
 
 
 def post_order(base_url: str, fields: dict[str, str], files: list[tuple[str, str, bytes, str]]) -> tuple[int, str]:
+    fields = dict(fields)
+    fields.setdefault("consent_service_terms", "true")
+    fields.setdefault("consent_personal_data", "true")
     url = f"{base_url.rstrip('/')}/api/order"
     body, content_type = encode_multipart_formdata(fields, files)
     req = urllib.request.Request(url, data=body, headers={"Content-Type": content_type}, method="POST")

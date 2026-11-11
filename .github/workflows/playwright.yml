@@ -51,6 +51,7 @@ jobs:
       ROBOKASSA_PASSWORD1: ci_pass1
       ROBOKASSA_PASSWORD2: ci_pass2
       ROBOKASSA_IS_TEST: "1"
+      CONSENT_FEATURE_ENABLED: "1"
     steps:
     - uses: actions/checkout@v4
       with:
@@ -234,6 +235,7 @@ jobs:
       PORT: 8080
       ROBOKASSA_IS_TEST: "1"
       DATABASE_PATH: /data/orders.db
+      CONSENT_FEATURE_ENABLED: "1"
     steps:
     - uses: actions/checkout@v4
     - name: Validate generic Docker Compose config
