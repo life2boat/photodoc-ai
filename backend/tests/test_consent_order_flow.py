@@ -40,7 +40,28 @@ def _dummy_file():
     return ("source.jpg", io.BytesIO(SOURCE_BYTES), "image/jpeg")
 
 
-def test_legacy_order_succeeds_when_consent_flag_disabled(monkeypatch):
+def test_order_rejected_when_flag_absent_and_no_consent(monkeypatch, setup_isolated_env):
+    """Test A: flag absent + no consent -> rejected (fail-closed)."""
+    monkeypatch.delenv(consents.FEATURE_FLAG, raising=False)
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/order",
+        data={
+            "name": "Иван Иванов",
+            "phone": "+79991234567",
+            "format": "DOC_3X4",
+            "paper": "Цифровая обработка",
+            "crop": "По стандарту документа",
+        },
+        files={"files": _dummy_file()},
+    )
+    assert response.status_code == 400
+    assert "consent enforcement system is not configured" in response.json()["detail"]
+
+
+def test_order_rejected_when_flag_disabled_and_no_consent(monkeypatch, setup_isolated_env):
+    """Test B: flag disabled ('0') + no consent -> rejected (fail-closed)."""
     monkeypatch.setenv(consents.FEATURE_FLAG, "0")
     client = TestClient(app)
 
@@ -55,10 +76,30 @@ def test_legacy_order_succeeds_when_consent_flag_disabled(monkeypatch):
         },
         files={"files": _dummy_file()},
     )
-    assert response.status_code == 200, response.text
-    data = response.json()
-    assert data["ok"] is True
-    assert "order_id" in data
+    assert response.status_code == 400
+    assert "consent enforcement system is not configured" in response.json()["detail"]
+
+
+def test_order_rejected_when_flag_absent_and_supplied_consent(monkeypatch, setup_isolated_env):
+    """Test C: flag absent + supplied consent -> rejected (fail-closed)."""
+    monkeypatch.delenv(consents.FEATURE_FLAG, raising=False)
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/order",
+        data={
+            "name": "Иван Иванов",
+            "phone": "+79991234567",
+            "format": "DOC_3X4",
+            "paper": "Цифровая обработка",
+            "crop": "По стандарту документа",
+            "consent_service_terms": "true",
+            "consent_personal_data": "true",
+        },
+        files={"files": _dummy_file()},
+    )
+    assert response.status_code == 400
+    assert "consent enforcement system is not configured" in response.json()["detail"]
 
 
 def test_order_rejected_when_consents_missing_and_feature_enabled(monkeypatch):
@@ -245,4 +286,60 @@ def test_order_with_consents_json_payload(monkeypatch):
     )
     assert response.status_code == 200, response.text
     assert response.json()["ok"] is True
+
+
+def test_failed_consent_validation_leaves_zero_orders_and_zero_files(monkeypatch, setup_isolated_env):
+    """Test G: failed consent validation leaves zero orders and zero orphaned customer files."""
+    monkeypatch.setenv(consents.FEATURE_FLAG, "1")
+    client = TestClient(app)
+
+    # 1. Attempt with invalid consent hash
+    resp_bad_hash = client.post(
+        "/api/order",
+        data={
+            "name": "Test Customer",
+            "phone": "+79990001122",
+            "format": "DOC_3X4",
+            "paper": "Цифровая обработка",
+            "crop": "По стандарту документа",
+            "consent_service_terms": "true",
+            "consent_personal_data": "true",
+            "consent_doc_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+        },
+        files={"files": _dummy_file()},
+    )
+    assert resp_bad_hash.status_code == 400
+
+    # 2. Attempt with unapproved purpose
+    resp_unapproved = client.post(
+        "/api/order",
+        data={
+            "name": "Test Customer 2",
+            "phone": "+79990001133",
+            "format": "DOC_3X4",
+            "paper": "Цифровая обработка",
+            "crop": "По стандарту документа",
+            "consent_service_terms": "true",
+            "consent_personal_data": "true",
+            "consent_third_party_images": "true",
+        },
+        files={"files": _dummy_file()},
+    )
+    assert resp_unapproved.status_code == 400
+
+    # 3. Verify absolute database and filesystem cleanliness:
+    # 0 orders, 0 consent_records, 0 delivery_jobs, 0 files in uploads directory
+    with sqlite3.connect(setup_isolated_env["db"]) as conn:
+        orders_count = conn.execute("SELECT COUNT(*) FROM orders").fetchone()[0]
+        assert orders_count == 0, f"Expected 0 orders, found {orders_count}"
+
+        consents_count = conn.execute("SELECT COUNT(*) FROM consent_records").fetchone()[0]
+        assert consents_count == 0, f"Expected 0 consent_records, found {consents_count}"
+
+        jobs_count = conn.execute("SELECT COUNT(*) FROM delivery_jobs").fetchone()[0]
+        assert jobs_count == 0, f"Expected 0 delivery_jobs, found {jobs_count}"
+
+    uploads_files = list(setup_isolated_env["uploads"].iterdir())
+    assert uploads_files == [], f"Expected 0 files in uploads, found {uploads_files}"
+
 

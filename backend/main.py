@@ -1315,31 +1315,36 @@ async def create_order(
     doc_ver = (consent_doc_version or parsed_json_consents.get("doc_version") or "").strip() or None
     doc_hash = (consent_doc_hash or parsed_json_consents.get("doc_hash") or "").strip() or None
 
-    if consents.feature_enabled():
-        if not st_flag or not pd_flag:
-            raise HTTPException(
-                status_code=400,
-                detail="Mandatory consents (service terms and personal data processing) are required",
-            )
-        if tp_flag and not consents.DOCUMENTS[consents.PURPOSE_THIRD_PARTY_IMAGES].get("approved", False):
-            raise HTTPException(
-                status_code=400,
-                detail=f"Consent for {consents.PURPOSE_THIRD_PARTY_IMAGES} is blocked pending legal approval",
-            )
-        if minor_flag and not consents.DOCUMENTS[consents.PURPOSE_MINOR_IMAGES].get("approved", False):
-            raise HTTPException(
-                status_code=400,
-                detail=f"Consent for {consents.PURPOSE_MINOR_IMAGES} is blocked pending legal approval",
-            )
-        if cb_flag and not consents.DOCUMENTS[consents.PURPOSE_CROSS_BORDER].get("approved", False):
-            raise HTTPException(
-                status_code=400,
-                detail=f"Consent for {consents.PURPOSE_CROSS_BORDER} is blocked pending legal approval",
-            )
-        if doc_ver and not consents.verify_document_version(consents.PURPOSE_SERVICE, doc_ver):
-            raise HTTPException(status_code=400, detail="Invalid consent document version")
-        if doc_hash and not consents.verify_document_hash(consents.PURPOSE_SERVICE, doc_hash):
-            raise HTTPException(status_code=400, detail="Invalid consent document hash")
+    if not consents.feature_enabled():
+        raise HTTPException(
+            status_code=400,
+            detail="Order creation is disabled: consent enforcement system is not configured",
+        )
+
+    if not st_flag or not pd_flag:
+        raise HTTPException(
+            status_code=400,
+            detail="Mandatory consents (service terms and personal data processing) are required",
+        )
+    if tp_flag and not consents.DOCUMENTS[consents.PURPOSE_THIRD_PARTY_IMAGES].get("approved", False):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Consent for {consents.PURPOSE_THIRD_PARTY_IMAGES} is blocked pending legal approval",
+        )
+    if minor_flag and not consents.DOCUMENTS[consents.PURPOSE_MINOR_IMAGES].get("approved", False):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Consent for {consents.PURPOSE_MINOR_IMAGES} is blocked pending legal approval",
+        )
+    if cb_flag and not consents.DOCUMENTS[consents.PURPOSE_CROSS_BORDER].get("approved", False):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Consent for {consents.PURPOSE_CROSS_BORDER} is blocked pending legal approval",
+        )
+    if doc_ver and not consents.verify_document_version(consents.PURPOSE_SERVICE, doc_ver):
+        raise HTTPException(status_code=400, detail="Invalid consent document version")
+    if doc_hash and not consents.verify_document_hash(consents.PURPOSE_SERVICE, doc_hash):
+        raise HTTPException(status_code=400, detail="Invalid consent document hash")
 
     amount = format_robokassa_amount(calculate_authoritative_price(format, paper, crop, len(files)))
     staged = []
@@ -1367,34 +1372,33 @@ async def create_order(
         )
         order_id = cursor.lastrowid
 
-        if consents.feature_enabled() or st_flag or pd_flag:
-            consents.record_consent(
-                conn,
-                order_ref=str(order_id),
-                purpose=consents.PURPOSE_SERVICE,
-                expected_hash=doc_hash,
-                expected_version=doc_ver,
-                auto_commit=False,
+        consents.record_consent(
+            conn,
+            order_ref=str(order_id),
+            purpose=consents.PURPOSE_SERVICE,
+            expected_hash=doc_hash,
+            expected_version=doc_ver,
+            auto_commit=False,
+        )
+        consents.record_consent(
+            conn,
+            order_ref=str(order_id),
+            purpose=consents.PURPOSE_PERSONAL_DATA,
+            expected_version=doc_ver,
+            auto_commit=False,
+        )
+        missing = consents.check_required(
+            conn,
+            str(order_id),
+            has_third_party_images=tp_flag,
+            has_minor_images=minor_flag,
+            requires_cross_border=cb_flag,
+        )
+        if missing:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Missing required consents: {', '.join(missing)}",
             )
-            consents.record_consent(
-                conn,
-                order_ref=str(order_id),
-                purpose=consents.PURPOSE_PERSONAL_DATA,
-                expected_version=doc_ver,
-                auto_commit=False,
-            )
-            missing = consents.check_required(
-                conn,
-                str(order_id),
-                has_third_party_images=tp_flag,
-                has_minor_images=minor_flag,
-                requires_cross_border=cb_flag,
-            )
-            if missing:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Missing required consents: {', '.join(missing)}",
-                )
 
         folder = _join_yandex_path(
             get_yandex_disk_root(), f"Заказ_{order_id}_{_folder_component(name)}",

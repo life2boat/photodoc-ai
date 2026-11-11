@@ -507,6 +507,7 @@ def test_fresh_db_order_creation_sets_created_at(temp_db, monkeypatch):
     import main
 
     monkeypatch.setattr(main, "DB_PATH", temp_db)
+    monkeypatch.setenv("CONSENT_FEATURE_ENABLED", "1")
     main.init_db()
 
     client = TestClient(main.app)
@@ -522,6 +523,8 @@ def test_fresh_db_order_creation_sets_created_at(temp_db, monkeypatch):
                 "paper": "Глянцевая",
                 "crop": "Без обрезки",
                 "comment": "Fresh order test",
+                "consent_service_terms": "true",
+                "consent_personal_data": "true",
             },
             files=[("files", ("test.jpg", b"\xff\xd8\xffsynthetic", "image/jpeg"))],
         )
@@ -600,6 +603,7 @@ def test_reconciled_db_order_creation_sets_created_at_and_preserves_old_null(tem
     reconcile_delivery(temp_db, apply=True)
     # Now create new order via API on the reconciled DB
     monkeypatch.setattr(main, "DB_PATH", temp_db)
+    monkeypatch.setenv("CONSENT_FEATURE_ENABLED", "1")
     client = TestClient(main.app)
 
     with patch("main.upload_to_yandex_disk"), patch("main.send_order_email"), patch("main.upload_info_to_yandex_disk"):
@@ -613,6 +617,8 @@ def test_reconciled_db_order_creation_sets_created_at_and_preserves_old_null(tem
                 "paper": "Матовая",
                 "crop": "Без обрезки",
                 "comment": "Reconciled order test",
+                "consent_service_terms": "true",
+                "consent_personal_data": "true",
             },
             files=[("files", ("new_doc.jpg", b"\xff\xd8\xffsynthetic", "image/jpeg"))],
         )

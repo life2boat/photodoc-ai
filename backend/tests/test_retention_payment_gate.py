@@ -14,10 +14,6 @@ from pathlib import Path
 
 import pytest
 
-_BOOT = tempfile.mkdtemp(prefix="pd-main-boot-")
-os.environ.setdefault("DATABASE_PATH", str(Path(_BOOT) / "boot.db"))
-os.environ.setdefault("PHOTODOC_ALLOW_FRESH_DB", "1")
-os.environ.setdefault("PHOTODOC_STAGING", "1")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 main = pytest.importorskip("main")
 
@@ -27,6 +23,8 @@ NOW = datetime(2026, 11, 8, 12, tzinfo=timezone.utc)
 @pytest.fixture
 def db(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "DB_PATH", tmp_path / "orders.db")
+    monkeypatch.setenv("PHOTODOC_ALLOW_FRESH_DB", "1")
+    monkeypatch.setenv("PHOTODOC_STAGING", "1")
     main.init_db()
     return main.DB_PATH
 

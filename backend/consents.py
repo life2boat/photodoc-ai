@@ -52,7 +52,7 @@ DOCUMENTS: dict[str, dict[str, Any]] = {
         "canonical_path": "public-preview/offer.html",
         "pinned_hash": CANONICAL_OFFER_HASH,
         "approved": True,
-        "legal_status": "APPROVED",
+        "legal_status": "DRAFT_PENDING_OWNER_LEGAL_FINALIZATION",
         "text": None,
     },
     PURPOSE_PERSONAL_DATA: {
@@ -61,7 +61,7 @@ DOCUMENTS: dict[str, dict[str, Any]] = {
         "canonical_path": "public-preview/privacy.html",
         "pinned_hash": CANONICAL_PRIVACY_HASH,
         "approved": True,
-        "legal_status": "APPROVED",
+        "legal_status": "DRAFT_PENDING_OWNER_LEGAL_FINALIZATION",
         "text": None,
     },
     PURPOSE_THIRD_PARTY_IMAGES: {

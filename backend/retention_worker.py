@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 import backup_rotation
+import log_rotation
 import paid_hold
 import retention
 
@@ -156,6 +157,7 @@ def run_retention_cycle(
     *,
     instance_id: str | None = None,
     backup_dir: Path | None = None,
+    log_dir: Path | None = None,
     now: datetime | None = None,
     dry_run: bool = False,
     lease_duration_seconds: int = 120,
@@ -219,12 +221,24 @@ def run_retention_cycle(
                 dry_run=dry_run,
             )
 
+        # Step 5: Application log rotation if enabled
+        log_rotation_summary: dict[str, Any] = {"purged": 0, "errors": []}
+        log_rotation_env_enabled = os.getenv("LOG_ROTATION_ENABLED", "0") == "1"
+        l_dir = log_dir or (Path(os.getenv("LOG_DIR")) if os.getenv("LOG_DIR") else None)
+        if log_rotation_env_enabled and l_dir and l_dir.is_dir():
+            log_rotation_summary = log_rotation.rotate_application_logs(
+                l_dir,
+                now=current,
+                dry_run=dry_run,
+            )
+
         cycle_end = (datetime.now(timezone.utc) if now is None else now).isoformat()
 
         errors_count = (
             len(expired_summary.get("errors", []))
             + len(quarantine_summary.get("errors", []))
             + len(rotation_summary.get("errors", []))
+            + len(log_rotation_summary.get("errors", []))
         )
 
         summary = {
@@ -236,6 +250,7 @@ def run_retention_cycle(
             "quarantine_purge": quarantine_summary,
             "paid_hold": hold_summary,
             "backup_rotation": rotation_summary,
+            "log_rotation": log_rotation_summary,
             "errors_count": errors_count,
         }
 
@@ -263,6 +278,7 @@ def run_retention_cycle(
                             "retention_hours": expired_summary.get("retention_hours"),
                             "held_paid": expired_summary.get("held_paid"),
                             "held_pending": expired_summary.get("held_pending"),
+                            "logs_purged": log_rotation_summary.get("purged", 0),
                         }),
                     ),
                 )
