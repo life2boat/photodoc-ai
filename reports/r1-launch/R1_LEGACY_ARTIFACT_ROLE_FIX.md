@@ -116,7 +116,7 @@ AMBIGUOUS_ARTIFACT_BEHAVIOR=Fail-closed assignment to quarantine role; worker de
 WORKER_PROTECTION=enqueue defaults file jobs to unknown; claim_due and process_due_cleanups strictly require artifact_role='result'; Invariant C protects source, quarantine, and unknown from file deletion
 REGRESSION_TESTS=10 new tests in backend/tests/test_legacy_artifact_role_migration.py covering classification, separation, quarantine, idempotence, self-healing, worker safety, and rollback; 224 backend tests passing locally and in CI
 LINUX_CI=GitHub Actions run 43002087208 all 4 jobs green (Combined Multi-PR Linux Tests, Payment Security Tests, Docker Build, Playwright Tests)
-PR38_NEW_HEAD=2dd1254343ab9ae622809216c10a8b9fae939b10
+PR38_NEW_HEAD=19ce6442385fa37883108fac6639e66fdc9378c2
 PRODUCTION_UNCHANGED=true
 FINAL_VERDICT=FIX_READY_FOR_INDEPENDENT_RECHECK
 ```
