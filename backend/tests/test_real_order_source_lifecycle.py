@@ -20,6 +20,7 @@ if str(BACKEND_DIR) not in sys.path:
 import pytest
 from fastapi.testclient import TestClient
 
+import consents
 import delivery
 import main
 import operator_workflow
@@ -61,6 +62,8 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setenv("SMTP_PASSWORD", "")
     monkeypatch.setenv("YANDEX_DISK_ROOT_DIR", "Synthetic_Orders")
     monkeypatch.setenv("CONSENT_FEATURE_ENABLED", "1")
+    monkeypatch.setitem(consents.DOCUMENTS[consents.PURPOSE_SERVICE], "approved", True)
+    monkeypatch.setitem(consents.DOCUMENTS[consents.PURPOSE_PERSONAL_DATA], "approved", True)
 
     main.init_db()
     client = TestClient(main.app)

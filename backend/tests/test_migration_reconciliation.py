@@ -25,6 +25,7 @@ BACKEND_DIR = Path(__file__).resolve().parent.parent
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
+import consents  # noqa: E402
 from migrations.reconcile_payment_schema import (  # noqa: E402
     EXPECTED_COLUMNS,
     get_existing_columns,
@@ -508,6 +509,8 @@ def test_fresh_db_order_creation_sets_created_at(temp_db, monkeypatch):
 
     monkeypatch.setattr(main, "DB_PATH", temp_db)
     monkeypatch.setenv("CONSENT_FEATURE_ENABLED", "1")
+    monkeypatch.setitem(consents.DOCUMENTS[consents.PURPOSE_SERVICE], "approved", True)
+    monkeypatch.setitem(consents.DOCUMENTS[consents.PURPOSE_PERSONAL_DATA], "approved", True)
     main.init_db()
 
     client = TestClient(main.app)
@@ -604,6 +607,8 @@ def test_reconciled_db_order_creation_sets_created_at_and_preserves_old_null(tem
     # Now create new order via API on the reconciled DB
     monkeypatch.setattr(main, "DB_PATH", temp_db)
     monkeypatch.setenv("CONSENT_FEATURE_ENABLED", "1")
+    monkeypatch.setitem(consents.DOCUMENTS[consents.PURPOSE_SERVICE], "approved", True)
+    monkeypatch.setitem(consents.DOCUMENTS[consents.PURPOSE_PERSONAL_DATA], "approved", True)
     client = TestClient(main.app)
 
     with patch("main.upload_to_yandex_disk"), patch("main.send_order_email"), patch("main.upload_info_to_yandex_disk"):

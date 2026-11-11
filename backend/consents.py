@@ -51,7 +51,7 @@ DOCUMENTS: dict[str, dict[str, Any]] = {
         "title": "Публичная оферта",
         "canonical_path": "public-preview/offer.html",
         "pinned_hash": CANONICAL_OFFER_HASH,
-        "approved": True,
+        "approved": False,
         "legal_status": "DRAFT_PENDING_OWNER_LEGAL_FINALIZATION",
         "text": None,
     },
@@ -60,7 +60,7 @@ DOCUMENTS: dict[str, dict[str, Any]] = {
         "title": "Согласие на обработку персональных данных",
         "canonical_path": "public-preview/privacy.html",
         "pinned_hash": CANONICAL_PRIVACY_HASH,
-        "approved": True,
+        "approved": False,
         "legal_status": "DRAFT_PENDING_OWNER_LEGAL_FINALIZATION",
         "text": None,
     },
@@ -110,6 +110,18 @@ CREATE INDEX IF NOT EXISTS idx_consent_order ON consent_records(order_ref, purpo
 def feature_enabled() -> bool:
     """The public feature stays off unless the owner explicitly enables it."""
     return os.getenv(FEATURE_FLAG, "0") == "1"
+
+
+def is_document_approved(purpose: str) -> bool:
+    """Return whether the document for this purpose has documented owner/legal approval."""
+    if purpose not in DOCUMENTS:
+        return False
+    return bool(DOCUMENTS[purpose].get("approved", False))
+
+
+def mandatory_documents_approved() -> bool:
+    """Check if all mandatory consent documents have formal owner/legal approval."""
+    return all(is_document_approved(p) for p in MANDATORY_PURPOSES)
 
 
 def canonical_content_hash(content: bytes | str) -> str:
@@ -204,7 +216,7 @@ def record_consent(conn: sqlite3.Connection, *, order_ref: str, purpose: str,
     if purpose not in DOCUMENTS:
         raise ValueError(f"unknown consent purpose: {purpose}")
     doc = DOCUMENTS[purpose]
-    if not doc.get("approved", True) and not allow_unapproved:
+    if not doc.get("approved", False) and not allow_unapproved:
         raise ValueError(
             f"purpose '{purpose}' cannot be granted: {doc.get('legal_status', 'NOT_APPROVED')}"
         )

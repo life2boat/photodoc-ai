@@ -4,7 +4,15 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import pytest
 import consents  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def synthetic_approval(monkeypatch):
+    for p in consents.MANDATORY_PURPOSES:
+        monkeypatch.setitem(consents.DOCUMENTS[p], "approved", True)
+        monkeypatch.setitem(consents.DOCUMENTS[p], "legal_status", "SYNTHETIC_TEST_APPROVED")
 
 
 def test_h04_future_dated_grant_cannot_override_withdrawal():

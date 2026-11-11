@@ -155,8 +155,84 @@ def test_order_rejected_when_only_one_mandatory_consent_provided(monkeypatch):
     assert "Mandatory consents" in r2.json()["detail"]
 
 
+def test_order_rejected_when_mandatory_documents_unapproved(monkeypatch, setup_isolated_env):
+    """When mandatory documents lack legal approval, order creation is rejected fail-closed."""
+    monkeypatch.setenv(consents.FEATURE_FLAG, "1")
+    # Both mandatory documents remain unapproved (default state)
+    assert consents.DOCUMENTS[consents.PURPOSE_SERVICE]["approved"] is False
+    assert consents.DOCUMENTS[consents.PURPOSE_PERSONAL_DATA]["approved"] is False
+
+    client = TestClient(app)
+    response = client.post(
+        "/api/order",
+        data={
+            "name": "Иван",
+            "phone": "+79991234567",
+            "format": "DOC_3X4",
+            "paper": "Цифровая обработка",
+            "crop": "По стандарту документа",
+            "consent_service_terms": "true",
+            "consent_personal_data": "true",
+            "consent_doc_version": "2026-11-08",
+            "consent_doc_hash": consents.CANONICAL_OFFER_HASH,
+        },
+        files={"files": _dummy_file()},
+    )
+    assert response.status_code == 400
+    assert "blocked pending legal approval" in response.json()["detail"]
+
+    # Verify fail-closed invariants: 0 orders, 0 consents, 0 files
+    with sqlite3.connect(setup_isolated_env["db"]) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM orders").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM consent_records").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM delivery_jobs").fetchone()[0] == 0
+    assert list(setup_isolated_env["uploads"].iterdir()) == []
+
+
+def test_order_rejected_when_service_terms_unapproved_alone(monkeypatch):
+    monkeypatch.setenv(consents.FEATURE_FLAG, "1")
+    monkeypatch.setitem(consents.DOCUMENTS[consents.PURPOSE_SERVICE], "approved", False)
+    monkeypatch.setitem(consents.DOCUMENTS[consents.PURPOSE_PERSONAL_DATA], "approved", True)
+
+    client = TestClient(app)
+    response = client.post(
+        "/api/order",
+        data={
+            "name": "Иван",
+            "phone": "+79991234567",
+            "consent_service_terms": "true",
+            "consent_personal_data": "true",
+        },
+        files={"files": _dummy_file()},
+    )
+    assert response.status_code == 400
+    assert f"Consent for {consents.PURPOSE_SERVICE} is blocked pending legal approval" in response.json()["detail"]
+
+
+def test_order_rejected_when_personal_data_unapproved_alone(monkeypatch):
+    monkeypatch.setenv(consents.FEATURE_FLAG, "1")
+    monkeypatch.setitem(consents.DOCUMENTS[consents.PURPOSE_SERVICE], "approved", True)
+    monkeypatch.setitem(consents.DOCUMENTS[consents.PURPOSE_PERSONAL_DATA], "approved", False)
+
+    client = TestClient(app)
+    response = client.post(
+        "/api/order",
+        data={
+            "name": "Иван",
+            "phone": "+79991234567",
+            "consent_service_terms": "true",
+            "consent_personal_data": "true",
+        },
+        files={"files": _dummy_file()},
+    )
+    assert response.status_code == 400
+    assert f"Consent for {consents.PURPOSE_PERSONAL_DATA} is blocked pending legal approval" in response.json()["detail"]
+
+
 def test_order_rejected_on_doc_hash_mismatch(monkeypatch, setup_isolated_env):
     monkeypatch.setenv(consents.FEATURE_FLAG, "1")
+    monkeypatch.setitem(consents.DOCUMENTS[consents.PURPOSE_SERVICE], "approved", True)
+    monkeypatch.setitem(consents.DOCUMENTS[consents.PURPOSE_PERSONAL_DATA], "approved", True)
     client = TestClient(app)
 
     response = client.post(
@@ -183,6 +259,8 @@ def test_order_rejected_on_doc_hash_mismatch(monkeypatch, setup_isolated_env):
 
 def test_order_rejected_on_doc_version_mismatch(monkeypatch):
     monkeypatch.setenv(consents.FEATURE_FLAG, "1")
+    monkeypatch.setitem(consents.DOCUMENTS[consents.PURPOSE_SERVICE], "approved", True)
+    monkeypatch.setitem(consents.DOCUMENTS[consents.PURPOSE_PERSONAL_DATA], "approved", True)
     client = TestClient(app)
 
     response = client.post(
@@ -202,6 +280,8 @@ def test_order_rejected_on_doc_version_mismatch(monkeypatch):
 
 def test_order_rejected_for_unapproved_conditional_purposes(monkeypatch):
     monkeypatch.setenv(consents.FEATURE_FLAG, "1")
+    monkeypatch.setitem(consents.DOCUMENTS[consents.PURPOSE_SERVICE], "approved", True)
+    monkeypatch.setitem(consents.DOCUMENTS[consents.PURPOSE_PERSONAL_DATA], "approved", True)
     client = TestClient(app)
 
     response = client.post(
@@ -221,6 +301,8 @@ def test_order_rejected_for_unapproved_conditional_purposes(monkeypatch):
 
 def test_order_succeeds_with_valid_consents_and_evidence_query(monkeypatch, setup_isolated_env):
     monkeypatch.setenv(consents.FEATURE_FLAG, "1")
+    monkeypatch.setitem(consents.DOCUMENTS[consents.PURPOSE_SERVICE], "approved", True)
+    monkeypatch.setitem(consents.DOCUMENTS[consents.PURPOSE_PERSONAL_DATA], "approved", True)
     client = TestClient(app)
 
     canonical_offer_hash = consents.CANONICAL_OFFER_HASH
@@ -262,6 +344,8 @@ def test_order_succeeds_with_valid_consents_and_evidence_query(monkeypatch, setu
 
 def test_order_with_consents_json_payload(monkeypatch):
     monkeypatch.setenv(consents.FEATURE_FLAG, "1")
+    monkeypatch.setitem(consents.DOCUMENTS[consents.PURPOSE_SERVICE], "approved", True)
+    monkeypatch.setitem(consents.DOCUMENTS[consents.PURPOSE_PERSONAL_DATA], "approved", True)
     client = TestClient(app)
 
     import json
@@ -291,6 +375,8 @@ def test_order_with_consents_json_payload(monkeypatch):
 def test_failed_consent_validation_leaves_zero_orders_and_zero_files(monkeypatch, setup_isolated_env):
     """Test G: failed consent validation leaves zero orders and zero orphaned customer files."""
     monkeypatch.setenv(consents.FEATURE_FLAG, "1")
+    monkeypatch.setitem(consents.DOCUMENTS[consents.PURPOSE_SERVICE], "approved", True)
+    monkeypatch.setitem(consents.DOCUMENTS[consents.PURPOSE_PERSONAL_DATA], "approved", True)
     client = TestClient(app)
 
     # 1. Attempt with invalid consent hash

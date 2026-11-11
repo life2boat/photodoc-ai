@@ -90,6 +90,8 @@ def journey_env(tmp_path, monkeypatch):
     monkeypatch.setenv("ROBOKASSA_PASSWORD2", SYNTHETIC_PASS2)
     monkeypatch.setenv("ROBOKASSA_IS_TEST", "1")
     monkeypatch.setenv("OPERATOR_TOKEN", OPERATOR_TOKEN)
+    monkeypatch.setitem(consents.DOCUMENTS[consents.PURPOSE_SERVICE], "approved", True)
+    monkeypatch.setitem(consents.DOCUMENTS[consents.PURPOSE_PERSONAL_DATA], "approved", True)
 
     main.init_db()
     client = TestClient(main.app)

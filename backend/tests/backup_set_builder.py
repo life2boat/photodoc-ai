@@ -74,12 +74,21 @@ def build_database(
     db_path.parent.mkdir(parents=True, exist_ok=True)
     uploads_dir.mkdir(parents=True, exist_ok=True)
 
+    import consents
+
+    original_approval = {
+        p: consents.DOCUMENTS[p].get("approved")
+        for p in consents.MANDATORY_PURPOSES
+    }
     saved = {name: os.environ.get(name) for name in
               ("ROBOKASSA_MERCHANT_LOGIN", "ROBOKASSA_PASSWORD1", "ROBOKASSA_PASSWORD2",
               "DELIVERY_WORKER_ENABLED", "YANDEX_DISK_ROOT_DIR", "SMTP_SERVER", "SMTP_USER",
               "SMTP_PASSWORD", "EMAIL_TO", "CONSENT_FEATURE_ENABLED")}
     original = (main.DB_PATH, main.UPLOAD_DIR)
     try:
+        for p in consents.MANDATORY_PURPOSES:
+            consents.DOCUMENTS[p]["approved"] = True
+
         os.environ.update({
             "ROBOKASSA_MERCHANT_LOGIN": "synthetic-merchant",
             "ROBOKASSA_PASSWORD1": "synthetic-pass-1",
@@ -211,6 +220,9 @@ def build_database(
         }
     finally:
         main.DB_PATH, main.UPLOAD_DIR = original
+        for p, approved in original_approval.items():
+            if approved is not None:
+                consents.DOCUMENTS[p]["approved"] = approved
         for name, value in saved.items():
             if value is None:
                 os.environ.pop(name, None)

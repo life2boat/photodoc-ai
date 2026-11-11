@@ -1326,17 +1326,27 @@ async def create_order(
             status_code=400,
             detail="Mandatory consents (service terms and personal data processing) are required",
         )
-    if tp_flag and not consents.DOCUMENTS[consents.PURPOSE_THIRD_PARTY_IMAGES].get("approved", False):
+    if not consents.is_document_approved(consents.PURPOSE_SERVICE):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Consent for {consents.PURPOSE_SERVICE} is blocked pending legal approval",
+        )
+    if not consents.is_document_approved(consents.PURPOSE_PERSONAL_DATA):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Consent for {consents.PURPOSE_PERSONAL_DATA} is blocked pending legal approval",
+        )
+    if tp_flag and not consents.is_document_approved(consents.PURPOSE_THIRD_PARTY_IMAGES):
         raise HTTPException(
             status_code=400,
             detail=f"Consent for {consents.PURPOSE_THIRD_PARTY_IMAGES} is blocked pending legal approval",
         )
-    if minor_flag and not consents.DOCUMENTS[consents.PURPOSE_MINOR_IMAGES].get("approved", False):
+    if minor_flag and not consents.is_document_approved(consents.PURPOSE_MINOR_IMAGES):
         raise HTTPException(
             status_code=400,
             detail=f"Consent for {consents.PURPOSE_MINOR_IMAGES} is blocked pending legal approval",
         )
-    if cb_flag and not consents.DOCUMENTS[consents.PURPOSE_CROSS_BORDER].get("approved", False):
+    if cb_flag and not consents.is_document_approved(consents.PURPOSE_CROSS_BORDER):
         raise HTTPException(
             status_code=400,
             detail=f"Consent for {consents.PURPOSE_CROSS_BORDER} is blocked pending legal approval",

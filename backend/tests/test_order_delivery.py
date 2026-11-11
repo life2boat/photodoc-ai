@@ -13,6 +13,7 @@ from fastapi.testclient import TestClient
 BACKEND = Path(__file__).resolve().parents[1]
 if str(BACKEND) not in sys.path:
     sys.path.insert(0, str(BACKEND))
+import consents  # noqa: E402
 import main  # noqa: E402
 import operator_workflow as operator_service  # noqa: E402
 from delivery import claim_due, finish, process_due, utc_now  # noqa: E402
@@ -34,6 +35,8 @@ def isolated(tmp_path, monkeypatch):
     monkeypatch.setenv("ROBOKASSA_PASSWORD2", "test-pass-2")
     monkeypatch.setenv("DELIVERY_WORKER_ENABLED", "0")
     monkeypatch.setenv("CONSENT_FEATURE_ENABLED", "1")
+    monkeypatch.setitem(consents.DOCUMENTS[consents.PURPOSE_SERVICE], "approved", True)
+    monkeypatch.setitem(consents.DOCUMENTS[consents.PURPOSE_PERSONAL_DATA], "approved", True)
     main.init_db()
     yield TestClient(main.app), db, uploads
 
