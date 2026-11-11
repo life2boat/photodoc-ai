@@ -9,7 +9,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from db_contract import APPLICATION_ID, inspect_database  # noqa: E402
-from delivery import DELIVERY_SCHEMA  # noqa: E402
+from delivery import DELIVERY_SCHEMA, acquire_migration_gate, release_migration_gate  # noqa: E402
 
 REQUIRED_CLEANUP_COLUMNS = {
     "cleanup_state",
@@ -25,6 +25,10 @@ def reconcile(db_path: Path, apply: bool = False, uploads_dir: Path | None = Non
     ready, details = inspect_database(db_path, require_complete_schema=True)
     if not ready or details["application_id"] != APPLICATION_ID:
         raise RuntimeError("P0 PhotoDoc database identity/schema check failed")
+
+    gate_holder = None
+    if apply:
+        gate_holder = acquire_migration_gate(db_path)
 
     if uploads_dir is None:
         env_dir = os.getenv("UPLOAD_DIR")
@@ -70,16 +74,22 @@ def reconcile(db_path: Path, apply: bool = False, uploads_dir: Path | None = Non
                     "SELECT COUNT(*) FROM delivery_jobs "
                     "WHERE ((artifact_role IS NULL OR artifact_role IN ('', 'unknown')) AND kind IN ('file', 'info')) "
                     "OR (kind = 'file' AND artifact_role = 'result' AND ("
-                    "  remote_path NOT LIKE '%_result.bin' OR "
+                    "  remote_path NOT LIKE '%_result.bin' OR remote_path LIKE '%_source%' OR "
                     "  NOT EXISTS (SELECT 1 FROM order_results r WHERE r.order_id = delivery_jobs.order_id "
                     "              AND r.path = delivery_jobs.local_path AND r.sha256 = delivery_jobs.content_sha256)"
+                    ")) "
+                    "OR (kind = 'file' AND artifact_role = 'source' AND ("
+                    "  remote_path LIKE '%_result.bin' OR "
+                    "  EXISTS (SELECT 1 FROM order_results r WHERE r.order_id = delivery_jobs.order_id "
+                    "          AND (r.path = delivery_jobs.local_path OR r.sha256 = delivery_jobs.content_sha256))"
                     "))"
                 ).fetchone()[0]
             else:
                 unclassified_role_count = conn.execute(
                     "SELECT COUNT(*) FROM delivery_jobs "
                     "WHERE ((artifact_role IS NULL OR artifact_role IN ('', 'unknown')) AND kind IN ('file', 'info')) "
-                    "OR (kind = 'file' AND artifact_role = 'result')"
+                    "OR (kind = 'file' AND artifact_role = 'result') "
+                    "OR (kind = 'file' AND artifact_role = 'source' AND remote_path LIKE '%_result.bin')"
                 ).fetchone()[0]
 
         needed = (
@@ -149,57 +159,40 @@ def reconcile(db_path: Path, apply: bool = False, uploads_dir: Path | None = Non
 
                     ores = results_by_order.get(oid)
 
-                    is_result = False
-                    is_source = False
-                    is_ambiguous = False
-
                     ends_result = rpath.endswith("_result.bin")
                     has_source_marker = "_source" in rpath.lower() or "_source" in lpath.lower()
+                    has_result_marker = "_result" in rpath.lower() or "_result" in lpath.lower()
 
-                    if ends_result:
-                        if ores is not None:
-                            path_match = bool(lpath and ores["path"] and lpath == ores["path"])
-                            sha_match = bool(jsha and ores["sha256"] and jsha == ores["sha256"])
-                            # Authoritative proof requires both path and hash to match without conflict
-                            if path_match and sha_match and not has_source_marker:
-                                is_result = True
-                            else:
-                                is_ambiguous = True
-                        else:
-                            # Ends with _result.bin but no order_results record: ambiguous legacy artifact
-                            is_ambiguous = True
-                    else:
-                        # remote_path does not end with _result.bin
-                        if ores is not None:
-                            conflicts_with_result = bool(
-                                (lpath and ores["path"] and lpath == ores["path"]) or
-                                (jsha and ores["sha256"] and jsha == ores["sha256"])
-                            )
-                            if conflicts_with_result or "_result_" in lpath:
-                                is_ambiguous = True
-                            elif lpath and not has_source_marker and jstate == "delivered":
-                                # Delivered without result suffix: ambiguous historical artifact
-                                is_ambiguous = True
-                            elif lpath:
-                                is_source = True
-                            else:
-                                is_ambiguous = True
-                        else:
-                            # No order_results table or record
-                            if "_result_" in lpath or "_result" in rpath:
-                                is_ambiguous = True
-                            elif jstate == "delivered":
-                                # Historical delivered job without order_results: ambiguous historical delivery!
-                                # Per HIGH-02, must NEVER be converted to result!
-                                is_ambiguous = True
-                            elif lpath:
-                                is_source = True
-                            else:
-                                is_ambiguous = True
+                    path_match = bool(lpath and ores and lpath == ores["path"])
+                    sha_match = bool(jsha and ores and jsha == ores["sha256"])
+                    job_matches_ores = bool(ores is not None and path_match and sha_match)
+                    job_conflicts_ores = bool(ores is not None and (path_match or sha_match))
 
-                    if is_result and not is_ambiguous:
+                    if cur_role == "quarantine":
+                        # Explicit quarantine classifications must never be promoted
+                        new_role = "quarantine"
+                    elif cur_role == "source":
+                        # Explicit source classifications must never be promoted to result.
+                        # If metadata conflicts with result (e.g. ends with _result.bin or matches/conflicts with ores),
+                        # fail closed to quarantine. Otherwise remain source.
+                        if ends_result or job_conflicts_ores or has_result_marker:
+                            new_role = "quarantine"
+                        else:
+                            new_role = "source"
+                    elif job_matches_ores and ends_result and not has_source_marker:
+                        # Authoritative evidence for completed result
                         new_role = "result"
-                    elif is_source and not is_ambiguous:
+                    elif job_conflicts_ores:
+                        # Partial conflict with order_results (e.g. path matches but hash disagrees)
+                        new_role = "quarantine"
+                    elif ends_result or has_result_marker:
+                        # Result-like naming but lacks authoritative order_results evidence
+                        new_role = "quarantine"
+                    elif jstate == "delivered":
+                        # Historical delivered job without authoritative order_results evidence
+                        new_role = "quarantine"
+                    elif lpath:
+                        # Clean, unambiguous source artifact
                         new_role = "source"
                     else:
                         new_role = "quarantine"
@@ -271,7 +264,12 @@ def reconcile(db_path: Path, apply: bool = False, uploads_dir: Path | None = Non
         conn.rollback()
         raise
     finally:
-        conn.close()
+        try:
+            conn.close()
+        except Exception:
+            pass
+        if gate_holder is not None:
+            release_migration_gate(db_path, gate_holder)
 
 
 if __name__ == "__main__":

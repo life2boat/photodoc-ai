@@ -67,6 +67,137 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_paid_email_once ON delivery_jobs(order_id)
 CREATE UNIQUE INDEX IF NOT EXISTS idx_admin_email_once ON delivery_jobs(order_id) WHERE kind = 'admin_email';
 """ + EMAIL_SCHEMA
 
+GATE_TABLE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS schema_migration_gate (
+    gate_name TEXT PRIMARY KEY,
+    holder_id TEXT NOT NULL,
+    holder_pid INTEGER NOT NULL,
+    acquired_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL
+);
+"""
+
+DEFAULT_GATE_TIMEOUT_SECONDS = 5.0
+DEFAULT_GATE_LEASE_SECONDS = 60
+
+
+def is_migration_active(db_path_or_conn: Path | str | sqlite3.Connection, now: str | None = None) -> bool:
+    """
+    Returns True if an exclusive cross-process migration gate is currently active and unexpired.
+    """
+    close_after = False
+    if isinstance(db_path_or_conn, (str, Path)):
+        try:
+            conn = sqlite3.connect(db_path_or_conn, timeout=5)
+            close_after = True
+        except Exception:
+            return True
+    else:
+        conn = db_path_or_conn
+
+    try:
+        has_table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_migration_gate'"
+        ).fetchone()
+        if not has_table:
+            return False
+        current_time = now or utc_now()
+        row = conn.execute(
+            "SELECT expires_at FROM schema_migration_gate WHERE gate_name = 'migration'"
+        ).fetchone()
+        if not row:
+            return False
+        expires_at = row[0]
+        return expires_at > current_time
+    except sqlite3.OperationalError:
+        return True
+    except Exception:
+        return False
+    finally:
+        if close_after:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def acquire_migration_gate(
+    db_path: Path | str,
+    timeout: float = DEFAULT_GATE_TIMEOUT_SECONDS,
+    lease_seconds: int = DEFAULT_GATE_LEASE_SECONDS,
+    clock: Any = None,
+) -> str:
+    """
+    Exclusively acquires the cross-process migration gate.
+    Fails closed (raises RuntimeError) if exclusive access cannot be established within timeout.
+    Returns the holder_id token.
+    """
+    db_path = Path(db_path)
+    deadline = time.monotonic() + timeout
+    holder_id = uuid.uuid4().hex
+    pid = os.getpid()
+
+    conn = sqlite3.connect(db_path, timeout=10)
+    try:
+        conn.execute(GATE_TABLE_SCHEMA)
+        conn.commit()
+
+        acquired = False
+        while time.monotonic() < deadline:
+            now_str = clock() if clock is not None else utc_now()
+            now_dt = datetime.fromisoformat(now_str) if clock is not None else datetime.now(timezone.utc)
+            expires_at = (now_dt + timedelta(seconds=lease_seconds)).isoformat()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    "SELECT holder_id, expires_at FROM schema_migration_gate WHERE gate_name = 'migration'"
+                ).fetchone()
+                if row is not None:
+                    existing_holder, existing_expires = row[0], row[1]
+                    if existing_expires > now_str:
+                        # Another active unexpired migration holds the gate
+                        conn.rollback()
+                        time.sleep(0.05)
+                        continue
+                    # Stale expired lock: log and reclaim
+                    logging.warning("Reclaiming expired migration gate from %s (expired at %s)", existing_holder, existing_expires)
+
+                conn.execute(
+                    "INSERT OR REPLACE INTO schema_migration_gate (gate_name, holder_id, holder_pid, acquired_at, expires_at) "
+                    "VALUES ('migration', ?, ?, ?, ?)",
+                    (holder_id, pid, now_str, expires_at),
+                )
+                conn.commit()
+                acquired = True
+                break
+            except sqlite3.OperationalError:
+                # Database locked by another write transaction
+                time.sleep(0.05)
+
+        if not acquired:
+            raise RuntimeError("Cannot acquire exclusive migration gate: timed out waiting for active lock")
+
+        return holder_id
+    finally:
+        conn.close()
+
+
+def release_migration_gate(db_path: Path | str, holder_id: str) -> bool:
+    """
+    Releases the exclusive migration gate if owned by holder_id.
+    """
+    conn = sqlite3.connect(db_path, timeout=10)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        cursor = conn.execute(
+            "DELETE FROM schema_migration_gate WHERE gate_name = 'migration' AND holder_id = ?",
+            (holder_id,),
+        )
+        conn.commit()
+        return cursor.rowcount > 0
+    finally:
+        conn.close()
+
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -139,6 +270,9 @@ def claim_due(db_path: Path, max_attempts: int = DEFAULT_MAX_ATTEMPTS) -> dict |
     conn.row_factory = sqlite3.Row
     try:
         conn.execute("BEGIN IMMEDIATE")
+        if is_migration_active(conn, now):
+            conn.commit()
+            return None
         quarantine_expired(conn, now, max_attempts)
         conn.execute("""UPDATE paid_email_outbox SET state='uncertain',last_error='WorkerInterrupted',updated_at=?
             WHERE state='sending' AND EXISTS (SELECT 1 FROM delivery_jobs j
@@ -351,6 +485,9 @@ def perform_job_cleanup(
     token = None
     try:
         conn.execute("BEGIN IMMEDIATE")
+        if is_migration_active(conn, now):
+            conn.commit()
+            return False
         cols = {r[1] for r in conn.execute("PRAGMA table_info(delivery_jobs)").fetchall()}
         has_role = "artifact_role" in cols
         job = conn.execute(
@@ -617,6 +754,9 @@ def perform_job_cleanup(
     conn = sqlite3.connect(db_path, timeout=10)
     try:
         conn.execute("BEGIN IMMEDIATE")
+        if is_migration_active(conn):
+            conn.rollback()
+            return False
         cols_check = {r[1] for r in conn.execute("PRAGMA table_info(delivery_jobs)").fetchall()}
         has_role_check = "artifact_role" in cols_check
         role_select = ", artifact_role" if has_role_check else ""
@@ -734,6 +874,8 @@ def process_due_cleanups(
     conn = sqlite3.connect(db_path, timeout=10)
     candidate_ids = []
     try:
+        if is_migration_active(conn, now):
+            return 0
         has_table = conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='delivery_jobs'"
         ).fetchone()
@@ -852,6 +994,8 @@ def cleanup_orphaned_temporary_files(
 def process_due(db_path: Path, deliver, limit: int = 20, uploads_dir: Path | None = None) -> int:
     processed = 0
     for _ in range(limit):
+        if is_migration_active(db_path):
+            break
         job = claim_due(db_path)
         if job is None:
             break

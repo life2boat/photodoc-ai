@@ -123,7 +123,8 @@ def _is_result_job(job) -> bool:
             return role == "result"
     remote = job["remote_path"] or ""
     local = job["local_path"] or ""
-    return (remote.endswith("_result.bin") and "_source" not in remote) or RESULT_SUFFIX in local
+    lname = Path(local).name if local else ""
+    return (remote.endswith("_result.bin") and "_source" not in remote) or RESULT_SUFFIX in lname
 
 
 def _source_job(conn: sqlite3.Connection, order_id: int):
@@ -143,12 +144,13 @@ def _source_job(conn: sqlite3.Connection, order_id: int):
             if row["artifact_role"] == "source":
                 return row
         for row in rows:
-            if row["artifact_role"] in (None, "", "unknown"):
+            if row["artifact_role"] in (None, ""):
                 if _is_result_job(row):
                     continue
                 rpath = row["remote_path"] or ""
                 lpath = row["local_path"] or ""
-                if "_result" in rpath or "_result" in lpath:
+                lname = Path(lpath).name if lpath else ""
+                if "_result" in rpath or "_result" in lname:
                     continue
                 return row
         return None
@@ -157,7 +159,8 @@ def _source_job(conn: sqlite3.Connection, order_id: int):
             continue
         rpath = row["remote_path"] or ""
         lpath = row["local_path"] or ""
-        if "_result" in rpath or "_result" in lpath:
+        lname = Path(lpath).name if lpath else ""
+        if "_result" in rpath or "_result" in lname:
             continue
         return row
     return None

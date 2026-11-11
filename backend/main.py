@@ -1207,9 +1207,24 @@ def deliver_job(job: dict) -> None:
     if job["kind"] in ("file", "info"):
         require_paid_order(job["order_id"])
         if job["kind"] == "file":
-            role = job.get("artifact_role")
-            if role != "result":
-                raise RuntimeError(f"Delivery forbidden for non-result artifact role: '{role}'")
+            conn = sqlite3.connect(DB_PATH, timeout=5)
+            try:
+                from delivery import is_migration_active
+                if is_migration_active(conn):
+                    raise RuntimeError("Delivery forbidden: exclusive migration gate is active")
+                row = conn.execute(
+                    "SELECT artifact_role, state FROM delivery_jobs WHERE id=?",
+                    (job["id"],),
+                ).fetchone()
+                if not row:
+                    raise RuntimeError(f"Delivery forbidden: job {job['id']} not found in DB")
+                cur_role, cur_state = row[0], row[1]
+                if cur_role != "result":
+                    raise RuntimeError(f"Delivery forbidden for non-result artifact role: '{cur_role}'")
+                if cur_state != "processing":
+                    raise RuntimeError(f"Delivery forbidden: job {job['id']} is in state '{cur_state}', not 'processing'")
+            finally:
+                conn.close()
         raw_path = job.get("local_path")
         if not raw_path:
             raise RuntimeError("Delivery job is missing local_path")

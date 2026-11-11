@@ -17,8 +17,11 @@ Verifies:
 import hashlib
 import os
 import sqlite3
+import subprocess
 import sys
 import tempfile
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -876,4 +879,424 @@ def test_adversarial_finish_rejects_processing_source(env):
 
     assert finished is False
     assert state != "delivered"
+
+
+# ---------------------------------------------------------------------------
+# PHOTODOC-R1-LEGACY-MIGRATION-HIGH-REMEDIATION-03:
+# Dedicated Security Acceptance Tests (HIGH-01 / HIGH-02 / HIGH-C1 / HIGH-C2)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("protected_role", ["source", "quarantine"])
+def test_security_acceptance_a_explicit_protected_role_never_promoted(env, monkeypatch, protected_role):
+    """
+    HIGH-01 / HIGH-C1:
+    Even if order_results contains a matching path & sha256 pointing to the same file,
+    an explicit protected role ('source' or 'quarantine') MUST NEVER be promoted to 'result'.
+    Attempted delivery must not send the original bytes, and cleanup must not delete the file.
+    """
+    db, uploads = env["db"], env["uploads"]
+    renamed = uploads / "1_result.bin"
+    content = b"synthetic-protected-source-content"
+    renamed.write_bytes(content)
+    now = datetime.now(timezone.utc).isoformat()
+    sha = hashlib.sha256(content).hexdigest()
+
+    conn = sqlite3.connect(db)
+    operator_workflow.initialize(conn)
+    conn.execute(
+        "INSERT INTO orders (id, name, phone, email, format, paper, crop, status, payment_status, order_amount, payment_amount, paid_at, created_at) "
+        "VALUES (1, 'Cust', '1', 'c@example.invalid', '3x4', 'matte', 'standard', 'paid', 'paid', '300', '300', ?, ?)",
+        (now, now)
+    )
+    conn.execute(
+        "INSERT INTO order_results (order_id, path, sha256, size, version, updated_at) VALUES (1, ?, ?, ?, 1, ?)",
+        (str(renamed), sha, len(content), now)
+    )
+    jid = delivery.enqueue(
+        conn, order_id=1, kind="file", local_path=str(renamed),
+        remote_path="PhotoDoc_Orders/1_result.bin", sha256=sha, size=len(content),
+        artifact_role=protected_role
+    )
+    # Add an unclassified legacy job to trigger reconcile
+    other = uploads / "1_other.jpg"
+    other.write_bytes(b"other")
+    delivery.enqueue(conn, order_id=1, kind="file", local_path=str(other),
+                     remote_path="PhotoDoc_Orders/1_other.jpg")
+    conn.commit()
+    conn.close()
+
+    summary = reconcile(db, apply=True, uploads_dir=uploads)
+    assert summary["applied"] is True
+
+    conn = sqlite3.connect(db)
+    new_role = conn.execute("SELECT artifact_role FROM delivery_jobs WHERE id=?", (jid,)).fetchone()[0]
+    conn.close()
+
+    assert new_role != "result", f"Role was promoted to result: {new_role}"
+    assert new_role in (protected_role, "quarantine")
+
+    sent = []
+    def mock_upload(path, *args, **kwargs):
+        sent.append(Path(path).read_bytes())
+        return True
+    monkeypatch.setattr(main, "upload_to_yandex_disk", mock_upload)
+
+    delivery.process_due(db, main.deliver_job, uploads_dir=uploads)
+    assert content not in sent, "Protected original bytes were sent to uploader!"
+    assert renamed.exists(), "Protected original file was deleted!"
+
+
+def test_security_acceptance_b_stale_claim_revalidated_at_delivery(env, monkeypatch):
+    """
+    HIGH-02 / HIGH-C2:
+    A worker claiming a job before or during migration cannot deliver the file if migration
+    reclassified it to 'quarantine'. The worker must re-read authoritative role from SQLite
+    before handing bytes to uploader.
+    """
+    db, uploads = env["db"], env["uploads"]
+    original, sha = _create_synthetic_source(uploads, "1_stale_claim.jpg", b"synthetic-stale-claim-original")
+    now = datetime.now(timezone.utc).isoformat()
+
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "INSERT INTO orders (id, name, phone, email, format, paper, crop, status, payment_status, order_amount, payment_amount, paid_at, created_at) "
+        "VALUES (2, 'Cust2', '2', 'c@example.invalid', '3x4', 'matte', 'standard', 'paid', 'paid', '300', '300', ?, ?)",
+        (now, now)
+    )
+    jid = delivery.enqueue(
+        conn, order_id=2, kind="file", local_path=str(original),
+        remote_path="PhotoDoc_Orders/2_result.bin", sha256=sha, size=len(original.read_bytes()),
+        artifact_role="result"
+    )
+    conn.commit()
+    conn.close()
+
+    claimed_event, resume_event = threading.Event(), threading.Event()
+    sent = []
+
+    def mock_upload(path, *args, **kwargs):
+        sent.append(Path(path).read_bytes())
+        return True
+    monkeypatch.setattr(main, "upload_to_yandex_disk", mock_upload)
+
+    def delayed_delivery(job):
+        claimed_event.set()
+        assert resume_event.wait(10), "Test timed out waiting to resume delivery worker"
+        main.deliver_job(job)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(delivery.process_due, db, delayed_delivery, 1, uploads)
+        try:
+            assert claimed_event.wait(10), "Test timed out waiting for worker claim"
+            # Now run reconcile concurrently - it will reclassify 2_result.bin to quarantine (since no order_results row)
+            reconcile(db, apply=True, uploads_dir=uploads)
+            conn = sqlite3.connect(db)
+            role_after = conn.execute("SELECT artifact_role FROM delivery_jobs WHERE id=?", (jid,)).fetchone()[0]
+            conn.close()
+            assert role_after == "quarantine"
+        finally:
+            resume_event.set()
+
+        future.result(timeout=15)
+
+    assert b"synthetic-stale-claim-original" not in sent, "Stale claim delivered original to uploader!"
+    assert original.exists(), "Original was deleted after stale claim!"
+
+
+def test_security_acceptance_c_worker_claim_due_blocked_during_active_migration_gate(env):
+    """
+    HIGH-02:
+    When a migration holds the gate, claim_due() must return None (fail closed).
+    """
+    db = env["db"]
+    holder = delivery.acquire_migration_gate(db, timeout=2.0, lease_seconds=60)
+    try:
+        assert delivery.is_migration_active(db) is True
+        assert delivery.claim_due(db) is None
+    finally:
+        delivery.release_migration_gate(db, holder)
+
+    assert delivery.is_migration_active(db) is False
+
+
+def test_security_acceptance_d_worker_cleanup_blocked_during_active_migration_gate(env):
+    """
+    HIGH-02:
+    When a migration holds the gate, perform_job_cleanup() must return False without deleting files.
+    """
+    db, uploads = env["db"], env["uploads"]
+    res_file, res_sha = _create_synthetic_result(uploads, "cleanup_blocked.jpg")
+    now = datetime.now(timezone.utc).isoformat()
+
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "INSERT INTO orders (id, name, phone, status, payment_status, created_at) "
+        "VALUES (3, 'Cust3', '3', 'paid', 'paid', ?)", (now,)
+    )
+    jid = delivery.enqueue(
+        conn, order_id=3, kind="file", local_path=str(res_file),
+        remote_path="PhotoDoc_Orders/3_result.jpg", sha256=res_sha, size=res_file.stat().st_size,
+        artifact_role="result"
+    )
+    conn.execute("UPDATE delivery_jobs SET state='delivered', delivered_at=? WHERE id=?", (now, jid))
+    conn.commit()
+    conn.close()
+
+    holder = delivery.acquire_migration_gate(db, timeout=2.0, lease_seconds=60)
+    try:
+        cleaned = delivery.perform_job_cleanup(db, jid, uploads_dir=uploads)
+        assert cleaned is False, "perform_job_cleanup executed while migration gate was active!"
+        assert res_file.exists(), "File was deleted while migration gate was active!"
+    finally:
+        delivery.release_migration_gate(db, holder)
+
+
+def test_security_acceptance_e_cross_process_mutual_exclusion(env):
+    """
+    HIGH-02:
+    Separate OS process holding migration gate blocks another process from acquiring it.
+    The second process times out and fails closed (RuntimeError).
+    """
+    db = env["db"]
+    backend_dir_posix = BACKEND_DIR.as_posix()
+    db_posix = db.as_posix()
+    code = f"""
+import sys, time
+sys.path.insert(0, '{backend_dir_posix}')
+import delivery
+holder = delivery.acquire_migration_gate('{db_posix}', timeout=5.0, lease_seconds=10)
+print('ACQUIRED', flush=True)
+time.sleep(2)
+delivery.release_migration_gate('{db_posix}', holder)
+print('RELEASED', flush=True)
+"""
+    proc = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        line = proc.stdout.readline()
+        assert "ACQUIRED" in line, f"Subprocess failed to acquire gate: {proc.stderr.read()}"
+
+        with pytest.raises(RuntimeError, match="timed out"):
+            delivery.acquire_migration_gate(db, timeout=0.3, lease_seconds=5)
+
+        proc.wait(timeout=10)
+        holder2 = delivery.acquire_migration_gate(db, timeout=5.0, lease_seconds=5)
+        assert holder2 is not None
+        delivery.release_migration_gate(db, holder2)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+
+
+def test_security_acceptance_f_stale_expired_gate_reclaimed_without_deadlock(env):
+    """
+    HIGH-02:
+    If a process crashes while holding gate, the lease expires and a subsequent migration
+    safely reclaims the gate without manual intervention or permanent deadlock.
+    """
+    db = env["db"]
+    expired_at = (datetime.now(timezone.utc) - timedelta(seconds=10)).isoformat()
+    conn = sqlite3.connect(db)
+    conn.execute(delivery.GATE_TABLE_SCHEMA)
+    conn.execute(
+        "INSERT OR REPLACE INTO schema_migration_gate (gate_name, holder_id, holder_pid, acquired_at, expires_at) "
+        "VALUES ('migration', 'dead-holder', 999999, ?, ?)",
+        (expired_at, expired_at),
+    )
+    conn.commit()
+    conn.close()
+
+    assert delivery.is_migration_active(db) is False
+
+    holder = delivery.acquire_migration_gate(db, timeout=1.0, lease_seconds=10)
+    assert holder is not None
+    assert delivery.is_migration_active(db) is True
+    delivery.release_migration_gate(db, holder)
+    assert delivery.is_migration_active(db) is False
+
+
+def test_security_acceptance_g_cleanup_rechecks_changed_role_at_unlink(env):
+    """
+    HIGH-02:
+    perform_job_cleanup() performs an authoritative pre-unlink check under BEGIN IMMEDIATE.
+    If another transaction or migration changes the role away from 'result' right before unlink,
+    cleanup is aborted and the file is untouched.
+    """
+    db, uploads = env["db"], env["uploads"]
+    src_file, src_sha = _create_synthetic_source(uploads, "4_race_unlink.jpg")
+    now = datetime.now(timezone.utc).isoformat()
+
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "INSERT INTO orders (id, name, phone, status, payment_status, created_at) "
+        "VALUES (4, 'Cust4', '4', 'paid', 'paid', ?)", (now,)
+    )
+    jid = delivery.enqueue(
+        conn, order_id=4, kind="file", local_path=str(src_file),
+        remote_path="PhotoDoc_Orders/4_result.bin", sha256=src_sha, size=src_file.stat().st_size,
+        artifact_role="result"
+    )
+    conn.execute("UPDATE delivery_jobs SET state='delivered', delivered_at=? WHERE id=?", (now, jid))
+    conn.commit()
+    conn.close()
+
+    def demote_role_hook(_jid, _token):
+        c = sqlite3.connect(db)
+        c.execute("UPDATE delivery_jobs SET artifact_role='source' WHERE id=?", (jid,))
+        c.commit()
+        c.close()
+
+    cleaned = delivery.perform_job_cleanup(db, jid, uploads_dir=uploads, pre_unlink_hook=demote_role_hook)
+    assert cleaned is False
+    assert src_file.exists()
+    conn = sqlite3.connect(db)
+    role = conn.execute("SELECT artifact_role FROM delivery_jobs WHERE id=?", (jid,)).fetchone()[0]
+    conn.close()
+    assert role == "source"
+
+
+def test_security_acceptance_h_process_due_clean_exit_when_migration_active(env, monkeypatch):
+    """
+    HIGH-02:
+    delivery.process_due() returns 0 without calling worker handler when migration is active.
+    """
+    db, uploads = env["db"], env["uploads"]
+    res_file, res_sha = _create_synthetic_result(uploads, "ready_result.jpg")
+    now = datetime.now(timezone.utc).isoformat()
+
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "INSERT INTO orders (id, name, phone, email, format, paper, crop, status, payment_status, order_amount, payment_amount, paid_at, created_at) "
+        "VALUES (5, 'Cust5', '5', 'c@example.invalid', '3x4', 'matte', 'standard', 'paid', 'paid', '300', '300', ?, ?)",
+        (now, now)
+    )
+    delivery.enqueue(
+        conn, order_id=5, kind="file", local_path=str(res_file),
+        remote_path="PhotoDoc_Orders/5_result.jpg", sha256=res_sha, size=res_file.stat().st_size,
+        artifact_role="result"
+    )
+    conn.commit()
+    conn.close()
+
+    calls = []
+    def handler(job):
+        calls.append(job)
+
+    holder = delivery.acquire_migration_gate(db, timeout=2.0, lease_seconds=60)
+    try:
+        processed = delivery.process_due(db, handler, 10, uploads)
+        assert processed == 0
+        assert len(calls) == 0
+    finally:
+        delivery.release_migration_gate(db, holder)
+
+    # After gate release, normal execution works
+    processed = delivery.process_due(db, handler, 10, uploads)
+    assert processed == 1
+    assert len(calls) == 1
+
+
+def test_security_acceptance_i_unclassified_result_not_offered_as_operator_original(env):
+    """
+    HIGH-02:
+    Operator download must reject unclassified / unknown artifacts, preventing processed
+    results or unknown binaries from being served as original source files.
+    """
+    db, uploads = env["db"], env["uploads"]
+    fake_orig = uploads / "6_abcd.jpg"
+    fake_orig.write_bytes(b"processed-bytes")
+    now = datetime.now(timezone.utc).isoformat()
+
+    conn = sqlite3.connect(db)
+    operator_workflow.initialize(conn)
+    conn.execute(
+        "INSERT INTO orders (id, name, phone, email, format, paper, crop, status, payment_status, order_amount, payment_amount, paid_at, created_at) "
+        "VALUES (6, 'Cust6', '6', 'c@example.invalid', '3x4', 'matte', 'standard', 'paid', 'paid', '300', '300', ?, ?)",
+        (now, now)
+    )
+    delivery.enqueue(
+        conn, order_id=6, kind="file", local_path=str(fake_orig),
+        remote_path="PhotoDoc_Orders/6_abcd.jpg", sha256=hashlib.sha256(b"processed-bytes").hexdigest(),
+        size=len(b"processed-bytes"), artifact_role="unknown"
+    )
+    conn.commit()
+    conn.close()
+
+    try:
+        path = operator_workflow.source_for_download(db, 6)
+        assert path != fake_orig, "Unknown role file was returned as operator source download!"
+    except Exception as exc:
+        assert isinstance(exc, HTTPException)
+        assert exc.status_code in (404, 409, 410)
+
+
+def test_security_acceptance_j_mismatched_result_path_remains_quarantined(env):
+    """
+    HIGH-01 / HIGH-02:
+    When order_results points to a missing file path, an unknown job pointing to another path
+    must be quarantined and must not be claimed by delivery worker.
+    """
+    db, uploads = env["db"], env["uploads"]
+    orig_file, orig_sha = _create_synthetic_source(uploads, "7_orig.jpg")
+    now = datetime.now(timezone.utc).isoformat()
+
+    conn = sqlite3.connect(db)
+    operator_workflow.initialize(conn)
+    conn.execute(
+        "INSERT INTO orders (id, name, phone, email, format, paper, crop, status, payment_status, order_amount, payment_amount, paid_at, created_at) "
+        "VALUES (7, 'Cust7', '7', 'c@example.invalid', '3x4', 'matte', 'standard', 'paid', 'paid', '300', '300', ?, ?)",
+        (now, now)
+    )
+    jid = delivery.enqueue(
+        conn, order_id=7, kind="file", local_path=str(orig_file),
+        remote_path="PhotoDoc_AI/7_result.bin", sha256=orig_sha, size=orig_file.stat().st_size,
+        artifact_role="unknown"
+    )
+    missing = uploads / "7_missing_result.jpg"
+    conn.execute(
+        "INSERT INTO order_results (order_id, path, sha256, size, version, updated_at) VALUES (7, ?, ?, ?, 1, ?)",
+        (str(missing), orig_sha, orig_file.stat().st_size, now)
+    )
+    conn.commit()
+    conn.close()
+
+    reconcile(db, apply=True, uploads_dir=uploads)
+
+    conn = sqlite3.connect(db)
+    role = conn.execute("SELECT artifact_role FROM delivery_jobs WHERE id=?", (jid,)).fetchone()[0]
+    conn.close()
+
+    assert role == "quarantine"
+    assert delivery.claim_due(db) is None
+    assert orig_file.exists()
+
+
+def test_security_acceptance_k_invalid_role_never_claimed_or_cleaned(env):
+    """
+    HIGH-01 / HIGH-02:
+    An invalid role string ('invalid-role') is never claimed by worker and never cleaned up.
+    """
+    db, uploads = env["db"], env["uploads"]
+    orig_file, orig_sha = _create_synthetic_source(uploads, "8_invalid.jpg")
+    now = datetime.now(timezone.utc).isoformat()
+
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "INSERT INTO orders (id, name, phone, status, payment_status, created_at) "
+        "VALUES (8, 'Cust8', '8', 'paid', 'paid', ?)", (now,)
+    )
+    jid = delivery.enqueue(
+        conn, order_id=8, kind="file", local_path=str(orig_file),
+        remote_path="PhotoDoc_Orders/8_result.bin", sha256=orig_sha, size=orig_file.stat().st_size,
+        artifact_role="invalid-role"
+    )
+    conn.execute("UPDATE delivery_jobs SET state='delivered', delivered_at=? WHERE id=?", (now, jid))
+    conn.commit()
+    conn.close()
+
+    assert delivery.claim_due(db) is None
+    cleaned = delivery.perform_job_cleanup(db, jid, uploads_dir=uploads)
+    assert cleaned is False
+    assert orig_file.exists()
+
+
 
