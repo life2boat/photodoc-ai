@@ -19,10 +19,11 @@ import os
 import sqlite3
 import sys
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
+from fastapi import HTTPException
 import pytest
 
 BACKEND_DIR = Path(__file__).resolve().parent.parent
@@ -597,3 +598,282 @@ def test_rollback_restart_after_migration_failure(env):
     role = conn.execute("SELECT artifact_role FROM delivery_jobs WHERE id=(SELECT id FROM delivery_jobs)").fetchone()[0]
     conn.close()
     assert role == "source"
+
+
+# ===========================================================================
+# INDEPENDENT CODEX AUDIT ADVERSARIAL REGRESSIONS (HIGH-01..04, MEDIUM-01..02)
+# ===========================================================================
+
+def test_adversarial_missing_column_never_claims_file_job(env):
+    """HIGH-01: When artifact_role column is absent, claim_due fails closed and claims 0 file jobs."""
+    db, uploads = env["db"], env["uploads"]
+    src_file, src_sha = _create_synthetic_source(uploads, "adv1_src.jpg")
+    now = datetime.now(timezone.utc).isoformat()
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "INSERT INTO orders (id, name, phone, status, payment_status, created_at) "
+        "VALUES (101, 'Adv1', '0', 'paid', 'paid', ?)", (now,)
+    )
+    delivery.enqueue(
+        conn, order_id=101, kind="file", local_path=str(src_file),
+        remote_path="PhotoDoc_Orders/101_result.bin", sha256=src_sha, size=src_file.stat().st_size
+    )
+    conn.commit()
+    conn.close()
+
+    _strip_artifact_role_column(db)
+
+    seen = []
+    delivery.process_due(db, lambda job: seen.append(Path(job["local_path"]).read_bytes()), uploads_dir=uploads)
+    assert not seen, "File job was claimed and processed when role column was missing!"
+    assert src_file.exists(), "Source file was deleted!"
+
+
+def test_adversarial_delivered_legacy_original_survives_migration_and_sweep(env):
+    """HIGH-02: Delivered legacy original without order_results must quarantine, not result, and survive sweep."""
+    db, uploads = env["db"], env["uploads"]
+    src_file, src_sha = _create_synthetic_source(uploads, "adv2_src.jpg")
+    now = datetime.now(timezone.utc).isoformat()
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "INSERT INTO orders (id, name, phone, status, payment_status, created_at) "
+        "VALUES (102, 'Adv2', '0', 'paid', 'paid', ?)", (now,)
+    )
+    jid = delivery.enqueue(
+        conn, order_id=102, kind="file", local_path=str(src_file),
+        remote_path="PhotoDoc_Orders/102_src.jpg", sha256=src_sha, size=src_file.stat().st_size
+    )
+    conn.execute("UPDATE delivery_jobs SET state='delivered', delivered_at=? WHERE id=?", (now, jid))
+    conn.commit()
+    conn.close()
+
+    _strip_artifact_role_column(db)
+
+    res = reconcile(db, apply=True, uploads_dir=uploads)
+    assert res["applied"] is True
+
+    conn = sqlite3.connect(db)
+    role = conn.execute("SELECT artifact_role FROM delivery_jobs WHERE id=?", (jid,)).fetchone()[0]
+    conn.close()
+
+    assert role != "result", f"Delivered legacy original was converted to result: {role}"
+    cleaned = delivery.process_due_cleanups(db, uploads_dir=uploads)
+    assert cleaned == 0
+    assert src_file.exists(), "Delivered legacy original was deleted by cleanup sweep!"
+
+
+def test_adversarial_conflicting_result_hash_quarantines_and_protects(env):
+    """HIGH-03: When order_results has conflicting path vs hash, artifact is quarantined and not delivered."""
+    db, uploads = env["db"], env["uploads"]
+    src_file, src_sha = _create_synthetic_source(uploads, "adv3_src.jpg")
+    proc_file, proc_sha = _create_synthetic_result(uploads, "adv3_proc.jpg")
+    now = datetime.now(timezone.utc).isoformat()
+
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "INSERT INTO orders (id, name, phone, status, payment_status, created_at) "
+        "VALUES (103, 'Adv3', '0', 'paid', 'paid', ?)", (now,)
+    )
+    jid = delivery.enqueue(
+        conn, order_id=103, kind="file", local_path=str(src_file),
+        remote_path="PhotoDoc_AI/103_result.bin", sha256=src_sha, size=src_file.stat().st_size
+    )
+    operator_workflow.initialize(conn)
+    # Conflicting metadata: path points to proc_file, but sha256 matches src_file!
+    conn.execute(
+        "INSERT INTO order_results (order_id, path, sha256, size, version, updated_at) "
+        "VALUES (103, ?, ?, ?, 1, ?)",
+        (str(proc_file), src_sha, proc_file.stat().st_size, now),
+    )
+    conn.commit()
+    conn.close()
+
+    reconcile(db, apply=True, uploads_dir=uploads)
+
+    conn = sqlite3.connect(db)
+    role = conn.execute("SELECT artifact_role FROM delivery_jobs WHERE id=?", (jid,)).fetchone()[0]
+    conn.close()
+
+    assert role != "result", f"Conflicting artifact accepted as result: {role}"
+    assert role == "quarantine"
+
+    seen = []
+    delivery.process_due(db, lambda job: seen.append(Path(job["local_path"]).read_bytes()), uploads_dir=uploads)
+    assert not seen
+    assert src_file.exists()
+
+
+def test_adversarial_source_in_deleting_phase_never_unlinked(env):
+    """HIGH-04 part 1: A source file with phase='deleting' is NEVER deleted if file physically exists."""
+    db, uploads = env["db"], env["uploads"]
+    src_file, src_sha = _create_synthetic_source(uploads, "adv4_src.jpg")
+    now = datetime.now(timezone.utc).isoformat()
+
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "INSERT INTO orders (id, name, phone, status, payment_status, created_at) "
+        "VALUES (104, 'Adv4', '0', 'paid', 'paid', ?)", (now,)
+    )
+    jid = delivery.enqueue(
+        conn, order_id=104, kind="file", local_path=str(src_file),
+        remote_path="PhotoDoc_Orders/104_src.jpg", sha256=src_sha, size=src_file.stat().st_size,
+        artifact_role="source"
+    )
+    conn.execute(
+        "UPDATE delivery_jobs SET state='delivered', cleanup_state='pending', cleanup_phase='deleting', delivered_at=? WHERE id=?",
+        (now, jid),
+    )
+    conn.commit()
+    conn.close()
+
+    cleaned = delivery.perform_job_cleanup(db, jid, uploads_dir=uploads)
+    assert cleaned is False
+    assert src_file.exists(), "Source file in deleting phase was unlinked!"
+
+
+def test_adversarial_quarantine_not_returned_by_operator_source_download(env):
+    """MEDIUM-01: Quarantined artifacts are never returned to operator as legitimate source photos."""
+    db, uploads = env["db"], env["uploads"]
+    quar_file, quar_sha = _create_synthetic_source(uploads, "adv5_quar.jpg")
+    now = datetime.now(timezone.utc).isoformat()
+
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "INSERT INTO orders (id, name, phone, status, payment_status, created_at) "
+        "VALUES (105, 'Adv5', '0', 'paid', 'paid', ?)", (now,)
+    )
+    delivery.enqueue(
+        conn, order_id=105, kind="file", local_path=str(quar_file),
+        remote_path="PhotoDoc_AI/105_result.bin", sha256=quar_sha, size=quar_file.stat().st_size,
+        artifact_role="quarantine"
+    )
+    conn.commit()
+    conn.close()
+
+    try:
+        returned = operator_workflow.source_for_download(db, 105)
+        assert returned != quar_file, "Quarantine file returned as source for download!"
+    except HTTPException as exc:
+        assert exc.status_code in (409, 410)
+
+
+def test_adversarial_null_role_never_cleaned_directly(env):
+    """HIGH-04 part 2: Direct call to perform_job_cleanup refuses to delete NULL-role file."""
+    db, uploads = env["db"], env["uploads"]
+    src_file, src_sha = _create_synthetic_source(uploads, "adv6_src.jpg")
+    now = datetime.now(timezone.utc).isoformat()
+
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "INSERT INTO orders (id, name, phone, status, payment_status, created_at) "
+        "VALUES (106, 'Adv6', '0', 'paid', 'paid', ?)", (now,)
+    )
+    jid = delivery.enqueue(
+        conn, order_id=106, kind="file", local_path=str(src_file),
+        remote_path="PhotoDoc_Orders/106_src.jpg", sha256=src_sha, size=src_file.stat().st_size
+    )
+    conn.execute(
+        "UPDATE delivery_jobs SET artifact_role=NULL, state='delivered', cleanup_state='pending', "
+        "cleanup_phase='pending', delivered_at=? WHERE id=?",
+        (now, jid),
+    )
+    conn.commit()
+    conn.close()
+
+    cleaned = delivery.perform_job_cleanup(db, jid, uploads_dir=uploads)
+    assert cleaned is False
+    assert src_file.exists(), "NULL-role file was deleted directly by cleanup!"
+
+
+def test_adversarial_real_delivery_handler_rejects_non_result_artifacts(env, monkeypatch):
+    """HIGH-01 handler: main.deliver_job() rejects file jobs whose artifact_role is not result."""
+    db, uploads = env["db"], env["uploads"]
+    src_file, src_sha = _create_synthetic_source(uploads, "107_adv7_src.jpg")
+    now = datetime.now(timezone.utc).isoformat()
+
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "INSERT INTO orders (id, name, phone, status, payment_status, created_at) "
+        "VALUES (107, 'Adv7', '0', 'paid', 'paid', ?)", (now,)
+    )
+    jid = delivery.enqueue(
+        conn, order_id=107, kind="file", local_path=str(src_file),
+        remote_path="PhotoDoc_Orders/107_result.bin", sha256=src_sha, size=src_file.stat().st_size
+    )
+    conn.commit()
+    conn.close()
+
+    _strip_artifact_role_column(db)
+
+    sent = []
+    def mock_upload(path, *args, **kwargs):
+        sent.append(Path(path).read_bytes())
+        return True
+    monkeypatch.setattr(main, "upload_to_yandex_disk", mock_upload)
+
+    delivery.process_due(db, main.deliver_job, uploads_dir=uploads)
+    assert not sent, "Legacy original was sent by real delivery handler!"
+    assert src_file.exists(), "Source file was deleted after delivery handler!"
+
+
+def test_adversarial_repeated_migration_heals_and_protects_delivered_original(env):
+    """HIGH-02 repeated: Repeated reconcile() never keeps delivered original as result."""
+    db, uploads = env["db"], env["uploads"]
+    src_file, src_sha = _create_synthetic_source(uploads, "adv8_src.jpg")
+    now = datetime.now(timezone.utc).isoformat()
+
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "INSERT INTO orders (id, name, phone, status, payment_status, created_at) "
+        "VALUES (108, 'Adv8', '0', 'paid', 'paid', ?)", (now,)
+    )
+    jid = delivery.enqueue(
+        conn, order_id=108, kind="file", local_path=str(src_file),
+        remote_path="PhotoDoc_Orders/108_src.jpg", sha256=src_sha, size=src_file.stat().st_size
+    )
+    conn.execute("UPDATE delivery_jobs SET state='delivered', delivered_at=? WHERE id=?", (now, jid))
+    conn.commit()
+    conn.close()
+
+    _strip_artifact_role_column(db)
+
+    first = reconcile(db, apply=True, uploads_dir=uploads)
+    second = reconcile(db, apply=True, uploads_dir=uploads)
+
+    conn = sqlite3.connect(db)
+    role = conn.execute("SELECT artifact_role FROM delivery_jobs WHERE id=?", (jid,)).fetchone()[0]
+    conn.close()
+
+    assert role != "result"
+    assert src_file.exists()
+
+
+def test_adversarial_finish_rejects_processing_source(env):
+    """MEDIUM-02: delivery.finish() returns False and refuses to mark state='delivered' on source jobs."""
+    db, uploads = env["db"], env["uploads"]
+    src_file, src_sha = _create_synthetic_source(uploads, "adv9_src.jpg")
+    now = datetime.now(timezone.utc).isoformat()
+
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "INSERT INTO orders (id, name, phone, status, payment_status, created_at) "
+        "VALUES (109, 'Adv9', '0', 'paid', 'paid', ?)", (now,)
+    )
+    jid = delivery.enqueue(
+        conn, order_id=109, kind="file", local_path=str(src_file),
+        remote_path="PhotoDoc_Orders/109_src.jpg", sha256=src_sha, size=src_file.stat().st_size,
+        artifact_role="source"
+    )
+    lease = (datetime.now(timezone.utc) + timedelta(minutes=2)).isoformat()
+    conn.execute("UPDATE delivery_jobs SET state='processing', lease_until=? WHERE id=?", (lease, jid))
+    conn.commit()
+    conn.close()
+
+    finished = delivery.finish(db, jid, lease_until=lease)
+    conn = sqlite3.connect(db)
+    state = conn.execute("SELECT state FROM delivery_jobs WHERE id=?", (jid,)).fetchone()[0]
+    conn.close()
+
+    assert finished is False
+    assert state != "delivered"
+

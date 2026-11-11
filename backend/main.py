@@ -1206,6 +1206,10 @@ def deliver_job(job: dict) -> None:
         raise RuntimeError("Order for delivery job is missing")
     if job["kind"] in ("file", "info"):
         require_paid_order(job["order_id"])
+        if job["kind"] == "file":
+            role = job.get("artifact_role")
+            if role != "result":
+                raise RuntimeError(f"Delivery forbidden for non-result artifact role: '{role}'")
         raw_path = job.get("local_path")
         if not raw_path:
             raise RuntimeError("Delivery job is missing local_path")

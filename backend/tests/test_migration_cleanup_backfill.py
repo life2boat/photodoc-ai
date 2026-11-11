@@ -102,9 +102,18 @@ def test_migration_backfill_delivered_job_with_existing_file_schedules_cleanup(t
             "VALUES (1, 'Historical Client', '+79991234567', 'paid', 300.0, 'hash1')"
         )
         conn.execute(
+            "CREATE TABLE IF NOT EXISTS order_results ("
+            "order_id INTEGER PRIMARY KEY, path TEXT, sha256 TEXT, size INTEGER, version INTEGER, updated_at TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO order_results (order_id, path, sha256, size, version, updated_at) "
+            "VALUES (1, ?, ?, ?, 1, ?)",
+            (str(photo_file), photo_sha, photo_size, delivered_time),
+        )
+        conn.execute(
             "INSERT INTO delivery_jobs (id, order_id, kind, local_path, original_name, remote_path, "
             "content_sha256, content_size, state, attempts, next_attempt_at, created_at, delivered_at) "
-            "VALUES ('job-legacy-1', 1, 'file', ?, 'test_photo.jpg', 'Remote/1_test_photo.jpg', "
+            "VALUES ('job-legacy-1', 1, 'file', ?, 'test_photo.jpg', 'Remote/1_result.bin', "
             "?, ?, 'delivered', 1, ?, ?, ?)",
             (str(photo_file), photo_sha, photo_size, delivered_time, delivered_time, delivered_time),
         )

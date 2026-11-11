@@ -145,7 +145,7 @@ def claim_due(db_path: Path, max_attempts: int = DEFAULT_MAX_ATTEMPTS) -> dict |
                 WHERE j.kind='paid_email' AND j.order_id=paid_email_outbox.order_id
                 AND (j.lease_until IS NULL OR j.lease_until<=?))""", (now, now))
         cols = {r[1] for r in conn.execute("PRAGMA table_info(delivery_jobs)").fetchall()}
-        role_predicate = "(kind != 'file' OR artifact_role = 'result')" if "artifact_role" in cols else "(kind != 'file' OR (remote_path LIKE '%_result.bin' AND remote_path NOT LIKE '%_source%'))"
+        role_predicate = "(kind != 'file' OR artifact_role = 'result')" if "artifact_role" in cols else "kind != 'file'"
         row = conn.execute(
             "SELECT * FROM delivery_jobs WHERE "
             "COALESCE(remote_path,'') NOT LIKE 'remote/%' AND "
@@ -190,10 +190,20 @@ def finish(db_path: Path, job_id: str, error: Exception | None = None, lease_unt
     try:
         conn.execute("BEGIN IMMEDIATE")
         if error is None:
-            row = conn.execute("SELECT kind,order_id FROM delivery_jobs WHERE id=?", (job_id,)).fetchone()
-            if row and row[0] in ("file", "info", "paid_email"):
-                paid = conn.execute("SELECT payment_status FROM orders WHERE id=?", (row[1],)).fetchone()
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(delivery_jobs)").fetchall()}
+            has_role = "artifact_role" in cols
+            query = "SELECT kind, order_id, artifact_role FROM delivery_jobs WHERE id=?" if has_role else "SELECT kind, order_id FROM delivery_jobs WHERE id=?"
+            row = conn.execute(query, (job_id,)).fetchone()
+            if not row:
+                return False
+            kind, order_id = row[0], row[1]
+            if kind in ("file", "info", "paid_email"):
+                paid = conn.execute("SELECT payment_status FROM orders WHERE id=?", (order_id,)).fetchone()
                 if not paid or paid[0] != "paid":
+                    return False
+            if kind == "file":
+                if not has_role or (len(row) > 2 and row[2] != "result"):
+                    # Only verified result files can be marked delivered
                     return False
             if lease_until is not None:
                 cursor = conn.execute(
@@ -355,13 +365,22 @@ def perform_job_cleanup(
             conn.commit()
             return False
 
-        # Invariant C: source copies and quarantined artifacts must never be deleted by normal delivery cleanup
-        if has_role and job["kind"] == "file" and job["artifact_role"] in ("source", "quarantine", "unknown") and job["cleanup_phase"] != "deleting":
-            conn.commit()
-            return False
-        if not has_role and job["kind"] == "file" and (job["local_path"] or "").find("source") != -1 and job["cleanup_phase"] != "deleting":
-            conn.commit()
-            return False
+        # Invariant C: only verified result files may be deleted by delivery cleanup.
+        # Original customer photos, quarantined files, and unverified/null roles must NEVER be deleted.
+        if job["kind"] == "file":
+            if not has_role or job["artifact_role"] != "result":
+                raw_path = job["local_path"]
+                file_present = False
+                if raw_path:
+                    p = Path(raw_path)
+                    if p.is_file():
+                        file_present = True
+                    elif uploads_dir is not None and (uploads_dir / p.name).is_file():
+                        file_present = True
+                if file_present:
+                    # File physically exists: NEVER delete non-result files!
+                    conn.commit()
+                    return False
 
         # Only delivered jobs can have their local files cleaned up
         if job["state"] != "delivered":
@@ -598,9 +617,12 @@ def perform_job_cleanup(
     conn = sqlite3.connect(db_path, timeout=10)
     try:
         conn.execute("BEGIN IMMEDIATE")
+        cols_check = {r[1] for r in conn.execute("PRAGMA table_info(delivery_jobs)").fetchall()}
+        has_role_check = "artifact_role" in cols_check
+        role_select = ", artifact_role" if has_role_check else ""
         row = conn.execute(
-            "SELECT cleanup_lease_until, cleanup_state, cleanup_attempts, state, local_path, "
-            "content_sha256, content_size, kind, order_id FROM delivery_jobs WHERE id=?",
+            f"SELECT cleanup_lease_until, cleanup_state, cleanup_attempts, state, local_path, "
+            f"content_sha256, content_size, kind, order_id{role_select} FROM delivery_jobs WHERE id=?",
             (job_id,),
         ).fetchone()
         if not row:
@@ -620,10 +642,16 @@ def perform_job_cleanup(
             conn.rollback()
             return False
 
+        # Fail-closed check: non-result files must NEVER be deleted
+        if row[7] == "file":
+            if not has_role_check or (len(row) > 9 and row[9] != "result"):
+                conn.rollback()
+                return False
+
         # Earlier checks and the durable intent are not a deletion authorization:
         # another worker may have changed delivery or added a consumer since then.
         # BEGIN IMMEDIATE fences these checks against enqueue/state transitions.
-        if tuple(row[3:]) != (
+        if tuple(row[3:9]) != (
             "delivered", raw_local_path, expected_sha256, expected_size, job["kind"], job["order_id"]
         ):
             conn.rollback()
@@ -714,7 +742,7 @@ def process_due_cleanups(
         cols = {row[1] for row in conn.execute("PRAGMA table_info(delivery_jobs)").fetchall()}
         if "cleanup_state" not in cols:
             return 0
-        role_predicate = "AND (kind != 'file' OR artifact_role = 'result')" if "artifact_role" in cols else "AND (kind != 'file' OR (remote_path LIKE '%_result.bin' AND remote_path NOT LIKE '%_source%'))"
+        role_predicate = "AND (kind != 'file' OR artifact_role = 'result')" if "artifact_role" in cols else "AND kind != 'file'"
         rows = conn.execute(
             "SELECT id FROM delivery_jobs "
             "WHERE state='delivered' AND kind IN ('file', 'info') "

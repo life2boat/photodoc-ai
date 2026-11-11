@@ -142,8 +142,22 @@ def _source_job(conn: sqlite3.Connection, order_id: int):
         for row in rows:
             if row["artifact_role"] == "source":
                 return row
+        for row in rows:
+            if row["artifact_role"] in (None, "", "unknown"):
+                if _is_result_job(row):
+                    continue
+                rpath = row["remote_path"] or ""
+                lpath = row["local_path"] or ""
+                if "_result" in rpath or "_result" in lpath:
+                    continue
+                return row
+        return None
     for row in rows:
         if _is_result_job(row):
+            continue
+        rpath = row["remote_path"] or ""
+        lpath = row["local_path"] or ""
+        if "_result" in rpath or "_result" in lpath:
             continue
         return row
     return None
@@ -170,13 +184,19 @@ def _source_path(conn: sqlite3.Connection, order_id: int) -> Path | None:
 
 def _quarantine_for(conn: sqlite3.Connection, order_id: int) -> Path | None:
     job = _source_job(conn, order_id)
-    if job is None:
-        return None
-    quarantine = uploads_dir() / ".quarantine"
-    if not quarantine.is_dir():
-        return None
-    for claim in quarantine.glob(f"{job['id']}.*.claim"):
-        return claim
+    if job is not None:
+        quarantine = uploads_dir() / ".quarantine"
+        if quarantine.is_dir():
+            for claim in quarantine.glob(f"{job['id']}.*.claim"):
+                return claim
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(delivery_jobs)").fetchall()}
+    if "artifact_role" in cols:
+        row = conn.execute(
+            "SELECT id FROM delivery_jobs WHERE order_id=? AND artifact_role='quarantine'",
+            (order_id,),
+        ).fetchone()
+        if row is not None:
+            return uploads_dir() / ".quarantine" / f"{row['id']}.quarantine"
     return None
 
 

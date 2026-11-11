@@ -47,7 +47,9 @@ def reconcile(db_path: Path, apply: bool = False, uploads_dir: Path | None = Non
         unrepaired_count = 0
         if table:
             query_parts = []
-            if "cleanup_phase" in delivery_cols:
+            if "cleanup_phase" in delivery_cols and "artifact_role" in delivery_cols:
+                query_parts.append("(cleanup_phase = 'none' AND kind IN ('file', 'info') AND state = 'delivered' AND artifact_role = 'result')")
+            elif "cleanup_phase" in delivery_cols:
                 query_parts.append("(cleanup_phase = 'none' AND kind IN ('file', 'info') AND state = 'delivered')")
             if "cleanup_state" in delivery_cols and "local_deleted_at" in delivery_cols:
                 query_parts.append(
@@ -70,14 +72,14 @@ def reconcile(db_path: Path, apply: bool = False, uploads_dir: Path | None = Non
                     "OR (kind = 'file' AND artifact_role = 'result' AND ("
                     "  remote_path NOT LIKE '%_result.bin' OR "
                     "  NOT EXISTS (SELECT 1 FROM order_results r WHERE r.order_id = delivery_jobs.order_id "
-                    "              AND (r.path = delivery_jobs.local_path OR r.sha256 = delivery_jobs.content_sha256))"
-                    ") AND (state != 'delivered' OR EXISTS (SELECT 1 FROM order_results r WHERE r.order_id = delivery_jobs.order_id)))"
+                    "              AND r.path = delivery_jobs.local_path AND r.sha256 = delivery_jobs.content_sha256)"
+                    "))"
                 ).fetchone()[0]
             else:
                 unclassified_role_count = conn.execute(
                     "SELECT COUNT(*) FROM delivery_jobs "
                     "WHERE ((artifact_role IS NULL OR artifact_role IN ('', 'unknown')) AND kind IN ('file', 'info')) "
-                    "OR (kind = 'file' AND artifact_role = 'result' AND state != 'delivered')"
+                    "OR (kind = 'file' AND artifact_role = 'result')"
                 ).fetchone()[0]
 
         needed = (
@@ -151,30 +153,49 @@ def reconcile(db_path: Path, apply: bool = False, uploads_dir: Path | None = Non
                     is_source = False
                     is_ambiguous = False
 
-                    if rpath.endswith("_result.bin"):
+                    ends_result = rpath.endswith("_result.bin")
+                    has_source_marker = "_source" in rpath.lower() or "_source" in lpath.lower()
+
+                    if ends_result:
                         if ores is not None:
-                            matches_path = bool(lpath and ores["path"] and lpath == ores["path"])
-                            matches_sha = bool(jsha and ores["sha256"] and jsha == ores["sha256"])
-                            if matches_path or matches_sha:
+                            path_match = bool(lpath and ores["path"] and lpath == ores["path"])
+                            sha_match = bool(jsha and ores["sha256"] and jsha == ores["sha256"])
+                            # Authoritative proof requires both path and hash to match without conflict
+                            if path_match and sha_match and not has_source_marker:
                                 is_result = True
                             else:
                                 is_ambiguous = True
                         else:
+                            # Ends with _result.bin but no order_results record: ambiguous legacy artifact
                             is_ambiguous = True
                     else:
-                        matches_result = False
+                        # remote_path does not end with _result.bin
                         if ores is not None:
-                            if (lpath and ores["path"] and lpath == ores["path"]) or (jsha and ores["sha256"] and jsha == ores["sha256"]):
-                                matches_result = True
-                        if matches_result or "_result_" in lpath:
-                            is_ambiguous = True
-                        elif lpath:
-                            if jstate == "delivered" and ores is None:
-                                is_result = True
-                            else:
+                            conflicts_with_result = bool(
+                                (lpath and ores["path"] and lpath == ores["path"]) or
+                                (jsha and ores["sha256"] and jsha == ores["sha256"])
+                            )
+                            if conflicts_with_result or "_result_" in lpath:
+                                is_ambiguous = True
+                            elif lpath and not has_source_marker and jstate == "delivered":
+                                # Delivered without result suffix: ambiguous historical artifact
+                                is_ambiguous = True
+                            elif lpath:
                                 is_source = True
+                            else:
+                                is_ambiguous = True
                         else:
-                            is_ambiguous = True
+                            # No order_results table or record
+                            if "_result_" in lpath or "_result" in rpath:
+                                is_ambiguous = True
+                            elif jstate == "delivered":
+                                # Historical delivered job without order_results: ambiguous historical delivery!
+                                # Per HIGH-02, must NEVER be converted to result!
+                                is_ambiguous = True
+                            elif lpath:
+                                is_source = True
+                            else:
+                                is_ambiguous = True
 
                     if is_result and not is_ambiguous:
                         new_role = "result"
@@ -183,19 +204,19 @@ def reconcile(db_path: Path, apply: bool = False, uploads_dir: Path | None = Non
                     else:
                         new_role = "quarantine"
 
-                    if cur_role is None or cur_role in ("", "unknown") or (cur_role == "result" and new_role != "result"):
+                    if cur_role != new_role:
                         conn.execute("UPDATE delivery_jobs SET artifact_role = ? WHERE id = ?", (new_role, jid))
 
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_cleanup_due ON delivery_jobs(state, cleanup_state, cleanup_lease_until)")
                 conn.execute("UPDATE delivery_jobs SET cleanup_state='not_applicable', cleanup_phase='none' WHERE kind NOT IN ('file', 'info')")
 
-                # Historical backfill and repair: inspect physical filesystem for delivered file/info jobs
+                # Historical backfill and repair: inspect physical filesystem for delivered RESULT file/info jobs
                 # Never assume delivered implies cleaned or invent local_deleted_at
                 delivered_rows = conn.execute(
-                    "SELECT id, local_path, cleanup_state, cleanup_phase, local_deleted_at, delivered_at "
+                    "SELECT id, local_path, cleanup_state, cleanup_phase, local_deleted_at, delivered_at, artifact_role "
                     "FROM delivery_jobs WHERE state='delivered' AND kind IN ('file', 'info')"
                 ).fetchall()
-                for job_id, local_path, cur_cstate, cur_cphase, cur_deleted_at, deliv_at in delivered_rows:
+                for job_id, local_path, cur_cstate, cur_cphase, cur_deleted_at, deliv_at, arole in delivered_rows:
                     file_exists = False
                     if local_path:
                         p = Path(local_path)
@@ -205,12 +226,20 @@ def reconcile(db_path: Path, apply: bool = False, uploads_dir: Path | None = Non
                             file_exists = True
 
                     if file_exists:
-                        # File physically exists: schedule for verified cleanup
-                        conn.execute(
-                            "UPDATE delivery_jobs SET cleanup_state='pending', cleanup_phase='pending', "
-                            "local_deleted_at=NULL, cleanup_error=NULL WHERE id=?",
-                            (job_id,),
-                        )
+                        if arole in ("result", "info"):
+                            # Verified result/info file physically exists: schedule for verified cleanup
+                            conn.execute(
+                                "UPDATE delivery_jobs SET cleanup_state='pending', cleanup_phase='pending', "
+                                "local_deleted_at=NULL, cleanup_error=NULL WHERE id=?",
+                                (job_id,),
+                            )
+                        else:
+                            # Source or quarantine file physically exists: must NEVER be deleted by delivery cleanup
+                            conn.execute(
+                                "UPDATE delivery_jobs SET cleanup_state='not_applicable', cleanup_phase='none', "
+                                "local_deleted_at=NULL, cleanup_error=NULL WHERE id=?",
+                                (job_id,),
+                            )
                     else:
                         # File is physically absent from disk:
                         has_genuine_evidence = (
