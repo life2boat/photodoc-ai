@@ -78,7 +78,8 @@ jobs:
                tests/test_payment_security.py \
                tests/test_delivery_concurrency.py \
                tests/test_migration_cleanup_backfill.py \
-               tests/test_migration_reconciliation.py -v
+               tests/test_migration_reconciliation.py \
+               tests/test_legacy_artifact_role_migration.py -v
     - name: Verify preflight scripts
       run: |
         python ../scripts/production_preflight.py --db nonexistent.db || true
@@ -222,6 +223,7 @@ jobs:
       run: |
         pytest tests/test_migration_cleanup_backfill.py \
                tests/test_migration_reconciliation.py \
+               tests/test_legacy_artifact_role_migration.py \
                tests/test_stage2_customer_journey.py -v
 
   docker-build:

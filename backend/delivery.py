@@ -22,6 +22,8 @@ _UPLOADS_DIR = DEFAULT_UPLOADS_DIR
 ROLE_SOURCE = "source"
 ROLE_RESULT = "result"
 ROLE_INFO = "info"
+ROLE_QUARANTINE = "quarantine"
+ROLE_UNKNOWN = "unknown"
 
 
 def set_uploads_dir(path: Path) -> None:
@@ -93,12 +95,18 @@ def enqueue(conn: sqlite3.Connection, *, order_id: int, kind: str,
     # artifact_role is explicitly set by callers (create_order: source, submit_delivery: result)
     cols = {r[1] for r in conn.execute("PRAGMA table_info(delivery_jobs)").fetchall()}
     if "artifact_role" in cols:
+        effective_role = artifact_role
+        if effective_role is None:
+            if kind == "info":
+                effective_role = ROLE_INFO
+            elif kind == "file":
+                effective_role = ROLE_UNKNOWN
         conn.execute(
             "INSERT OR IGNORE INTO delivery_jobs "
             "(id, order_id, kind, artifact_role, local_path, original_name, remote_path, content_sha256, "
             "content_size, next_attempt_at, created_at, cleanup_state, cleanup_phase) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (job_id, order_id, kind, artifact_role, local_path, original_name, remote_path, sha256, size, now, now, cleanup_state, cleanup_phase),
+            (job_id, order_id, kind, effective_role, local_path, original_name, remote_path, sha256, size, now, now, cleanup_state, cleanup_phase),
         )
     else:
         conn.execute(
@@ -137,7 +145,7 @@ def claim_due(db_path: Path, max_attempts: int = DEFAULT_MAX_ATTEMPTS) -> dict |
                 WHERE j.kind='paid_email' AND j.order_id=paid_email_outbox.order_id
                 AND (j.lease_until IS NULL OR j.lease_until<=?))""", (now, now))
         cols = {r[1] for r in conn.execute("PRAGMA table_info(delivery_jobs)").fetchall()}
-        role_predicate = "(kind != 'file' OR COALESCE(artifact_role, '') != 'source')" if "artifact_role" in cols else "(kind != 'file' OR remote_path LIKE '%_result.bin')"
+        role_predicate = "(kind != 'file' OR artifact_role = 'result')" if "artifact_role" in cols else "(kind != 'file' OR (remote_path LIKE '%_result.bin' AND remote_path NOT LIKE '%_source%'))"
         row = conn.execute(
             "SELECT * FROM delivery_jobs WHERE "
             "COALESCE(remote_path,'') NOT LIKE 'remote/%' AND "
@@ -347,8 +355,11 @@ def perform_job_cleanup(
             conn.commit()
             return False
 
-        # Invariant C: source copies must never be deleted by normal delivery cleanup
-        if has_role and job["artifact_role"] == "source" and job["cleanup_phase"] != "deleting":
+        # Invariant C: source copies and quarantined artifacts must never be deleted by normal delivery cleanup
+        if has_role and job["kind"] == "file" and job["artifact_role"] in ("source", "quarantine", "unknown") and job["cleanup_phase"] != "deleting":
+            conn.commit()
+            return False
+        if not has_role and job["kind"] == "file" and (job["local_path"] or "").find("source") != -1 and job["cleanup_phase"] != "deleting":
             conn.commit()
             return False
 
@@ -703,7 +714,7 @@ def process_due_cleanups(
         cols = {row[1] for row in conn.execute("PRAGMA table_info(delivery_jobs)").fetchall()}
         if "cleanup_state" not in cols:
             return 0
-        role_predicate = "AND (kind != 'file' OR COALESCE(artifact_role, '') != 'source')" if "artifact_role" in cols else "AND (kind != 'file' OR remote_path LIKE '%_result.bin')"
+        role_predicate = "AND (kind != 'file' OR artifact_role = 'result')" if "artifact_role" in cols else "AND (kind != 'file' OR (remote_path LIKE '%_result.bin' AND remote_path NOT LIKE '%_source%'))"
         rows = conn.execute(
             "SELECT id FROM delivery_jobs "
             "WHERE state='delivered' AND kind IN ('file', 'info') "

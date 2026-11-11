@@ -58,6 +58,28 @@ def reconcile(db_path: Path, apply: bool = False, uploads_dir: Path | None = Non
                 unrepaired_query = f"SELECT COUNT(*) FROM delivery_jobs WHERE {' OR '.join(query_parts)}"
                 unrepaired_count = conn.execute(unrepaired_query).fetchone()[0]
 
+        unclassified_role_count = 0
+        if table is not None and "artifact_role" in delivery_cols:
+            has_order_results = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='order_results'"
+            ).fetchone() is not None
+            if has_order_results:
+                unclassified_role_count = conn.execute(
+                    "SELECT COUNT(*) FROM delivery_jobs "
+                    "WHERE ((artifact_role IS NULL OR artifact_role IN ('', 'unknown')) AND kind IN ('file', 'info')) "
+                    "OR (kind = 'file' AND artifact_role = 'result' AND ("
+                    "  remote_path NOT LIKE '%_result.bin' OR "
+                    "  NOT EXISTS (SELECT 1 FROM order_results r WHERE r.order_id = delivery_jobs.order_id "
+                    "              AND (r.path = delivery_jobs.local_path OR r.sha256 = delivery_jobs.content_sha256))"
+                    ") AND (state != 'delivered' OR EXISTS (SELECT 1 FROM order_results r WHERE r.order_id = delivery_jobs.order_id)))"
+                ).fetchone()[0]
+            else:
+                unclassified_role_count = conn.execute(
+                    "SELECT COUNT(*) FROM delivery_jobs "
+                    "WHERE ((artifact_role IS NULL OR artifact_role IN ('', 'unknown')) AND kind IN ('file', 'info')) "
+                    "OR (kind = 'file' AND artifact_role = 'result' AND state != 'delivered')"
+                ).fetchone()[0]
+
         needed = (
             "order_token_hash" not in columns
             or table is None
@@ -65,6 +87,7 @@ def reconcile(db_path: Path, apply: bool = False, uploads_dir: Path | None = Non
             or "artifact_role" not in delivery_cols
             or not {"idx_delivery_due", "idx_cleanup_due", "idx_paid_email_once", "idx_admin_email_once"} <= indexes
             or unrepaired_count > 0
+            or unclassified_role_count > 0
         )
 
         if apply and needed:
@@ -92,33 +115,76 @@ def reconcile(db_path: Path, apply: bool = False, uploads_dir: Path | None = Non
                 if "artifact_role" not in delivery_cols:
                     conn.execute("ALTER TABLE delivery_jobs ADD COLUMN artifact_role TEXT")
 
-                # Backfill artifact_role for existing rows
+                # Authoritative classification of artifact_role
                 has_order_results = conn.execute(
                     "SELECT 1 FROM sqlite_master WHERE type='table' AND name='order_results'"
                 ).fetchone() is not None
+
+                results_by_order = {}
                 if has_order_results:
-                    conn.execute(
-                        "UPDATE delivery_jobs SET artifact_role = 'result' "
-                        "WHERE (artifact_role IS NULL OR artifact_role = '') AND kind = 'file' AND ("
-                        "  remote_path LIKE '%_result.bin' OR "
-                        "  EXISTS (SELECT 1 FROM order_results r WHERE r.order_id=delivery_jobs.order_id)"
-                        ")"
-                    )
-                else:
-                    conn.execute(
-                        "UPDATE delivery_jobs SET artifact_role = 'result' "
-                        "WHERE (artifact_role IS NULL OR artifact_role = '') AND kind = 'file' AND ("
-                        "  remote_path LIKE '%_result.bin'"
-                        ")"
-                    )
-                conn.execute(
-                    "UPDATE delivery_jobs SET artifact_role = 'source' "
-                    "WHERE (artifact_role IS NULL OR artifact_role = '') AND kind = 'file' AND state != 'delivered'"
-                )
+                    for r in conn.execute("SELECT order_id, path, sha256, size FROM order_results").fetchall():
+                        results_by_order[r[0]] = {"path": r[1], "sha256": r[2], "size": r[3]}
+
                 conn.execute(
                     "UPDATE delivery_jobs SET artifact_role = 'info' "
                     "WHERE (artifact_role IS NULL OR artifact_role = '') AND kind = 'info'"
                 )
+
+                file_jobs = conn.execute(
+                    "SELECT id, order_id, local_path, original_name, remote_path, content_sha256, artifact_role, state "
+                    "FROM delivery_jobs WHERE kind = 'file'"
+                ).fetchall()
+
+                for job in file_jobs:
+                    jid = job[0]
+                    oid = job[1]
+                    lpath = job[2] or ""
+                    orig_name = job[3] or ""
+                    rpath = job[4] or ""
+                    jsha = job[5] or ""
+                    cur_role = job[6]
+                    jstate = job[7]
+
+                    ores = results_by_order.get(oid)
+
+                    is_result = False
+                    is_source = False
+                    is_ambiguous = False
+
+                    if rpath.endswith("_result.bin"):
+                        if ores is not None:
+                            matches_path = bool(lpath and ores["path"] and lpath == ores["path"])
+                            matches_sha = bool(jsha and ores["sha256"] and jsha == ores["sha256"])
+                            if matches_path or matches_sha:
+                                is_result = True
+                            else:
+                                is_ambiguous = True
+                        else:
+                            is_ambiguous = True
+                    else:
+                        matches_result = False
+                        if ores is not None:
+                            if (lpath and ores["path"] and lpath == ores["path"]) or (jsha and ores["sha256"] and jsha == ores["sha256"]):
+                                matches_result = True
+                        if matches_result or "_result_" in lpath:
+                            is_ambiguous = True
+                        elif lpath:
+                            if jstate == "delivered" and ores is None:
+                                is_result = True
+                            else:
+                                is_source = True
+                        else:
+                            is_ambiguous = True
+
+                    if is_result and not is_ambiguous:
+                        new_role = "result"
+                    elif is_source and not is_ambiguous:
+                        new_role = "source"
+                    else:
+                        new_role = "quarantine"
+
+                    if cur_role is None or cur_role in ("", "unknown") or (cur_role == "result" and new_role != "result"):
+                        conn.execute("UPDATE delivery_jobs SET artifact_role = ? WHERE id = ?", (new_role, jid))
 
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_cleanup_due ON delivery_jobs(state, cleanup_state, cleanup_lease_until)")
                 conn.execute("UPDATE delivery_jobs SET cleanup_state='not_applicable', cleanup_phase='none' WHERE kind NOT IN ('file', 'info')")
