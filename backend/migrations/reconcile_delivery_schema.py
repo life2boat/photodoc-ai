@@ -9,7 +9,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from db_contract import APPLICATION_ID, inspect_database  # noqa: E402
-from delivery import DELIVERY_SCHEMA, acquire_migration_gate, release_migration_gate  # noqa: E402
+from delivery import DELIVERY_SCHEMA, acquire_migration_gate, release_migration_gate, get_file_identity  # noqa: E402
 
 REQUIRED_CLEANUP_COLUMNS = {
     "cleanup_state",
@@ -72,9 +72,10 @@ def reconcile(db_path: Path, apply: bool = False, uploads_dir: Path | None = Non
             if has_order_results:
                 unclassified_role_count = conn.execute(
                     "SELECT COUNT(*) FROM delivery_jobs "
-                    "WHERE ((artifact_role IS NULL OR artifact_role IN ('', 'unknown')) AND kind IN ('file', 'info')) "
+                    "WHERE (artifact_role IS NULL OR artifact_role NOT IN ('source', 'result', 'quarantine', 'info')) "
                     "OR (kind = 'file' AND artifact_role = 'result' AND ("
-                    "  remote_path NOT LIKE '%_result.bin' OR remote_path LIKE '%_source%' OR "
+                    "  remote_path NOT LIKE '%_result.bin' OR remote_path LIKE '%_source%' OR remote_path LIKE '%_protected%' OR "
+                    "  EXISTS (SELECT 1 FROM delivery_jobs j2 WHERE j2.id != delivery_jobs.id AND j2.local_path = delivery_jobs.local_path AND j2.artifact_role IN ('source', 'quarantine')) OR "
                     "  NOT EXISTS (SELECT 1 FROM order_results r WHERE r.order_id = delivery_jobs.order_id "
                     "              AND r.path = delivery_jobs.local_path AND r.sha256 = delivery_jobs.content_sha256)"
                     ")) "
@@ -87,7 +88,7 @@ def reconcile(db_path: Path, apply: bool = False, uploads_dir: Path | None = Non
             else:
                 unclassified_role_count = conn.execute(
                     "SELECT COUNT(*) FROM delivery_jobs "
-                    "WHERE ((artifact_role IS NULL OR artifact_role IN ('', 'unknown')) AND kind IN ('file', 'info')) "
+                    "WHERE (artifact_role IS NULL OR artifact_role NOT IN ('source', 'result', 'quarantine', 'info')) "
                     "OR (kind = 'file' AND artifact_role = 'result') "
                     "OR (kind = 'file' AND artifact_role = 'source' AND remote_path LIKE '%_result.bin')"
                 ).fetchone()[0]
@@ -147,6 +148,29 @@ def reconcile(db_path: Path, apply: bool = False, uploads_dir: Path | None = Non
                     "FROM delivery_jobs WHERE kind = 'file'"
                 ).fetchall()
 
+                # Pre-pass: map canonical paths and physical identities to detect protected files / alias conflicts
+                protected_paths = set()
+                protected_fids = set()
+                jobs_by_path = {}
+                jobs_by_fid = {}
+                for job in file_jobs:
+                    lpath = job[2] or ""
+                    cpath = os.path.normcase(os.path.abspath(lpath)) if lpath else ""
+                    fid = get_file_identity(lpath) if lpath else None
+                    if not cpath and not fid:
+                        continue
+                    if cpath:
+                        jobs_by_path.setdefault(cpath, []).append(job)
+                    if fid:
+                        jobs_by_fid.setdefault(fid, []).append(job)
+                    rpath = (job[4] or "").lower()
+                    cur_role = job[6]
+                    if cur_role in ("source", "quarantine") or "_source" in rpath or "_protected" in rpath:
+                        if cpath:
+                            protected_paths.add(cpath)
+                        if fid:
+                            protected_fids.add(fid)
+
                 for job in file_jobs:
                     jid = job[0]
                     oid = job[1]
@@ -156,11 +180,13 @@ def reconcile(db_path: Path, apply: bool = False, uploads_dir: Path | None = Non
                     jsha = job[5] or ""
                     cur_role = job[6]
                     jstate = job[7]
+                    cpath = os.path.normcase(os.path.abspath(lpath)) if lpath else ""
+                    fid = get_file_identity(lpath) if lpath else None
 
                     ores = results_by_order.get(oid)
 
                     ends_result = rpath.endswith("_result.bin")
-                    has_source_marker = "_source" in rpath.lower() or "_source" in lpath.lower()
+                    has_source_marker = "_source" in rpath.lower() or "_source" in lpath.lower() or "_protected" in rpath.lower()
                     has_result_marker = "_result" in rpath.lower() or "_result" in lpath.lower()
 
                     path_match = bool(lpath and ores and lpath == ores["path"])
@@ -168,20 +194,35 @@ def reconcile(db_path: Path, apply: bool = False, uploads_dir: Path | None = Non
                     job_matches_ores = bool(ores is not None and path_match and sha_match)
                     job_conflicts_ores = bool(ores is not None and (path_match or sha_match))
 
-                    if cur_role == "quarantine":
+                    is_file_protected = bool((cpath and cpath in protected_paths) or (fid and fid in protected_fids))
+                    path_siblings = jobs_by_path.get(cpath, []) if cpath else []
+                    fid_siblings = jobs_by_fid.get(fid, []) if fid else []
+                    total_siblings = set(j[0] for j in path_siblings + fid_siblings)
+                    has_alias_conflict = bool(len(total_siblings) > 1 and is_file_protected)
+
+                    if cur_role not in (None, "", "unknown", "source", "result", "quarantine", "info"):
+                        # Non-standard or invalid roles must fail closed to quarantine
+                        new_role = "quarantine"
+                    elif cur_role == "quarantine":
                         # Explicit quarantine classifications must never be promoted
                         new_role = "quarantine"
                     elif cur_role == "source":
                         # Explicit source classifications must never be promoted to result.
-                        # If metadata conflicts with result (e.g. ends with _result.bin or matches/conflicts with ores),
-                        # fail closed to quarantine. Otherwise remain source.
-                        if ends_result or job_conflicts_ores or has_result_marker:
+                        # If metadata conflicts with result (e.g. ends with _result.bin or matches/conflicts with ores)
+                        # or has alias conflict, fail closed to quarantine. Otherwise remain source.
+                        if ends_result or job_conflicts_ores or has_result_marker or has_alias_conflict:
                             new_role = "quarantine"
                         else:
                             new_role = "source"
                     elif job_matches_ores and ends_result and not has_source_marker:
-                        # Authoritative evidence for completed result
-                        new_role = "result"
+                        # HIGH-01: Artifact alias protection: if physical file is associated with
+                        # a protected source/quarantine artifact, it must NEVER become result!
+                        if is_file_protected or has_alias_conflict:
+                            new_role = "quarantine"
+                        else:
+                            new_role = "result"
+                    elif has_alias_conflict:
+                        new_role = "quarantine"
                     elif job_conflicts_ores:
                         # Partial conflict with order_results (e.g. path matches but hash disagrees)
                         new_role = "quarantine"
@@ -219,7 +260,10 @@ def reconcile(db_path: Path, apply: bool = False, uploads_dir: Path | None = Non
                             file_exists = True
 
                     if file_exists:
-                        if arole in ("result", "info"):
+                        fid = get_file_identity(local_path) if local_path else None
+                        cpath = os.path.normcase(os.path.abspath(local_path)) if local_path else ""
+                        is_alias_protected = bool((cpath and cpath in protected_paths) or (fid and fid in protected_fids))
+                        if arole in ("result", "info") and not is_alias_protected:
                             # Verified result/info file physically exists: schedule for verified cleanup
                             conn.execute(
                                 "UPDATE delivery_jobs SET cleanup_state='pending', cleanup_phase='pending', "

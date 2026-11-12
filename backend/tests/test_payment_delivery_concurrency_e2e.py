@@ -36,6 +36,8 @@ def test_mixed_paid_unpaid_four_workers_lock_contention_and_restart(tmp_path, mo
                 unpaid.append(oid)
             else:
                 paid.append(oid)
+                with sqlite3.connect(main.DB_PATH) as c:
+                    c.execute("UPDATE delivery_jobs SET artifact_role='result' WHERE order_id=? AND kind='file'", (oid,))
                 sig=hashlib.md5(f"20.00:{oid}:synthetic-p2".encode()).hexdigest()
                 for _ in range(2):
                     assert client.post("/api/payment/robokassa/result",data={"OutSum":"20.00","InvId":str(oid),"SignatureValue":sig}).status_code==200

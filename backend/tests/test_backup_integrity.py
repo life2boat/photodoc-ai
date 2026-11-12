@@ -64,10 +64,22 @@ def test_env(tmp_path, monkeypatch):
     monkeypatch.setenv("ROBOKASSA_MERCHANT_LOGIN", "test-merchant")
     monkeypatch.setenv("ROBOKASSA_PASSWORD1", "test-pass-1")
     monkeypatch.setenv("ROBOKASSA_PASSWORD2", "test-pass-2")
-    monkeypatch.setenv("DELIVERY_WORKER_ENABLED", "0")
+    import consents
+    monkeypatch.setenv("CONSENT_FEATURE_ENABLED", "1")
+    monkeypatch.setitem(consents.DOCUMENTS[consents.PURPOSE_SERVICE], "approved", True)
+    monkeypatch.setitem(consents.DOCUMENTS[consents.PURPOSE_PERSONAL_DATA], "approved", True)
 
     main.init_db()
     client = TestClient(main.app)
+    real_post = client.post
+
+    def safe_post(url, *args, **kwargs):
+        if url == "/api/order" and "data" in kwargs:
+            kwargs["data"].setdefault("consent_service_terms", "1")
+            kwargs["data"].setdefault("consent_personal_data", "1")
+        return real_post(url, *args, **kwargs)
+
+    client.post = safe_post
     yield client, db, uploads
 
 
@@ -851,7 +863,7 @@ def test_crash_recovery_durable_intent_source_present_retry_cleans_safely(test_e
         conn.execute("UPDATE orders SET payment_status='paid' WHERE id=?", (order_id,))
         conn.execute(
             "UPDATE delivery_jobs SET state='delivered', cleanup_state='failed', cleanup_phase='deleting', "
-            "cleanup_lease_until=NULL, delivered_at='2026-10-27T12:00:00+00:00' WHERE id=?",
+            "cleanup_lease_until=NULL, delivered_at='2026-10-27T12:00:00+00:00', artifact_role='result' WHERE id=?",
             (job_id,),
         )
 

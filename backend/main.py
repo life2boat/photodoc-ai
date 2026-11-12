@@ -1136,7 +1136,10 @@ def upload_to_yandex_disk(
 
     with local.open("rb") as source:
         def chunks():
+            from delivery import is_migration_active
             for chunk in iter(lambda: source.read(65536), b""):
+                if is_migration_active(DB_PATH):
+                    raise RuntimeError("Upload aborted: exclusive migration gate is active")
                 yield chunk
         if order_id is not None:
             require_paid_order(order_id)
@@ -1206,25 +1209,6 @@ def deliver_job(job: dict) -> None:
         raise RuntimeError("Order for delivery job is missing")
     if job["kind"] in ("file", "info"):
         require_paid_order(job["order_id"])
-        if job["kind"] == "file":
-            conn = sqlite3.connect(DB_PATH, timeout=5)
-            try:
-                from delivery import is_migration_active
-                if is_migration_active(conn):
-                    raise RuntimeError("Delivery forbidden: exclusive migration gate is active")
-                row = conn.execute(
-                    "SELECT artifact_role, state FROM delivery_jobs WHERE id=?",
-                    (job["id"],),
-                ).fetchone()
-                if not row:
-                    raise RuntimeError(f"Delivery forbidden: job {job['id']} not found in DB")
-                cur_role, cur_state = row[0], row[1]
-                if cur_role != "result":
-                    raise RuntimeError(f"Delivery forbidden for non-result artifact role: '{cur_role}'")
-                if cur_state != "processing":
-                    raise RuntimeError(f"Delivery forbidden: job {job['id']} is in state '{cur_state}', not 'processing'")
-            finally:
-                conn.close()
         raw_path = job.get("local_path")
         if not raw_path:
             raise RuntimeError("Delivery job is missing local_path")
@@ -1238,6 +1222,27 @@ def deliver_job(job: dict) -> None:
         if not path.name.startswith(f"{job['order_id']}_"):
             raise RuntimeError("Local file name does not match order ID")
 
+        if job["kind"] == "file":
+            conn = sqlite3.connect(DB_PATH, timeout=5)
+            try:
+                from delivery import is_migration_active
+                if is_migration_active(conn):
+                    logging.warning("Delivery forbidden: exclusive migration gate is active")
+                    return
+                row = conn.execute(
+                    "SELECT artifact_role, state FROM delivery_jobs WHERE id=?",
+                    (job["id"],),
+                ).fetchone()
+                if not row:
+                    raise RuntimeError(f"Delivery forbidden: job {job['id']} not found in DB")
+                cur_role, cur_state = row[0], row[1]
+                if cur_role != "result":
+                    raise RuntimeError(f"Delivery forbidden for non-result artifact role: '{cur_role}'")
+                if cur_state != "processing":
+                    raise RuntimeError(f"Delivery forbidden: job {job['id']} is in state '{cur_state}', not 'processing'")
+            finally:
+                conn.close()
+
         try:
             target_resolved = path.resolve()
         except Exception as exc:
@@ -1248,6 +1253,33 @@ def deliver_job(job: dict) -> None:
         upload_resolved = UPLOAD_DIR.resolve()
         if upload_resolved not in target_resolved.parents and target_resolved.parent != upload_resolved:
             raise RuntimeError("Local delivery source is outside uploads")
+
+        if job["kind"] == "file":
+            conn = sqlite3.connect(DB_PATH, timeout=5)
+            try:
+                from delivery import is_migration_active, get_file_identity
+                if is_migration_active(conn):
+                    logging.warning("Delivery forbidden: exclusive migration gate is active")
+                    return
+                row = conn.execute(
+                    "SELECT artifact_role, state FROM delivery_jobs WHERE id=?",
+                    (job["id"],),
+                ).fetchone()
+                if not row or row[0] != "result":
+                    raise RuntimeError(f"Delivery forbidden: artifact role changed to '{row[0] if row else None}'")
+                if row[1] != "processing":
+                    raise RuntimeError(f"Delivery forbidden: job state is '{row[1]}', not 'processing'")
+                
+                target_fid = get_file_identity(raw_path)
+                for other_path, other_role in conn.execute(
+                    "SELECT local_path, artifact_role FROM delivery_jobs WHERE id != ? AND artifact_role IN ('source', 'quarantine')",
+                    (job["id"],),
+                ).fetchall():
+                    if other_path:
+                        if other_path == raw_path or (target_fid and get_file_identity(other_path) == target_fid):
+                            raise RuntimeError("Delivery forbidden: file is aliased to a protected source/quarantine artifact")
+            finally:
+                conn.close()
 
         remote_folder, remote_name = job["remote_path"].rsplit("/", 1)
         expected_sha256 = job.get("content_sha256")

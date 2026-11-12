@@ -79,7 +79,8 @@ jobs:
                tests/test_delivery_concurrency.py \
                tests/test_migration_cleanup_backfill.py \
                tests/test_migration_reconciliation.py \
-               tests/test_legacy_artifact_role_migration.py -v
+               tests/test_legacy_artifact_role_migration.py \
+               tests/test_r1_concurrency_artifact_alias_04.py -v
     - name: Verify preflight scripts
       run: |
         python ../scripts/production_preflight.py --db nonexistent.db || true

@@ -138,9 +138,9 @@ def insert_delivered_job(conn, oid, payment_status, created_at):
         "INSERT INTO orders(id,name,payment_status,order_amount,payment_amount)"
         " VALUES(?,'Synthetic',?,'20.00','20.00')", (oid, payment_status))
     conn.execute(
-        "INSERT INTO delivery_jobs(id,order_id,kind,local_path,remote_path,content_sha256,"
+        "INSERT INTO delivery_jobs(id,order_id,kind,artifact_role,local_path,remote_path,content_sha256,"
         "content_size,state,attempts,next_attempt_at,created_at,delivered_at,cleanup_state,"
-        "cleanup_phase) VALUES(?,?,'file',?,?,?,?,'delivered',1,?,?,?,'pending','pending')",
+        "cleanup_phase) VALUES(?,?,'file','result',?,?,?,?,'delivered',1,?,?,?,'pending','pending')",
         (f"job-{oid}", oid, str(source), f"PhotoDoc_Orders/Order_{oid}/p.jpg",
          hashlib.sha256(content).hexdigest(), len(content),
          created_at, created_at, created_at))

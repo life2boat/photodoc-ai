@@ -73,7 +73,9 @@ CREATE TABLE IF NOT EXISTS schema_migration_gate (
     holder_id TEXT NOT NULL,
     holder_pid INTEGER NOT NULL,
     acquired_at TEXT NOT NULL,
-    expires_at TEXT NOT NULL
+    expires_at TEXT NOT NULL,
+    generation INTEGER NOT NULL DEFAULT 1,
+    holder_start_time REAL
 );
 """
 
@@ -81,14 +83,127 @@ DEFAULT_GATE_TIMEOUT_SECONDS = 5.0
 DEFAULT_GATE_LEASE_SECONDS = 60
 
 
+def ensure_gate_table(conn: sqlite3.Connection) -> None:
+    conn.execute(GATE_TABLE_SCHEMA)
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(schema_migration_gate)").fetchall()}
+    if "generation" not in cols:
+        try:
+            conn.execute("ALTER TABLE schema_migration_gate ADD COLUMN generation INTEGER NOT NULL DEFAULT 1")
+        except Exception:
+            pass
+    if "holder_start_time" not in cols:
+        try:
+            conn.execute("ALTER TABLE schema_migration_gate ADD COLUMN holder_start_time REAL")
+        except Exception:
+            pass
+
+
+def get_file_identity(path: Path | str | None) -> tuple[int, int] | str | None:
+    """
+    Returns unique physical identity (st_dev, st_ino) across hardlinks and symlinks,
+    or case-normalized resolved path.
+    """
+    if not path:
+        return None
+    try:
+        p = Path(path).resolve()
+        st = p.stat()
+        return (st.st_dev, st.st_ino)
+    except Exception:
+        try:
+            return os.path.normcase(os.path.abspath(str(path)))
+        except Exception:
+            return str(path)
+
+
+def get_process_start_time(pid: int) -> float | None:
+    """Returns process creation timestamp if available, to protect against PID reuse."""
+    if pid <= 0:
+        return None
+    if os.name == "nt":
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return None
+        try:
+            class FILETIME(ctypes.Structure):
+                _fields_ = [("dwLowDateTime", ctypes.c_ulong), ("dwHighDateTime", ctypes.c_ulong)]
+            c, e, k, u = FILETIME(), FILETIME(), FILETIME(), FILETIME()
+            if kernel32.GetProcessTimes(handle, ctypes.byref(c), ctypes.byref(e), ctypes.byref(k), ctypes.byref(u)):
+                time_val = (c.dwHighDateTime << 32) + c.dwLowDateTime
+                return time_val / 10_000_000.0
+            return None
+        finally:
+            kernel32.CloseHandle(handle)
+    else:
+        try:
+            proc_stat = Path(f"/proc/{pid}/stat")
+            if proc_stat.exists():
+                parts = proc_stat.read_text().split(")")[-1].split()
+                return float(parts[19])
+            return os.path.getctime(f"/proc/{pid}")
+        except Exception:
+            return None
+
+
+def is_pid_alive(pid: int) -> bool:
+    """Cross-platform check whether a process with the given PID is currently alive."""
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return False
+        try:
+            exit_code = ctypes.c_ulong()
+            if kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                return exit_code.value == STILL_ACTIVE
+            return False
+        finally:
+            kernel32.CloseHandle(handle)
+    else:
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError as err:
+            import errno
+            return err.errno == errno.EPERM
+
+
+def is_pid_owner_alive(pid: int, expected_start_time: float | None = None) -> bool:
+    """
+    Checks if PID is alive AND matches original creation time (fencing against PID reuse).
+    """
+    if not is_pid_alive(pid):
+        return False
+    if expected_start_time is not None:
+        actual_start_time = get_process_start_time(pid)
+        if actual_start_time is not None:
+            if abs(actual_start_time - expected_start_time) > 1.0:
+                logging.warning(
+                    "Detected PID %s recycling: expected start time %s != actual %s",
+                    pid, expected_start_time, actual_start_time,
+                )
+                return False
+    return True
+
+
 def is_migration_active(db_path_or_conn: Path | str | sqlite3.Connection, now: str | None = None) -> bool:
     """
-    Returns True if an exclusive cross-process migration gate is currently active and unexpired.
+    Returns True if an exclusive cross-process migration gate is currently active, unexpired,
+    held by a living process, or if an incomplete/crashed migration has left the database unverified.
+    Fails closed (returns True) on any operational or malformed data errors.
     """
     close_after = False
     if isinstance(db_path_or_conn, (str, Path)):
         try:
-            conn = sqlite3.connect(db_path_or_conn, timeout=5)
+            conn = sqlite3.connect(db_path_or_conn, timeout=2)
             close_after = True
         except Exception:
             return True
@@ -102,17 +217,37 @@ def is_migration_active(db_path_or_conn: Path | str | sqlite3.Connection, now: s
         if not has_table:
             return False
         current_time = now or utc_now()
-        row = conn.execute(
-            "SELECT expires_at FROM schema_migration_gate WHERE gate_name = 'migration'"
-        ).fetchone()
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(schema_migration_gate)").fetchall()}
+        has_start_time = "holder_start_time" in cols
+        query = (
+            "SELECT holder_id, holder_pid, expires_at, holder_start_time FROM schema_migration_gate WHERE gate_name = 'migration'"
+            if has_start_time
+            else "SELECT holder_id, holder_pid, expires_at, NULL FROM schema_migration_gate WHERE gate_name = 'migration'"
+        )
+        row = conn.execute(query).fetchone()
         if not row:
             return False
-        expires_at = row[0]
-        return expires_at > current_time
+        holder_id, holder_pid, expires_at, holder_start = row[0], row[1], row[2], row[3]
+        # MEDIUM-01: Malformed metadata fails closed
+        if not isinstance(expires_at, str):
+            return True
+        # HIGH-03: Process liveness and identity check with start-time verification
+        if holder_pid and is_pid_owner_alive(holder_pid, holder_start):
+            return True
+        # If holder PID is dead/recycled, check lease expiry:
+        try:
+            exp_dt = datetime.fromisoformat(expires_at)
+            cur_dt = datetime.fromisoformat(current_time)
+            if exp_dt > cur_dt:
+                return True
+        except Exception:
+            return True
+        return False
     except sqlite3.OperationalError:
         return True
     except Exception:
-        return False
+        # MEDIUM-01: Fail closed on any malformed data or parsing error
+        return True
     finally:
         if close_after:
             try:
@@ -137,8 +272,12 @@ def acquire_migration_gate(
     holder_id = uuid.uuid4().hex
     pid = os.getpid()
 
-    conn = sqlite3.connect(db_path, timeout=10)
+    # MEDIUM-02: SQLite contention timeout must respect requested timeout
+    remaining = max(0.01, deadline - time.monotonic())
+    conn = sqlite3.connect(db_path, timeout=remaining)
     try:
+        if time.monotonic() >= deadline:
+            raise RuntimeError("Cannot acquire exclusive migration gate: timed out waiting for active lock")
         conn.execute(GATE_TABLE_SCHEMA)
         conn.commit()
 
@@ -150,17 +289,20 @@ def acquire_migration_gate(
             try:
                 conn.execute("BEGIN IMMEDIATE")
                 row = conn.execute(
-                    "SELECT holder_id, expires_at FROM schema_migration_gate WHERE gate_name = 'migration'"
+                    "SELECT holder_id, holder_pid, expires_at FROM schema_migration_gate WHERE gate_name = 'migration'"
                 ).fetchone()
                 if row is not None:
-                    existing_holder, existing_expires = row[0], row[1]
-                    if existing_expires > now_str:
-                        # Another active unexpired migration holds the gate
+                    existing_holder, existing_pid, existing_expires = row[0], row[1], row[2]
+                    # HIGH-03: If existing holder process is alive, MUST NOT reclaim gate!
+                    if existing_pid and is_pid_alive(existing_pid):
                         conn.rollback()
                         time.sleep(0.05)
                         continue
-                    # Stale expired lock: log and reclaim
-                    logging.warning("Reclaiming expired migration gate from %s (expired at %s)", existing_holder, existing_expires)
+                    # Stale lock from dead/crashed process: log and reclaim
+                    logging.warning(
+                        "Reclaiming migration gate from dead process PID %s (holder %s, expired at %s)",
+                        existing_pid, existing_holder, existing_expires,
+                    )
 
                 conn.execute(
                     "INSERT OR REPLACE INTO schema_migration_gate (gate_name, holder_id, holder_pid, acquired_at, expires_at) "
@@ -273,6 +415,18 @@ def claim_due(db_path: Path, max_attempts: int = DEFAULT_MAX_ATTEMPTS) -> dict |
         if is_migration_active(conn, now):
             conn.commit()
             return None
+        # Task 4 / Crash recovery: if gate table still has an unreleased record,
+        # migration crashed before clean release. Keep workers blocked until clean migration completes.
+        has_gate_tbl = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_migration_gate'"
+        ).fetchone()
+        if has_gate_tbl:
+            pending_gate = conn.execute(
+                "SELECT 1 FROM schema_migration_gate WHERE gate_name = 'migration'"
+            ).fetchone()
+            if pending_gate:
+                conn.commit()
+                return None
         quarantine_expired(conn, now, max_attempts)
         conn.execute("""UPDATE paid_email_outbox SET state='uncertain',last_error='WorkerInterrupted',updated_at=?
             WHERE state='sending' AND EXISTS (SELECT 1 FROM delivery_jobs j
@@ -280,10 +434,19 @@ def claim_due(db_path: Path, max_attempts: int = DEFAULT_MAX_ATTEMPTS) -> dict |
                 AND (j.lease_until IS NULL OR j.lease_until<=?))""", (now, now))
         cols = {r[1] for r in conn.execute("PRAGMA table_info(delivery_jobs)").fetchall()}
         role_predicate = "(kind != 'file' OR artifact_role = 'result')" if "artifact_role" in cols else "kind != 'file'"
+        alias_predicate = ""
+        if "artifact_role" in cols:
+            alias_predicate = (
+                "AND (kind != 'file' OR NOT EXISTS ("
+                "SELECT 1 FROM delivery_jobs j2 WHERE j2.id != delivery_jobs.id "
+                "AND j2.local_path = delivery_jobs.local_path "
+                "AND j2.artifact_role IN ('source', 'quarantine')))"
+            )
         row = conn.execute(
             "SELECT * FROM delivery_jobs WHERE "
             "COALESCE(remote_path,'') NOT LIKE 'remote/%' AND "
-            f"{role_predicate} AND "
+            f"{role_predicate} "
+            f"{alias_predicate} AND "
             "((state IN ('pending', 'failed') AND attempts < ? AND next_attempt_at <= ?) OR "
             "(state = 'processing' AND attempts < ? AND lease_until <= ?)) "
             "AND (kind NOT IN ('file','info','paid_email') OR EXISTS "
@@ -698,7 +861,8 @@ def perform_job_cleanup(
             )
             return False
 
-    # Dependency check: check if any OTHER unfinished job still references this file
+    # Dependency check: check if any OTHER unfinished job still references this file,
+    # OR if any job classifies this file as source or quarantine (protected customer artifact)
     conn = sqlite3.connect(db_path, timeout=10)
     try:
         unfinished_refs = conn.execute(
@@ -706,8 +870,30 @@ def perform_job_cleanup(
             "WHERE local_path=? AND id!=? AND state!='delivered'",
             (raw_local_path, job_id),
         ).fetchone()[0]
+        protected_refs = 0
+        cols_c = {r[1] for r in conn.execute("PRAGMA table_info(delivery_jobs)").fetchall()}
+        if "artifact_role" in cols_c:
+            protected_refs = conn.execute(
+                "SELECT COUNT(*) FROM delivery_jobs "
+                "WHERE local_path=? AND artifact_role IN ('source', 'quarantine')",
+                (raw_local_path,),
+            ).fetchone()[0]
     finally:
         conn.close()
+
+    if protected_refs > 0:
+        # File is associated with a protected source/quarantine artifact; NEVER delete!
+        conn = sqlite3.connect(db_path, timeout=10)
+        try:
+            conn.execute(
+                "UPDATE delivery_jobs SET cleanup_state='not_applicable', cleanup_phase='none', cleanup_lease_until=NULL, "
+                "cleanup_error='ProtectedArtifactLinkedToSourceOrQuarantine' WHERE id=? AND cleanup_lease_until=?",
+                (job_id, token),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        return False
 
     if unfinished_refs > 0:
         # File is still needed by another active task; postpone cleanup
@@ -811,6 +997,12 @@ def perform_job_cleanup(
                 "WHERE id=? AND cleanup_lease_until=?", (job_id, token),
             )
             conn.commit()
+            return False
+        if has_role_check and conn.execute(
+            "SELECT 1 FROM delivery_jobs WHERE local_path=? AND artifact_role IN ('source', 'quarantine') LIMIT 1",
+            (raw_local_path,),
+        ).fetchone():
+            conn.rollback()
             return False
 
         # Recheck the actual bytes at the filesystem boundary, including a

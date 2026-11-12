@@ -112,7 +112,7 @@ def test_new_backup_contains_zero_delivered_photo_content(zero_retention_env):
     # 2. Mark delivery completed and perform cleanup
     with sqlite3.connect(db_path) as conn:
         conn.execute(
-            "UPDATE delivery_jobs SET state='delivered', delivered_at='2026-10-28T10:00:00+00:00' "
+            "UPDATE delivery_jobs SET state='delivered', delivered_at='2026-10-28T10:00:00+00:00', artifact_role='result' "
             "WHERE order_id=?",
             (order_id,),
         )
@@ -202,7 +202,7 @@ def test_mixed_orders_backup_archives_only_unfinished(zero_retention_env):
     # Order 1: Delivered and cleaned
     order1 = create_order_helper(client, "Delivered User", [("photo_del.jpg", JPEG)])
     with sqlite3.connect(db_path) as conn:
-        conn.execute("UPDATE delivery_jobs SET state='delivered' WHERE order_id=?", (order1,))
+        conn.execute("UPDATE delivery_jobs SET state='delivered', artifact_role='result' WHERE order_id=?", (order1,))
     with sqlite3.connect(db_path) as conn:
         job_ids = [r[0] for r in conn.execute("SELECT id FROM delivery_jobs WHERE order_id=?", (order1,)).fetchall()]
     for jid in job_ids:
@@ -301,7 +301,7 @@ def test_historical_audit_confirms_zero_risk_on_zero_retention_backup(zero_reten
 
     order_id = create_order_helper(client, "Clean User", [("clean.jpg", JPEG)])
     with sqlite3.connect(db_path) as conn:
-        conn.execute("UPDATE delivery_jobs SET state='delivered' WHERE order_id=?", (order_id,))
+        conn.execute("UPDATE delivery_jobs SET state='delivered', artifact_role='result' WHERE order_id=?", (order_id,))
 
     with sqlite3.connect(db_path) as conn:
         jids = [r[0] for r in conn.execute("SELECT id FROM delivery_jobs WHERE order_id=?", (order_id,)).fetchall()]
@@ -376,7 +376,7 @@ def test_shared_file_between_delivered_and_unfinished_jobs_preserved(zero_retent
 
         conn.execute("UPDATE delivery_jobs SET local_path=? WHERE id=?", (local_path, job2_id))
         # Mark only job 1 as delivered
-        conn.execute("UPDATE delivery_jobs SET state='delivered' WHERE id=?", (job1_id,))
+        conn.execute("UPDATE delivery_jobs SET state='delivered', artifact_role='result' WHERE id=?", (job1_id,))
 
     # Cleanup attempt on job 1 MUST be deferred because job 2 is unfinished
     cleanup_ok = perform_job_cleanup(db_path, job1_id, uploads_dir=uploads_dir)
@@ -396,7 +396,7 @@ def test_shared_file_between_delivered_and_unfinished_jobs_preserved(zero_retent
 
     # Now deliver job 2 as well:
     with sqlite3.connect(db_path) as conn:
-        conn.execute("UPDATE delivery_jobs SET state='delivered' WHERE id=?", (job2_id,))
+        conn.execute("UPDATE delivery_jobs SET state='delivered', artifact_role='result' WHERE id=?", (job2_id,))
 
     # Now cleanup job 1 and job 2:
     with sqlite3.connect(db_path) as conn:
@@ -1043,7 +1043,7 @@ def test_purge_runbook_executable_sequence(zero_retention_env):
     # On server: delivery completes and cleanup is executed with durable evidence
     with sqlite3.connect(db_path) as conn:
         conn.execute(
-            "UPDATE delivery_jobs SET state='delivered', delivered_at='2026-10-28T10:00:00+00:00' WHERE order_id=?",
+            "UPDATE delivery_jobs SET state='delivered', delivered_at='2026-10-28T10:00:00+00:00', artifact_role='result' WHERE order_id=?",
             (order_del,),
         )
         jids = [r[0] for r in conn.execute("SELECT id FROM delivery_jobs WHERE order_id=?", (order_del,)).fetchall()]
@@ -1646,7 +1646,7 @@ def create_synthetic_archive_fixture(tmp_path):
         with sqlite3.connect(db_path) as conn:
             conn.execute("UPDATE orders SET payment_status='paid' WHERE id=?", (order_del,))
             conn.execute(
-                "UPDATE delivery_jobs SET state='delivered', delivered_at='2026-10-28T10:00:00+00:00' WHERE order_id=?",
+                "UPDATE delivery_jobs SET state='delivered', delivered_at='2026-10-28T10:00:00+00:00', artifact_role='result' WHERE order_id=?",
                 (order_del,),
             )
             jids = [r[0] for r in conn.execute("SELECT id FROM delivery_jobs WHERE order_id=?", (order_del,)).fetchall()]
