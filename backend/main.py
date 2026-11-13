@@ -1,4 +1,5 @@
 import os
+import sys
 import logging
 import math
 import sqlite3
@@ -1042,6 +1043,9 @@ def upload_to_yandex_disk(
     expected_size: int | None = None,
     uploads_dir: Path | None = None,
     order_id: int | None = None,
+    job_id: str | None = None,
+    stream_generation: int | None = None,
+    stream_operation_id: str | None = None,
 ):
     if order_id is not None:
         require_paid_order(order_id)
@@ -1113,12 +1117,18 @@ def upload_to_yandex_disk(
     # If authoritative expected checksum and size are known, check if already verified remotely
     if expected_sha256 and expected_size is not None:
         if _remote_verified(token, remote_path, expected_sha256, expected_size):
+            if job_id and stream_operation_id:
+                from delivery import confirm_delivery_stream_completed
+                confirm_delivery_stream_completed(DB_PATH, job_id, stream_operation_id)
             return True
 
     ensure_yandex_folder(token, remote_folder_path)
     headers = {"Authorization": f"OAuth {token}"}
 
     if _remote_verified(token, remote_path, target_sha256, target_size):
+        if job_id and stream_operation_id:
+            from delivery import confirm_delivery_stream_completed
+            confirm_delivery_stream_completed(DB_PATH, job_id, stream_operation_id)
         return True
 
     upload_url_response = httpx.get(
@@ -1128,33 +1138,99 @@ def upload_to_yandex_disk(
         timeout=30,
     )
     if upload_url_response.status_code == 409 and _remote_verified(token, remote_path, target_sha256, target_size):
+        if job_id and stream_operation_id:
+            from delivery import confirm_delivery_stream_completed
+            confirm_delivery_stream_completed(DB_PATH, job_id, stream_operation_id)
         return True
     upload_url_response.raise_for_status()
     href = upload_url_response.json().get("href")
     if not href or not href.startswith("https://"):
         raise RuntimeError("Yandex upload URL is missing or invalid")
 
-    with local.open("rb") as source:
-        def chunks():
-            from delivery import is_migration_active
-            for chunk in iter(lambda: source.read(65536), b""):
-                if is_migration_active(DB_PATH):
-                    raise RuntimeError("Upload aborted: exclusive migration gate is active")
-                yield chunk
-        if order_id is not None:
-            require_paid_order(order_id)
-        put_response = httpx.put(
-            href,
-            content=chunks(),
-            headers={"Content-Length": str(target_size)},
-            timeout=httpx.Timeout(120.0, connect=30.0),
-        )
-        put_response.raise_for_status()
+    init_generation = stream_generation or 0
+    if not init_generation:
+        try:
+            with sqlite3.connect(DB_PATH, timeout=2) as conn_gen:
+                row_gen = conn_gen.execute(
+                    "SELECT generation FROM schema_migration_gate WHERE gate_name = 'migration'"
+                ).fetchone()
+                if row_gen and row_gen[0] is not None:
+                    init_generation = int(row_gen[0])
+        except Exception:
+            pass
 
-    # Step 4 & 5: Verify remote metadata matches delivery_jobs authoritative sha256 and size
-    if not _remote_verified(token, remote_path, target_sha256, target_size):
-        raise RuntimeError("Yandex upload was not confirmed by resource metadata")
-    return True
+    try:
+        with local.open("rb") as source:
+            def chunks():
+                from delivery import is_migration_active
+                conn_chk = None
+                try:
+                    conn_chk = sqlite3.connect(DB_PATH, timeout=2)
+                except Exception as exc:
+                    raise RuntimeError(f"Upload aborted: cannot open SQLite connection to verify authorization: {exc}")
+
+                try:
+                    for chunk in iter(lambda: source.read(65536), b""):
+                        try:
+                            if is_migration_active(DB_PATH):
+                                raise RuntimeError("Upload aborted: exclusive migration gate is active")
+                        except Exception as exc:
+                            raise RuntimeError(f"Upload aborted: migration check failed: {exc}")
+
+                        if job_id:
+                            from delivery import check_delivery_stream_lease
+                            try:
+                                check_delivery_stream_lease(
+                                    conn_chk,
+                                    job_id,
+                                    expected_generation=stream_generation or init_generation,
+                                    stream_operation_id=stream_operation_id,
+                                    renew=True,
+                                )
+                            except Exception as exc:
+                                raise RuntimeError(f"Upload aborted: stream lease validation failed: {exc}")
+                        elif init_generation > 0:
+                            try:
+                                cur_gen_row = conn_chk.execute(
+                                    "SELECT generation FROM schema_migration_gate WHERE gate_name = 'migration'"
+                                ).fetchone()
+                                if cur_gen_row and cur_gen_row[0] is not None:
+                                    if int(cur_gen_row[0]) > init_generation:
+                                        raise RuntimeError("Upload aborted: migration gate was acquired during upload")
+                            except Exception as exc:
+                                raise RuntimeError(f"Upload aborted: SQLite error checking gate generation: {exc}")
+
+                        try:
+                            st = local.stat()
+                            if st.st_size != target_size:
+                                raise RuntimeError("Upload aborted: file size changed during upload")
+                        except Exception as exc:
+                            raise RuntimeError(f"Upload aborted: unable to verify file stat during upload: {exc}")
+
+                        yield chunk
+                finally:
+                    if conn_chk is not None:
+                        conn_chk.close()
+
+            if order_id is not None:
+                require_paid_order(order_id)
+            put_response = httpx.put(
+                href,
+                content=chunks(),
+                headers={"Content-Length": str(target_size)},
+                timeout=httpx.Timeout(120.0, connect=30.0),
+            )
+            put_response.raise_for_status()
+
+        # Step 4 & 5: Verify remote metadata matches delivery_jobs authoritative sha256 and size
+        if not _remote_verified(token, remote_path, target_sha256, target_size):
+            raise RuntimeError("Yandex upload was not confirmed by resource metadata")
+        if job_id and stream_operation_id:
+            from delivery import confirm_delivery_stream_completed
+            confirm_delivery_stream_completed(DB_PATH, job_id, stream_operation_id)
+        return True
+    except Exception:
+        raise
 
 
 def order_info_bytes(order_id: int, name: str, phone: str, format: str, paper: str, crop: str, comment: str) -> bytes:
@@ -1203,7 +1279,8 @@ def upload_info_to_yandex_disk(
         )
 
 
-def deliver_job(job: dict) -> None:
+def deliver_job(job: dict) -> dict:
+    stream_lease = None
     order = get_order_by_id(job["order_id"])
     if not order:
         raise RuntimeError("Order for delivery job is missing")
@@ -1227,8 +1304,7 @@ def deliver_job(job: dict) -> None:
             try:
                 from delivery import is_migration_active
                 if is_migration_active(conn):
-                    logging.warning("Delivery forbidden: exclusive migration gate is active")
-                    return
+                    raise RuntimeError("Delivery forbidden: exclusive migration gate is active")
                 row = conn.execute(
                     "SELECT artifact_role, state FROM delivery_jobs WHERE id=?",
                     (job["id"],),
@@ -1257,10 +1333,9 @@ def deliver_job(job: dict) -> None:
         if job["kind"] == "file":
             conn = sqlite3.connect(DB_PATH, timeout=5)
             try:
-                from delivery import is_migration_active, get_file_identity
+                from delivery import is_migration_active, get_file_identity_strict
                 if is_migration_active(conn):
-                    logging.warning("Delivery forbidden: exclusive migration gate is active")
-                    return
+                    raise RuntimeError("Delivery forbidden: exclusive migration gate is active")
                 row = conn.execute(
                     "SELECT artifact_role, state FROM delivery_jobs WHERE id=?",
                     (job["id"],),
@@ -1269,40 +1344,75 @@ def deliver_job(job: dict) -> None:
                     raise RuntimeError(f"Delivery forbidden: artifact role changed to '{row[0] if row else None}'")
                 if row[1] != "processing":
                     raise RuntimeError(f"Delivery forbidden: job state is '{row[1]}', not 'processing'")
-                
-                target_fid = get_file_identity(raw_path)
+
+                try:
+                    target_fid = get_file_identity_strict(raw_path)
+                    target_norm = os.path.normcase(os.path.abspath(raw_path))
+                except Exception as exc:
+                    raise RuntimeError(f"Delivery forbidden: unable to establish identity of delivery target: {exc}")
+
                 for other_path, other_role in conn.execute(
                     "SELECT local_path, artifact_role FROM delivery_jobs WHERE id != ? AND artifact_role IN ('source', 'quarantine')",
                     (job["id"],),
                 ).fetchall():
-                    if other_path:
-                        if other_path == raw_path or (target_fid and get_file_identity(other_path) == target_fid):
+                    if not other_path:
+                        continue
+                    other_norm = os.path.normcase(os.path.abspath(other_path))
+                    if other_norm == target_norm:
+                        raise RuntimeError("Delivery forbidden: file is aliased to a protected source/quarantine artifact")
+                    try:
+                        other_fid = get_file_identity_strict(other_path)
+                        if other_fid == target_fid:
                             raise RuntimeError("Delivery forbidden: file is aliased to a protected source/quarantine artifact")
+                    except Exception as exc:
+                        raise RuntimeError(f"Delivery forbidden: unable to establish identity of protected record: {exc}")
             finally:
                 conn.close()
 
         remote_folder, remote_name = job["remote_path"].rsplit("/", 1)
         expected_sha256 = job.get("content_sha256")
         expected_size = job.get("content_size")
-        if job["kind"] == "info":
-            ok = upload_info_to_yandex_disk(
-                order["id"], order["name"], order["phone"], order["format"],
-                order["paper"], order["crop"], order["comment"], remote_folder,
-                source_path=str(path),
-                expected_sha256=expected_sha256,
-                expected_size=expected_size,
-                uploads_dir=UPLOAD_DIR,
-            )
-        else:
-            ok = upload_to_yandex_disk(
-                str(path),
-                remote_folder,
-                remote_name,
-                expected_sha256=expected_sha256,
-                expected_size=expected_size,
-                uploads_dir=UPLOAD_DIR,
-                order_id=job["order_id"],
-            )
+
+        stream_lease = None
+        if job["kind"] == "file":
+            from delivery import acquire_delivery_stream_lease, release_delivery_stream_lease
+            stream_lease = acquire_delivery_stream_lease(DB_PATH, job["id"])
+            if stream_lease and "stream_operation_id" in stream_lease:
+                job["stream_operation_id"] = stream_lease["stream_operation_id"]
+
+        try:
+            if job["kind"] == "info":
+                ok = upload_info_to_yandex_disk(
+                    order["id"], order["name"], order["phone"], order["format"],
+                    order["paper"], order["crop"], order["comment"], remote_folder,
+                    source_path=str(path),
+                    expected_sha256=expected_sha256,
+                    expected_size=expected_size,
+                    uploads_dir=UPLOAD_DIR,
+                )
+            else:
+                ok = upload_to_yandex_disk(
+                    str(path),
+                    remote_folder,
+                    remote_name,
+                    expected_sha256=expected_sha256,
+                    expected_size=expected_size,
+                    uploads_dir=UPLOAD_DIR,
+                    order_id=job["order_id"],
+                    job_id=job["id"],
+                    stream_generation=stream_lease["gate_generation"] if stream_lease else None,
+                    stream_operation_id=stream_lease.get("stream_operation_id") if stream_lease else None,
+                )
+        finally:
+            if stream_lease is not None:
+                try:
+                    release_delivery_stream_lease(
+                        DB_PATH,
+                        job["id"],
+                        stream_operation_id=stream_lease.get("stream_operation_id"),
+                    )
+                except Exception as rel_err:
+                    logging.warning("release_delivery_stream_lease failed for job %s: %s", job["id"], rel_err)
     elif job["kind"] == "admin_email":
         ok = send_order_email(order["id"], order["name"], order["phone"], order["comment"],
                               order["format"], order["paper"], order["crop"])
@@ -1312,6 +1422,26 @@ def deliver_job(job: dict) -> None:
         raise RuntimeError("Unknown delivery job kind")
     if not ok:
         raise RuntimeError("Delivery was not confirmed")
+
+    if job["kind"] == "file":
+        conn = sqlite3.connect(DB_PATH, timeout=5)
+        try:
+            from delivery import is_migration_active
+            if is_migration_active(conn):
+                raise RuntimeError("Delivery forbidden: migration became active during upload")
+            row = conn.execute(
+                "SELECT artifact_role, state FROM delivery_jobs WHERE id=?",
+                (job["id"],),
+            ).fetchone()
+            if not row or row[0] != "result":
+                raise RuntimeError(f"Delivery forbidden: artifact role reclassified to '{row[0] if row else None}'")
+        finally:
+            conn.close()
+
+    return {
+        "ok": True,
+        "stream_operation_id": stream_lease.get("stream_operation_id") if stream_lease else None,
+    }
 
 
 # --- Эндпоинт приема заказа ---
