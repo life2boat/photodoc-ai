@@ -252,6 +252,7 @@ def create_acceptance_order(
     # Native transport/cleanup rehearsal starts from a paid synthetic order.
     with sqlite3.connect(main.DB_PATH) as conn:
         conn.execute("UPDATE orders SET payment_status='paid' WHERE id=?", (resp.json()["order_id"],))
+        conn.execute("UPDATE delivery_jobs SET artifact_role='result' WHERE order_id=? AND kind='file'", (resp.json()["order_id"],))
     return resp.json()
 
 

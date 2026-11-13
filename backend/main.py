@@ -1,4 +1,5 @@
 import os
+import sys
 import logging
 import math
 import sqlite3
@@ -16,17 +17,23 @@ from pathlib import Path
 from datetime import datetime
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from typing import List, Optional
+from typing import Any, List, Optional
 
 import httpx
+import json
 
 # Sanitize NO_PROXY on Windows against httpx unbracketed IPv6 ::1 parser issue
 for _k in ("NO_PROXY", "no_proxy"):
     if _k in os.environ and "::1" in os.environ[_k] and "[::1]" not in os.environ[_k]:
         os.environ[_k] = os.environ[_k].replace("::1", "")
 
-from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks, HTTPException, Request
-from fastapi.responses import PlainTextResponse, JSONResponse
+import operator_workflow as operator_service
+import consents
+import retention_worker
+import backup_rotation
+import log_rotation
+from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks, HTTPException, Request, Query
+from fastapi.responses import PlainTextResponse, JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -43,6 +50,8 @@ from yandex_paths import (
 )
 from delivery import (
     DELIVERY_SCHEMA,
+    ROLE_SOURCE,
+    ROLE_INFO,
     cleanup_orphaned_temporary_files,
     enqueue,
     perform_job_cleanup,
@@ -117,20 +126,79 @@ def validate_staging_delivery_safety():
             )
 
 
+def validate_rotation_safety() -> None:
+    """Validate backup and log rotation configurations at application startup (M-03).
+
+    Fails closed with RuntimeError on invalid parameters or path safety violations
+    without exposing credentials or sensitive tokens in error messages.
+    """
+    if os.getenv("BACKUP_ROTATION_ENABLED", "0") == "1":
+        backup_dir = os.getenv("BACKUP_DIR")
+        if not backup_dir:
+            raise RuntimeError("BACKUP_ROTATION_ENABLED is 1 but BACKUP_DIR is not set")
+        try:
+            backup_rotation.validate_backup_dir_safety(backup_dir)
+            retention_days = int(os.getenv("BACKUP_RETENTION_DAYS", str(backup_rotation.DEFAULT_RETENTION_DAYS)))
+            keep_min = int(os.getenv("BACKUP_KEEP_MIN", str(backup_rotation.DEFAULT_KEEP_MIN)))
+            max_age_env = os.getenv("BACKUP_MAX_AGE_DAYS")
+            max_age = int(max_age_env) if max_age_env else None
+            backup_rotation.validate_backup_rotation_params(retention_days, keep_min, max_age)
+        except ValueError as err:
+            raise RuntimeError(f"Backup rotation configuration safety violation: {err}") from err
+
+    if os.getenv("LOG_ROTATION_VERIFICATION_ENABLED", "0") == "1":
+        log_dir = os.getenv("LOG_DIR")
+        if not log_dir:
+            raise RuntimeError("LOG_ROTATION_VERIFICATION_ENABLED is 1 but LOG_DIR is not set")
+        try:
+            log_rotation.validate_log_dir_safety(log_dir)
+            max_days = int(os.getenv("LOG_RETENTION_MAX_DAYS", str(log_rotation.DEFAULT_LOG_RETENTION_DAYS)))
+            if max_days > 15:
+                raise RuntimeError(
+                    f"Log retention policy violation: LOG_RETENTION_MAX_DAYS ({max_days}) "
+                    f"exceeds public policy commitment of 15 days (152FZ_PACKAGE.md:17)"
+                )
+            result = log_rotation.verify_log_retention_policy(log_dir, max_days=max_days, dry_run=True)
+            if not result["ok"]:
+                raise RuntimeError(
+                    f"Log retention policy failure: {result['expired']} expired log files found exceeding {max_days} days"
+                )
+        except ValueError as err:
+            raise RuntimeError(f"Log rotation configuration safety violation: {err}") from err
+
+
 @asynccontextmanager
 async def lifespan(_app):
+    validate_rotation_safety()
     stop = threading.Event()
     thread = None
     if os.getenv("DELIVERY_WORKER_ENABLED", "1") != "0":
         validate_staging_delivery_safety()
         thread = threading.Thread(target=worker_loop, args=(DB_PATH, deliver_job, stop), kwargs={"uploads_dir": UPLOAD_DIR}, daemon=True)
         thread.start()
+
+    retention_stop = threading.Event()
+    retention_thread = None
+    if os.getenv("RETENTION_WORKER_ENABLED", "0") == "1":
+        retention_worker.validate_retention_safety(DB_PATH, UPLOAD_DIR)
+        interval = float(os.getenv("RETENTION_WORKER_INTERVAL_SECONDS", "3600"))
+        retention_thread = threading.Thread(
+            target=retention_worker.retention_worker_loop,
+            args=(DB_PATH, retention_stop),
+            kwargs={"uploads_dir": UPLOAD_DIR, "interval_seconds": interval},
+            daemon=True,
+        )
+        retention_thread.start()
+
     try:
         yield
     finally:
         stop.set()
+        retention_stop.set()
         if thread is not None:
             thread.join(timeout=5)
+        if retention_thread is not None:
+            retention_thread.join(timeout=5)
 
 
 app = FastAPI(title="PhotoDoc AI API", lifespan=lifespan)
@@ -151,6 +219,17 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 set_uploads_dir(UPLOAD_DIR)
 
 
+def _parse_consent_flag(val: Any) -> bool:
+    if val is None:
+        return False
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, (int, float)):
+        return bool(val)
+    s = str(val).strip().lower()
+    return s in ("1", "true", "yes", "on")
+
+
 # --- Инициализация базы данных ---
 def init_db():
     """Create only a genuinely fresh DB; never bless an existing unknown DB."""
@@ -164,6 +243,9 @@ def init_db():
                 "run the controlled reconciliation migration"
             )
         paid_email_outbox.initialize(DB_PATH)
+        with sqlite3.connect(DB_PATH) as _c:
+            consents.initialize(_c)
+            retention_worker.initialize(_c)
         return
 
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -196,6 +278,12 @@ def init_db():
         )
         ''')
         for statement in DELIVERY_SCHEMA.split(";"):
+            if statement.strip():
+                conn.execute(statement)
+        for statement in consents.SCHEMA.split(";"):
+            if statement.strip():
+                conn.execute(statement)
+        for statement in retention_worker.SCHEMA.split(";"):
             if statement.strip():
                 conn.execute(statement)
         if read_application_id(conn) != APPLICATION_ID:
@@ -496,6 +584,35 @@ def update_order_payment_pending(order_id: int, amount: str) -> str:
 
 
 @retry_busy
+def _flag_missing_sources(conn, order_id: int) -> None:
+    """A paid order must never look processable when its source files are gone.
+
+    Retention deletes the source of an order that stayed unpaid past its window; if the
+    provider confirms a payment for such an order afterwards, the money is real and the
+    order must stay visible instead of silently waiting for a file that no longer exists.
+    """
+    rows = conn.execute(
+        "SELECT id, local_path, state FROM delivery_jobs "
+        "WHERE order_id = ? AND kind IN ('file', 'info')",
+        (order_id,),
+    ).fetchall()
+    missing = [row[0] for row in rows
+               if row[2] != "delivered" and row[1] and not Path(row[1]).exists()]
+    if not missing:
+        return
+    for job_id in missing:
+        conn.execute(
+            "UPDATE delivery_jobs SET last_error = 'SourceMissingAtPayment' WHERE id = ?",
+            (job_id,),
+        )
+    logging.critical(
+        "Late payment for order #%s: %s source file(s) are missing; the order needs a "
+        "manual resolution (deliver from another source or refund).",
+        order_id,
+        len(missing),
+    )
+
+
 def mark_order_paid(order_id: int, amount: str) -> bool:
     """
     Atomically transitions order to 'paid' status using a conditional UPDATE.
@@ -516,6 +633,7 @@ def mark_order_paid(order_id: int, amount: str) -> bool:
         )
         if cursor.rowcount == 1:
             enqueue(conn, order_id=order_id, kind="paid_email")
+            _flag_missing_sources(conn, order_id)
             conn.commit()
             return True
         conn.commit()
@@ -925,6 +1043,9 @@ def upload_to_yandex_disk(
     expected_size: int | None = None,
     uploads_dir: Path | None = None,
     order_id: int | None = None,
+    job_id: str | None = None,
+    stream_generation: int | None = None,
+    stream_operation_id: str | None = None,
 ):
     if order_id is not None:
         require_paid_order(order_id)
@@ -996,12 +1117,18 @@ def upload_to_yandex_disk(
     # If authoritative expected checksum and size are known, check if already verified remotely
     if expected_sha256 and expected_size is not None:
         if _remote_verified(token, remote_path, expected_sha256, expected_size):
+            if job_id and stream_operation_id:
+                from delivery import confirm_delivery_stream_completed
+                confirm_delivery_stream_completed(DB_PATH, job_id, stream_operation_id)
             return True
 
     ensure_yandex_folder(token, remote_folder_path)
     headers = {"Authorization": f"OAuth {token}"}
 
     if _remote_verified(token, remote_path, target_sha256, target_size):
+        if job_id and stream_operation_id:
+            from delivery import confirm_delivery_stream_completed
+            confirm_delivery_stream_completed(DB_PATH, job_id, stream_operation_id)
         return True
 
     upload_url_response = httpx.get(
@@ -1011,30 +1138,99 @@ def upload_to_yandex_disk(
         timeout=30,
     )
     if upload_url_response.status_code == 409 and _remote_verified(token, remote_path, target_sha256, target_size):
+        if job_id and stream_operation_id:
+            from delivery import confirm_delivery_stream_completed
+            confirm_delivery_stream_completed(DB_PATH, job_id, stream_operation_id)
         return True
     upload_url_response.raise_for_status()
     href = upload_url_response.json().get("href")
     if not href or not href.startswith("https://"):
         raise RuntimeError("Yandex upload URL is missing or invalid")
 
-    with local.open("rb") as source:
-        def chunks():
-            for chunk in iter(lambda: source.read(65536), b""):
-                yield chunk
-        if order_id is not None:
-            require_paid_order(order_id)
-        put_response = httpx.put(
-            href,
-            content=chunks(),
-            headers={"Content-Length": str(target_size)},
-            timeout=httpx.Timeout(120.0, connect=30.0),
-        )
-        put_response.raise_for_status()
+    init_generation = stream_generation or 0
+    if not init_generation:
+        try:
+            with sqlite3.connect(DB_PATH, timeout=2) as conn_gen:
+                row_gen = conn_gen.execute(
+                    "SELECT generation FROM schema_migration_gate WHERE gate_name = 'migration'"
+                ).fetchone()
+                if row_gen and row_gen[0] is not None:
+                    init_generation = int(row_gen[0])
+        except Exception:
+            pass
 
-    # Step 4 & 5: Verify remote metadata matches delivery_jobs authoritative sha256 and size
-    if not _remote_verified(token, remote_path, target_sha256, target_size):
-        raise RuntimeError("Yandex upload was not confirmed by resource metadata")
-    return True
+    try:
+        with local.open("rb") as source:
+            def chunks():
+                from delivery import is_migration_active
+                conn_chk = None
+                try:
+                    conn_chk = sqlite3.connect(DB_PATH, timeout=2)
+                except Exception as exc:
+                    raise RuntimeError(f"Upload aborted: cannot open SQLite connection to verify authorization: {exc}")
+
+                try:
+                    for chunk in iter(lambda: source.read(65536), b""):
+                        try:
+                            if is_migration_active(DB_PATH):
+                                raise RuntimeError("Upload aborted: exclusive migration gate is active")
+                        except Exception as exc:
+                            raise RuntimeError(f"Upload aborted: migration check failed: {exc}")
+
+                        if job_id:
+                            from delivery import check_delivery_stream_lease
+                            try:
+                                check_delivery_stream_lease(
+                                    conn_chk,
+                                    job_id,
+                                    expected_generation=stream_generation or init_generation,
+                                    stream_operation_id=stream_operation_id,
+                                    renew=True,
+                                )
+                            except Exception as exc:
+                                raise RuntimeError(f"Upload aborted: stream lease validation failed: {exc}")
+                        elif init_generation > 0:
+                            try:
+                                cur_gen_row = conn_chk.execute(
+                                    "SELECT generation FROM schema_migration_gate WHERE gate_name = 'migration'"
+                                ).fetchone()
+                                if cur_gen_row and cur_gen_row[0] is not None:
+                                    if int(cur_gen_row[0]) > init_generation:
+                                        raise RuntimeError("Upload aborted: migration gate was acquired during upload")
+                            except Exception as exc:
+                                raise RuntimeError(f"Upload aborted: SQLite error checking gate generation: {exc}")
+
+                        try:
+                            st = local.stat()
+                            if st.st_size != target_size:
+                                raise RuntimeError("Upload aborted: file size changed during upload")
+                        except Exception as exc:
+                            raise RuntimeError(f"Upload aborted: unable to verify file stat during upload: {exc}")
+
+                        yield chunk
+                finally:
+                    if conn_chk is not None:
+                        conn_chk.close()
+
+            if order_id is not None:
+                require_paid_order(order_id)
+            put_response = httpx.put(
+                href,
+                content=chunks(),
+                headers={"Content-Length": str(target_size)},
+                timeout=httpx.Timeout(120.0, connect=30.0),
+            )
+            put_response.raise_for_status()
+
+        # Step 4 & 5: Verify remote metadata matches delivery_jobs authoritative sha256 and size
+        if not _remote_verified(token, remote_path, target_sha256, target_size):
+            raise RuntimeError("Yandex upload was not confirmed by resource metadata")
+        if job_id and stream_operation_id:
+            from delivery import confirm_delivery_stream_completed
+            confirm_delivery_stream_completed(DB_PATH, job_id, stream_operation_id)
+        return True
+    except Exception:
+        raise
 
 
 def order_info_bytes(order_id: int, name: str, phone: str, format: str, paper: str, crop: str, comment: str) -> bytes:
@@ -1083,7 +1279,8 @@ def upload_info_to_yandex_disk(
         )
 
 
-def deliver_job(job: dict) -> None:
+def deliver_job(job: dict) -> dict:
+    stream_lease = None
     order = get_order_by_id(job["order_id"])
     if not order:
         raise RuntimeError("Order for delivery job is missing")
@@ -1102,6 +1299,26 @@ def deliver_job(job: dict) -> None:
         if not path.name.startswith(f"{job['order_id']}_"):
             raise RuntimeError("Local file name does not match order ID")
 
+        if job["kind"] == "file":
+            conn = sqlite3.connect(DB_PATH, timeout=5)
+            try:
+                from delivery import is_migration_active
+                if is_migration_active(conn):
+                    raise RuntimeError("Delivery forbidden: exclusive migration gate is active")
+                row = conn.execute(
+                    "SELECT artifact_role, state FROM delivery_jobs WHERE id=?",
+                    (job["id"],),
+                ).fetchone()
+                if not row:
+                    raise RuntimeError(f"Delivery forbidden: job {job['id']} not found in DB")
+                cur_role, cur_state = row[0], row[1]
+                if cur_role != "result":
+                    raise RuntimeError(f"Delivery forbidden for non-result artifact role: '{cur_role}'")
+                if cur_state != "processing":
+                    raise RuntimeError(f"Delivery forbidden: job {job['id']} is in state '{cur_state}', not 'processing'")
+            finally:
+                conn.close()
+
         try:
             target_resolved = path.resolve()
         except Exception as exc:
@@ -1113,28 +1330,89 @@ def deliver_job(job: dict) -> None:
         if upload_resolved not in target_resolved.parents and target_resolved.parent != upload_resolved:
             raise RuntimeError("Local delivery source is outside uploads")
 
+        if job["kind"] == "file":
+            conn = sqlite3.connect(DB_PATH, timeout=5)
+            try:
+                from delivery import is_migration_active, get_file_identity_strict
+                if is_migration_active(conn):
+                    raise RuntimeError("Delivery forbidden: exclusive migration gate is active")
+                row = conn.execute(
+                    "SELECT artifact_role, state FROM delivery_jobs WHERE id=?",
+                    (job["id"],),
+                ).fetchone()
+                if not row or row[0] != "result":
+                    raise RuntimeError(f"Delivery forbidden: artifact role changed to '{row[0] if row else None}'")
+                if row[1] != "processing":
+                    raise RuntimeError(f"Delivery forbidden: job state is '{row[1]}', not 'processing'")
+
+                try:
+                    target_fid = get_file_identity_strict(raw_path)
+                    target_norm = os.path.normcase(os.path.abspath(raw_path))
+                except Exception as exc:
+                    raise RuntimeError(f"Delivery forbidden: unable to establish identity of delivery target: {exc}")
+
+                for other_path, other_role in conn.execute(
+                    "SELECT local_path, artifact_role FROM delivery_jobs WHERE id != ? AND artifact_role IN ('source', 'quarantine')",
+                    (job["id"],),
+                ).fetchall():
+                    if not other_path:
+                        continue
+                    other_norm = os.path.normcase(os.path.abspath(other_path))
+                    if other_norm == target_norm:
+                        raise RuntimeError("Delivery forbidden: file is aliased to a protected source/quarantine artifact")
+                    try:
+                        other_fid = get_file_identity_strict(other_path)
+                        if other_fid == target_fid:
+                            raise RuntimeError("Delivery forbidden: file is aliased to a protected source/quarantine artifact")
+                    except Exception as exc:
+                        raise RuntimeError(f"Delivery forbidden: unable to establish identity of protected record: {exc}")
+            finally:
+                conn.close()
+
         remote_folder, remote_name = job["remote_path"].rsplit("/", 1)
         expected_sha256 = job.get("content_sha256")
         expected_size = job.get("content_size")
-        if job["kind"] == "info":
-            ok = upload_info_to_yandex_disk(
-                order["id"], order["name"], order["phone"], order["format"],
-                order["paper"], order["crop"], order["comment"], remote_folder,
-                source_path=str(path),
-                expected_sha256=expected_sha256,
-                expected_size=expected_size,
-                uploads_dir=UPLOAD_DIR,
-            )
-        else:
-            ok = upload_to_yandex_disk(
-                str(path),
-                remote_folder,
-                remote_name,
-                expected_sha256=expected_sha256,
-                expected_size=expected_size,
-                uploads_dir=UPLOAD_DIR,
-                order_id=job["order_id"],
-            )
+
+        stream_lease = None
+        if job["kind"] == "file":
+            from delivery import acquire_delivery_stream_lease, release_delivery_stream_lease
+            stream_lease = acquire_delivery_stream_lease(DB_PATH, job["id"])
+            if stream_lease and "stream_operation_id" in stream_lease:
+                job["stream_operation_id"] = stream_lease["stream_operation_id"]
+
+        try:
+            if job["kind"] == "info":
+                ok = upload_info_to_yandex_disk(
+                    order["id"], order["name"], order["phone"], order["format"],
+                    order["paper"], order["crop"], order["comment"], remote_folder,
+                    source_path=str(path),
+                    expected_sha256=expected_sha256,
+                    expected_size=expected_size,
+                    uploads_dir=UPLOAD_DIR,
+                )
+            else:
+                ok = upload_to_yandex_disk(
+                    str(path),
+                    remote_folder,
+                    remote_name,
+                    expected_sha256=expected_sha256,
+                    expected_size=expected_size,
+                    uploads_dir=UPLOAD_DIR,
+                    order_id=job["order_id"],
+                    job_id=job["id"],
+                    stream_generation=stream_lease["gate_generation"] if stream_lease else None,
+                    stream_operation_id=stream_lease.get("stream_operation_id") if stream_lease else None,
+                )
+        finally:
+            if stream_lease is not None:
+                try:
+                    release_delivery_stream_lease(
+                        DB_PATH,
+                        job["id"],
+                        stream_operation_id=stream_lease.get("stream_operation_id"),
+                    )
+                except Exception as rel_err:
+                    logging.warning("release_delivery_stream_lease failed for job %s: %s", job["id"], rel_err)
     elif job["kind"] == "admin_email":
         ok = send_order_email(order["id"], order["name"], order["phone"], order["comment"],
                               order["format"], order["paper"], order["crop"])
@@ -1144,6 +1422,26 @@ def deliver_job(job: dict) -> None:
         raise RuntimeError("Unknown delivery job kind")
     if not ok:
         raise RuntimeError("Delivery was not confirmed")
+
+    if job["kind"] == "file":
+        conn = sqlite3.connect(DB_PATH, timeout=5)
+        try:
+            from delivery import is_migration_active
+            if is_migration_active(conn):
+                raise RuntimeError("Delivery forbidden: migration became active during upload")
+            row = conn.execute(
+                "SELECT artifact_role, state FROM delivery_jobs WHERE id=?",
+                (job["id"],),
+            ).fetchone()
+            if not row or row[0] != "result":
+                raise RuntimeError(f"Delivery forbidden: artifact role reclassified to '{row[0] if row else None}'")
+        finally:
+            conn.close()
+
+    return {
+        "ok": True,
+        "stream_operation_id": stream_lease.get("stream_operation_id") if stream_lease else None,
+    }
 
 
 # --- Эндпоинт приема заказа ---
@@ -1158,9 +1456,87 @@ async def create_order(
     paper: str = Form("Не указана"),
     crop: str = Form("Не указано"),
     files: List[UploadFile] = File(...),
+    consent_service_terms: Optional[str] = Form(None),
+    consent_personal_data: Optional[str] = Form(None),
+    consent_third_party_images: Optional[str] = Form(None),
+    consent_minor_images: Optional[str] = Form(None),
+    consent_cross_border: Optional[str] = Form(None),
+    consent_doc_version: Optional[str] = Form(None),
+    consent_doc_hash: Optional[str] = Form(None),
+    consents_json: Optional[str] = Form(None),
 ):
     if not 1 <= len(files) <= MAX_FILES:
         raise HTTPException(status_code=400, detail="Invalid number of files")
+
+    parsed_json_consents = {}
+    if consents_json:
+        try:
+            parsed_json_consents = json.loads(consents_json)
+            if not isinstance(parsed_json_consents, dict):
+                raise ValueError("consents_json must be an object")
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid consents_json: {exc}")
+
+    st_flag = _parse_consent_flag(consent_service_terms) or _parse_consent_flag(
+        parsed_json_consents.get("service_terms")
+    )
+    pd_flag = _parse_consent_flag(consent_personal_data) or _parse_consent_flag(
+        parsed_json_consents.get("personal_data_processing")
+    )
+    tp_flag = _parse_consent_flag(consent_third_party_images) or _parse_consent_flag(
+        parsed_json_consents.get("third_party_images")
+    )
+    minor_flag = _parse_consent_flag(consent_minor_images) or _parse_consent_flag(
+        parsed_json_consents.get("minor_images")
+    )
+    cb_flag = _parse_consent_flag(consent_cross_border) or _parse_consent_flag(
+        parsed_json_consents.get("cross_border_transfer")
+    )
+
+    doc_ver = (consent_doc_version or parsed_json_consents.get("doc_version") or "").strip() or None
+    doc_hash = (consent_doc_hash or parsed_json_consents.get("doc_hash") or "").strip() or None
+
+    if not consents.feature_enabled():
+        raise HTTPException(
+            status_code=400,
+            detail="Order creation is disabled: consent enforcement system is not configured",
+        )
+
+    if not st_flag or not pd_flag:
+        raise HTTPException(
+            status_code=400,
+            detail="Mandatory consents (service terms and personal data processing) are required",
+        )
+    if not consents.is_document_approved(consents.PURPOSE_SERVICE):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Consent for {consents.PURPOSE_SERVICE} is blocked pending legal approval",
+        )
+    if not consents.is_document_approved(consents.PURPOSE_PERSONAL_DATA):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Consent for {consents.PURPOSE_PERSONAL_DATA} is blocked pending legal approval",
+        )
+    if tp_flag and not consents.is_document_approved(consents.PURPOSE_THIRD_PARTY_IMAGES):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Consent for {consents.PURPOSE_THIRD_PARTY_IMAGES} is blocked pending legal approval",
+        )
+    if minor_flag and not consents.is_document_approved(consents.PURPOSE_MINOR_IMAGES):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Consent for {consents.PURPOSE_MINOR_IMAGES} is blocked pending legal approval",
+        )
+    if cb_flag and not consents.is_document_approved(consents.PURPOSE_CROSS_BORDER):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Consent for {consents.PURPOSE_CROSS_BORDER} is blocked pending legal approval",
+        )
+    if doc_ver and not consents.verify_document_version(consents.PURPOSE_SERVICE, doc_ver):
+        raise HTTPException(status_code=400, detail="Invalid consent document version")
+    if doc_hash and not consents.verify_document_hash(consents.PURPOSE_SERVICE, doc_hash):
+        raise HTTPException(status_code=400, detail="Invalid consent document hash")
+
     amount = format_robokassa_amount(calculate_authoritative_price(format, paper, crop, len(files)))
     staged = []
     finalized = []
@@ -1186,6 +1562,35 @@ async def create_order(
              amount, amount, datetime.utcnow().isoformat(), token_hash),
         )
         order_id = cursor.lastrowid
+
+        consents.record_consent(
+            conn,
+            order_ref=str(order_id),
+            purpose=consents.PURPOSE_SERVICE,
+            expected_hash=doc_hash,
+            expected_version=doc_ver,
+            auto_commit=False,
+        )
+        consents.record_consent(
+            conn,
+            order_ref=str(order_id),
+            purpose=consents.PURPOSE_PERSONAL_DATA,
+            expected_version=doc_ver,
+            auto_commit=False,
+        )
+        missing = consents.check_required(
+            conn,
+            str(order_id),
+            has_third_party_images=tp_flag,
+            has_minor_images=minor_flag,
+            requires_cross_border=cb_flag,
+        )
+        if missing:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Missing required consents: {', '.join(missing)}",
+            )
+
         folder = _join_yandex_path(
             get_yandex_disk_root(), f"Заказ_{order_id}_{_folder_component(name)}",
             f"{_folder_component(format)}_{_folder_component(paper)}_{_folder_component(crop)}",
@@ -1198,7 +1603,7 @@ async def create_order(
             finalized.append(final_path)
             enqueue(conn, order_id=order_id, kind="file", local_path=str(final_path),
                     original_name=item["original_name"], remote_path=f"{folder}/{stored_name}",
-                    sha256=item["sha256"], size=item["size"])
+                    sha256=item["sha256"], size=item["size"], artifact_role=ROLE_SOURCE)
 
         info_path = UPLOAD_DIR / f"{order_id}_{uuid.uuid4().hex}_info.txt"
         info = order_info_bytes(order_id, name, phone, format, paper, crop, comment)
@@ -1209,7 +1614,7 @@ async def create_order(
         finalized.append(info_path)
         enqueue(conn, order_id=order_id, kind="info", local_path=str(info_path),
                 original_name="info.txt", remote_path=f"{folder}/info.txt",
-                sha256=hashlib.sha256(info).hexdigest(), size=len(info))
+                sha256=hashlib.sha256(info).hexdigest(), size=len(info), artifact_role=ROLE_INFO)
         enqueue(conn, order_id=order_id, kind="admin_email")
         commit_started = True
         conn.commit()
@@ -1230,6 +1635,23 @@ async def create_order(
     finally:
         if conn is not None:
             conn.close()
+
+
+@app.get("/api/order/{order_id}/consents")
+async def get_order_consents(order_id: int, order_token: str = Query(...)):
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    try:
+        row = conn.execute(
+            "SELECT order_token_hash FROM orders WHERE id=?", (order_id,)
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Order not found")
+        expected_hash = hashlib.sha256(order_token.encode("utf-8")).hexdigest()
+        if not hmac.compare_digest(row[0], expected_hash):
+            raise HTTPException(status_code=403, detail="Forbidden: invalid order token")
+        return {"order_id": order_id, "consents": consents.evidence(conn, str(order_id))}
+    finally:
+        conn.close()
 
 
 # --- Эндпоинты платежной системы Robokassa ---
@@ -1349,7 +1771,12 @@ async def robokassa_result(request: Request, background_tasks: BackgroundTasks):
     signature = payload.get("SignatureValue")
 
     if not out_sum or inv_id is None or not signature:
-        logging.error("Result URL: Отсутствуют обязательные параметры payload=%s", payload)
+        # M-05: never log the raw callback — a sender controls those fields and may embed
+        # contact data, tokens or signatures. Only the field names are safe.
+        logging.error(
+            "Result URL: отсутствуют обязательные параметры; получены поля: %s",
+            sorted(payload.keys()),
+        )
         raise HTTPException(status_code=400, detail="Missing Robokassa payload")
 
     try:
@@ -1449,3 +1876,57 @@ async def robokassa_success(request: Request):
         "status": "paid" if is_paid else "pending",
         "message": "Оплата подтверждена" if is_paid else "Ожидание подтверждения от платежной системы",
     })
+
+# ---------------------------------------------------------------------------
+# Operator workflow (contract PHOTODOC-R1-OPERATOR-CONTRACT 1.0).
+# Every route authenticates independently; without OPERATOR_TOKEN the whole
+# surface answers 503 and nothing is reachable.
+# ---------------------------------------------------------------------------
+
+def _require_operator(request: Request) -> None:
+    operator_service.require_operator(request.headers.get("authorization"))
+
+
+@app.get("/api/operator/orders")
+def operator_orders(request: Request):
+    _require_operator(request)
+    return {"ok": True, "orders": operator_service.list_paid_orders(DB_PATH)}
+
+
+@app.get("/api/operator/orders/{order_id}")
+def operator_order(order_id: int, request: Request):
+    _require_operator(request)
+    return {"ok": True, "order": operator_service.order_metadata(DB_PATH, order_id)}
+
+
+@app.get("/api/operator/orders/{order_id}/source")
+def operator_source(order_id: int, request: Request):
+    _require_operator(request)
+    path = operator_service.source_for_download(DB_PATH, order_id)
+    # M-03: a protected photograph must never be cached by a browser or a proxy.
+    return FileResponse(path, media_type="application/octet-stream", filename=path.name,
+                        headers={"Cache-Control": "no-store, private"})
+
+
+@app.post("/api/operator/orders/{order_id}/result")
+async def operator_upload_result(order_id: int, request: Request,
+                                 file: UploadFile = File(...), replace: bool = False):
+    _require_operator(request)
+    payload = operator_service.read_limited(file)      # M-06: bounded read
+    suffix, sha256 = operator_service.validate_result(file, payload)
+    stored = operator_service.store_result(DB_PATH, order_id, suffix, payload, sha256, replace=replace)
+    return {"ok": True, "order_id": order_id, "bytes": len(payload), "sha256": sha256[:16]}
+
+
+@app.post("/api/operator/orders/{order_id}/submit")
+def operator_submit(order_id: int, request: Request):
+    _require_operator(request)
+    job_id = operator_service.submit_delivery(DB_PATH, order_id)
+    return {"ok": True, "order_id": order_id, "job_id": job_id}
+
+
+@app.get("/api/operator/orders/{order_id}/delivery")
+def operator_delivery(order_id: int, request: Request):
+    _require_operator(request)
+    return {"ok": True, "order_id": order_id,
+            "jobs": operator_service.delivery_state(DB_PATH, order_id)}
