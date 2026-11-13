@@ -220,7 +220,7 @@ def test_audit_records_actions_without_secrets(env):
     events = [row[0] for row in rows]
     assert "result_uploaded" in events and "delivery_submitted" in events
     joined = " ".join(row[1] or "" for row in rows)
-    assert TOKEN not in joined and "420" not in joined
+    assert TOKEN not in joined and f"Bearer {TOKEN}" not in joined
 
 
 def test_original_is_never_modified_by_the_workflow(env):

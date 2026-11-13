@@ -20,6 +20,7 @@ if str(BACKEND_DIR) not in sys.path:
 import pytest
 from fastapi.testclient import TestClient
 
+import consents
 import delivery
 import main
 import operator_workflow
@@ -60,6 +61,9 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setenv("YANDEX_DISK_STAGING_TOKEN", "")
     monkeypatch.setenv("SMTP_PASSWORD", "")
     monkeypatch.setenv("YANDEX_DISK_ROOT_DIR", "Synthetic_Orders")
+    monkeypatch.setenv("CONSENT_FEATURE_ENABLED", "1")
+    monkeypatch.setitem(consents.DOCUMENTS[consents.PURPOSE_SERVICE], "approved", True)
+    monkeypatch.setitem(consents.DOCUMENTS[consents.PURPOSE_PERSONAL_DATA], "approved", True)
 
     main.init_db()
     client = TestClient(main.app)
@@ -94,6 +98,8 @@ def test_16_step_real_order_source_lifecycle(env):
             "paper": "Цифровая обработка",
             "crop": "По стандарту документа",
             "comment": "Срочно для паспорта",
+            "consent_service_terms": "true",
+            "consent_personal_data": "true",
         },
         files={"files": ("source.jpg", SOURCE_BYTES, "image/jpeg")},
     )
@@ -225,7 +231,10 @@ def test_duplicate_payment_callback_is_idempotent_and_preserves_source(env):
     client, db_path, uploads_dir = env
     order_resp = client.post(
         "/api/order",
-        data={"name": "Dup Callback", "phone": "123", "format": "10x15"},
+        data={
+            "name": "Dup Callback", "phone": "123", "format": "10x15",
+            "consent_service_terms": "true", "consent_personal_data": "true",
+        },
         files={"files": ("orig.jpg", SOURCE_BYTES, "image/jpeg")},
     )
     order_id = order_resp.json()["order_id"]
@@ -259,7 +268,10 @@ def test_delayed_payment_callback_preserves_source(env):
     client, db_path, _ = env
     order_resp = client.post(
         "/api/order",
-        data={"name": "Delayed Pay", "phone": "123", "format": "10x15"},
+        data={
+            "name": "Delayed Pay", "phone": "123", "format": "10x15",
+            "consent_service_terms": "true", "consent_personal_data": "true",
+        },
         files={"files": ("orig.jpg", SOURCE_BYTES, "image/jpeg")},
     )
     order_id = order_resp.json()["order_id"]
@@ -284,7 +296,10 @@ def test_quarantined_source_returns_409_and_is_not_claimable(env):
     client, db_path, uploads_dir = env
     order_resp = client.post(
         "/api/order",
-        data={"name": "Quarantine User", "phone": "123", "format": "10x15"},
+        data={
+            "name": "Quarantine User", "phone": "123", "format": "10x15",
+            "consent_service_terms": "true", "consent_personal_data": "true",
+        },
         files={"files": ("orig.jpg", SOURCE_BYTES, "image/jpeg")},
     )
     order_id = order_resp.json()["order_id"]
@@ -320,7 +335,10 @@ def test_missing_original_returns_410(env):
     client, db_path, _ = env
     order_resp = client.post(
         "/api/order",
-        data={"name": "Missing User", "phone": "123", "format": "10x15"},
+        data={
+            "name": "Missing User", "phone": "123", "format": "10x15",
+            "consent_service_terms": "true", "consent_personal_data": "true",
+        },
         files={"files": ("orig.jpg", SOURCE_BYTES, "image/jpeg")},
     )
     order_id = order_resp.json()["order_id"]
@@ -341,7 +359,10 @@ def test_result_replacement_and_delivery_in_place(env):
     client, db_path, uploads_dir = env
     order_resp = client.post(
         "/api/order",
-        data={"name": "Replace User", "phone": "123", "format": "10x15"},
+        data={
+            "name": "Replace User", "phone": "123", "format": "10x15",
+            "consent_service_terms": "true", "consent_personal_data": "true",
+        },
         files={"files": ("orig.jpg", SOURCE_BYTES, "image/jpeg")},
     )
     order_id = order_resp.json()["order_id"]
@@ -401,7 +422,10 @@ def test_worker_claim_racing_with_result_replacement(env):
     client, db_path, _ = env
     order_resp = client.post(
         "/api/order",
-        data={"name": "Race User", "phone": "123", "format": "10x15"},
+        data={
+            "name": "Race User", "phone": "123", "format": "10x15",
+            "consent_service_terms": "true", "consent_personal_data": "true",
+        },
         files={"files": ("orig.jpg", SOURCE_BYTES, "image/jpeg")},
     )
     order_id = order_resp.json()["order_id"]
@@ -436,7 +460,10 @@ def test_duplicate_delivery_submission_is_idempotent(env):
     client, db_path, _ = env
     order_resp = client.post(
         "/api/order",
-        data={"name": "Idempotent Submit", "phone": "123", "format": "10x15"},
+        data={
+            "name": "Idempotent Submit", "phone": "123", "format": "10x15",
+            "consent_service_terms": "true", "consent_personal_data": "true",
+        },
         files={"files": ("orig.jpg", SOURCE_BYTES, "image/jpeg")},
     )
     order_id = order_resp.json()["order_id"]

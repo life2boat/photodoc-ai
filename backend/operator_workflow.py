@@ -119,13 +119,12 @@ def require_processable(conn: sqlite3.Connection, order_id: int) -> dict[str, An
 def _is_result_job(job) -> bool:
     if "artifact_role" in job.keys():
         role = job["artifact_role"]
-        if role == "result":
-            return True
-        if role == "source":
-            return False
+        if role is not None and role != "":
+            return role == "result"
     remote = job["remote_path"] or ""
     local = job["local_path"] or ""
-    return remote.endswith("_result.bin") or RESULT_SUFFIX in local
+    lname = Path(local).name if local else ""
+    return (remote.endswith("_result.bin") and "_source" not in remote) or RESULT_SUFFIX in lname
 
 
 def _source_job(conn: sqlite3.Connection, order_id: int):
@@ -144,8 +143,24 @@ def _source_job(conn: sqlite3.Connection, order_id: int):
         for row in rows:
             if row["artifact_role"] == "source":
                 return row
+        for row in rows:
+            if row["artifact_role"] in (None, ""):
+                if _is_result_job(row):
+                    continue
+                rpath = row["remote_path"] or ""
+                lpath = row["local_path"] or ""
+                lname = Path(lpath).name if lpath else ""
+                if "_result" in rpath or "_result" in lname:
+                    continue
+                return row
+        return None
     for row in rows:
         if _is_result_job(row):
+            continue
+        rpath = row["remote_path"] or ""
+        lpath = row["local_path"] or ""
+        lname = Path(lpath).name if lpath else ""
+        if "_result" in rpath or "_result" in lname:
             continue
         return row
     return None
@@ -172,13 +187,19 @@ def _source_path(conn: sqlite3.Connection, order_id: int) -> Path | None:
 
 def _quarantine_for(conn: sqlite3.Connection, order_id: int) -> Path | None:
     job = _source_job(conn, order_id)
-    if job is None:
-        return None
-    quarantine = uploads_dir() / ".quarantine"
-    if not quarantine.is_dir():
-        return None
-    for claim in quarantine.glob(f"{job['id']}.*.claim"):
-        return claim
+    if job is not None:
+        quarantine = uploads_dir() / ".quarantine"
+        if quarantine.is_dir():
+            for claim in quarantine.glob(f"{job['id']}.*.claim"):
+                return claim
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(delivery_jobs)").fetchall()}
+    if "artifact_role" in cols:
+        row = conn.execute(
+            "SELECT id FROM delivery_jobs WHERE order_id=? AND artifact_role='quarantine'",
+            (order_id,),
+        ).fetchone()
+        if row is not None:
+            return uploads_dir() / ".quarantine" / f"{row['id']}.quarantine"
     return None
 
 
@@ -278,12 +299,12 @@ def _result_is_locked(conn: sqlite3.Connection, order_id: int) -> bool:
     if has_role:
         row = conn.execute(
             "SELECT 1 FROM delivery_jobs WHERE order_id=? AND state IN ('processing','delivered') "
-            "AND (artifact_role='result' OR remote_path LIKE '%_result.bin')", (order_id,)
+            "AND artifact_role='result'", (order_id,)
         ).fetchone()
     else:
         row = conn.execute(
             "SELECT 1 FROM delivery_jobs WHERE order_id=? AND state IN ('processing','delivered') "
-            "AND (remote_path LIKE '%_result.bin')", (order_id,)
+            "AND remote_path LIKE '%_result.bin' AND remote_path NOT LIKE '%_source%'", (order_id,)
         ).fetchone()
     return row is not None
 
@@ -367,12 +388,12 @@ def submit_delivery(db_path: Path, order_id: int) -> str:
         has_role = "artifact_role" in cols
         if has_role:
             job = conn.execute(
-                "SELECT id, state FROM delivery_jobs WHERE order_id=? AND (artifact_role='result' OR remote_path LIKE '%_result.bin')",
+                "SELECT id, state FROM delivery_jobs WHERE order_id=? AND artifact_role='result'",
                 (order_id,),
             ).fetchone()
         else:
             job = conn.execute(
-                "SELECT id, state FROM delivery_jobs WHERE order_id=? AND remote_path LIKE '%_result.bin'",
+                "SELECT id, state FROM delivery_jobs WHERE order_id=? AND remote_path LIKE '%_result.bin' AND remote_path NOT LIKE '%_source%'",
                 (order_id,),
             ).fetchone()
         if job is not None and job["state"] in ("processing", "delivered"):

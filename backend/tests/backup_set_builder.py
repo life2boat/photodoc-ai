@@ -74,18 +74,28 @@ def build_database(
     db_path.parent.mkdir(parents=True, exist_ok=True)
     uploads_dir.mkdir(parents=True, exist_ok=True)
 
+    import consents
+
+    original_approval = {
+        p: consents.DOCUMENTS[p].get("approved")
+        for p in consents.MANDATORY_PURPOSES
+    }
     saved = {name: os.environ.get(name) for name in
-             ("ROBOKASSA_MERCHANT_LOGIN", "ROBOKASSA_PASSWORD1", "ROBOKASSA_PASSWORD2",
+              ("ROBOKASSA_MERCHANT_LOGIN", "ROBOKASSA_PASSWORD1", "ROBOKASSA_PASSWORD2",
               "DELIVERY_WORKER_ENABLED", "YANDEX_DISK_ROOT_DIR", "SMTP_SERVER", "SMTP_USER",
-              "SMTP_PASSWORD", "EMAIL_TO")}
+              "SMTP_PASSWORD", "EMAIL_TO", "CONSENT_FEATURE_ENABLED")}
     original = (main.DB_PATH, main.UPLOAD_DIR)
     try:
+        for p in consents.MANDATORY_PURPOSES:
+            consents.DOCUMENTS[p]["approved"] = True
+
         os.environ.update({
             "ROBOKASSA_MERCHANT_LOGIN": "synthetic-merchant",
             "ROBOKASSA_PASSWORD1": "synthetic-pass-1",
             "ROBOKASSA_PASSWORD2": PASSWORD2,
             "DELIVERY_WORKER_ENABLED": "0",
             "YANDEX_DISK_ROOT_DIR": "PhotoDoc_Synthetic",
+            "CONSENT_FEATURE_ENABLED": "1",
         })
         for name in ("SMTP_SERVER", "SMTP_USER", "SMTP_PASSWORD", "EMAIL_TO"):
             os.environ.pop(name, None)
@@ -98,8 +108,15 @@ def build_database(
         for index, (customer_name, data) in CUSTOMER_FILES.items():
             response = client.post(
                 "/api/order",
-                data={"name": f"Synthetic {index}", "phone": "+79990000000",
-                      "format": "10x15", "paper": "Matte", "crop": "None"},
+                data={
+                    "name": f"Synthetic {index}",
+                    "phone": "+79990000000",
+                    "format": "10x15",
+                    "paper": "Matte",
+                    "crop": "None",
+                    "consent_service_terms": "true",
+                    "consent_personal_data": "true",
+                },
                 files=[("files", (customer_name, data, "image/jpeg"))],
             )
             assert response.status_code == 200, response.text
@@ -203,6 +220,9 @@ def build_database(
         }
     finally:
         main.DB_PATH, main.UPLOAD_DIR = original
+        for p, approved in original_approval.items():
+            if approved is not None:
+                consents.DOCUMENTS[p]["approved"] = approved
         for name, value in saved.items():
             if value is None:
                 os.environ.pop(name, None)

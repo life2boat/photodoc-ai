@@ -65,12 +65,16 @@ def lifecycle(tmp_path, monkeypatch):
     uploads.mkdir()
     monkeypatch.setattr(main, "DB_PATH", db)
     monkeypatch.setattr(main, "UPLOAD_DIR", uploads)
+    import consents
     for key, value in {"DELIVERY_WORKER_ENABLED": "0", "YANDEX_DISK_TOKEN": "synthetic-oauth-secret",
                        "ROBOKASSA_MERCHANT_LOGIN": "synthetic-merchant", "ROBOKASSA_PASSWORD1": "synthetic-p1",
                        "ROBOKASSA_PASSWORD2": "synthetic-p2", "ROBOKASSA_IS_TEST": "1",
                        "PHOTODOC_STAGING": "0", "PHOTODOC_ALLOW_FRESH_DB": "0",
+                       "CONSENT_FEATURE_ENABLED": "1",
                        "YANDEX_DISK_ROOT_DIR": "PhotoDoc_Orders"}.items():
         monkeypatch.setenv(key, value)
+    monkeypatch.setitem(consents.DOCUMENTS[consents.PURPOSE_SERVICE], "approved", True)
+    monkeypatch.setitem(consents.DOCUMENTS[consents.PURPOSE_PERSONAL_DATA], "approved", True)
     main.init_db()
     disk = Disk()
     monkeypatch.setattr(main.httpx, "get", disk.get)
@@ -79,13 +83,15 @@ def lifecycle(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "send_paid_order_email", lambda *_: True)
     client = TestClient(main.app)
     response = client.post("/api/order", data={"name": "Synthetic", "phone": "79990000000",
-                           "format": "10x15", "paper": "Матовая", "crop": "Без полей"},
+                           "format": "10x15", "paper": "Матовая", "crop": "Без полей",
+                           "consent_service_terms": "1", "consent_personal_data": "1"},
                            files={"files": ("photo.jpg", PHOTO, "image/jpeg")})
     assert response.status_code == 200, response.text
     # Delivery/recovery scenarios start after a confirmed payment. H1 unpaid
     # coverage lives in test_payment_delivery_reliability.py.
     with sqlite3.connect(db) as conn:
         conn.execute("UPDATE orders SET payment_status='paid',paid_at='2026-01-01' WHERE id=?", (response.json()["order_id"],))
+        conn.execute("UPDATE delivery_jobs SET artifact_role='result' WHERE kind='file'")
     yield client, db, uploads, disk, response.json()
     client.close()
 

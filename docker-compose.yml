@@ -6,6 +6,7 @@ services:
     restart: unless-stopped
     environment:
       - DATABASE_PATH=${DATABASE_PATH:-/data/orders.db}
+      - CONSENT_FEATURE_ENABLED=${CONSENT_FEATURE_ENABLED:-1}
     volumes:
       - photodoc_db:/data
       - ${PHOTODOC_UPLOADS_SOURCE:-photodoc_uploads}:/app/uploads

@@ -13,6 +13,7 @@ from fastapi.testclient import TestClient
 BACKEND = Path(__file__).resolve().parents[1]
 if str(BACKEND) not in sys.path:
     sys.path.insert(0, str(BACKEND))
+import consents  # noqa: E402
 import main  # noqa: E402
 import operator_workflow as operator_service  # noqa: E402
 from delivery import claim_due, finish, process_due, utc_now  # noqa: E402
@@ -33,6 +34,9 @@ def isolated(tmp_path, monkeypatch):
     monkeypatch.setenv("ROBOKASSA_PASSWORD1", "test-pass-1")
     monkeypatch.setenv("ROBOKASSA_PASSWORD2", "test-pass-2")
     monkeypatch.setenv("DELIVERY_WORKER_ENABLED", "0")
+    monkeypatch.setenv("CONSENT_FEATURE_ENABLED", "1")
+    monkeypatch.setitem(consents.DOCUMENTS[consents.PURPOSE_SERVICE], "approved", True)
+    monkeypatch.setitem(consents.DOCUMENTS[consents.PURPOSE_PERSONAL_DATA], "approved", True)
     main.init_db()
     yield TestClient(main.app), db, uploads
 
@@ -41,6 +45,8 @@ def create(client, format_name="10x15", paper="Матовая", crop="Без п�
     return client.post("/api/order", data={
         "name": "Test Client", "phone": "79990000000", "email": "client@example.invalid",
         "format": format_name, "paper": paper, "crop": crop,
+        "consent_service_terms": "true",
+        "consent_personal_data": "true",
     }, files=[("files", (name, JPEG, "image/jpeg")) for name in names])
 
 
@@ -88,8 +94,11 @@ def test_duplicate_names_use_distinct_local_and_remote_ids(isolated):
 
 def test_invalid_type_limit_and_interrupted_upload_leave_no_order(isolated):
     client, db, uploads = isolated
-    wrong_magic = client.post("/api/order", data={"name": "Test", "phone": "7999", "format": "10x15"},
-                              files={"files": ("bad.jpg", b"not-an-image", "image/jpeg")})
+    wrong_magic = client.post("/api/order", data={
+        "name": "Test", "phone": "7999", "format": "10x15",
+        "consent_service_terms": "true",
+        "consent_personal_data": "true",
+    }, files={"files": ("bad.jpg", b"not-an-image", "image/jpeg")})
     assert wrong_magic.status_code == 400
     with patch.object(main, "MAX_FILE_BYTES", 5):
         oversized = create(client)
