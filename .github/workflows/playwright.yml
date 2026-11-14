@@ -70,25 +70,19 @@ jobs:
         if [ -f ../ops/receipts/requirements.txt ]; then
           pip install -r ../ops/receipts/requirements.txt
         fi
-    - name: Run relevant source lifecycle, delivery, migration, and security tests
-      run: |
-        pytest tests/test_real_order_source_lifecycle.py \
-               tests/test_order_delivery.py \
-               tests/test_operator_workflow.py \
-               tests/test_payment_security.py \
-               tests/test_delivery_concurrency.py \
-               tests/test_migration_cleanup_backfill.py \
-               tests/test_migration_reconciliation.py \
-               tests/test_legacy_artifact_role_migration.py \
-               tests/test_r1_concurrency_artifact_alias_04.py -v
+    - name: Run fast payment security checks
+      run: python -m pytest tests/test_payment_security.py -v
     - name: Verify preflight scripts
       run: |
         python ../scripts/production_preflight.py --db nonexistent.db || true
         python ../scripts/verify_staging_delivery_preflight.py
 
-  combined-tree-linux-tests:
-    name: Combined Multi-PR Linux & Symlink Integration Tests
-    runs-on: ubuntu-latest
+  backend-full-tests:
+    name: Full Backend Regression
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
     defaults:
       run:
         working-directory: backend
@@ -98,134 +92,79 @@ jobs:
       ROBOKASSA_PASSWORD2: ci_pass2
       ROBOKASSA_IS_TEST: "1"
       CONSENT_FEATURE_ENABLED: "1"
-      LOG_ROTATION_ENABLED: "1"
+      DELIVERY_WORKER_ENABLED: "0"
+      RETENTION_WORKER_ENABLED: "0"
+      DATABASE_PATH: ${{ runner.temp }}/photodoc-full-import.db
+      PYTHONDONTWRITEBYTECODE: "1"
     steps:
     - uses: actions/checkout@v4
-      with:
-        fetch-depth: 0
     - uses: actions/setup-python@v5
       with:
         python-version: "3.11"
-    - name: Install backend dependencies
-      run: pip install -r requirements.txt
-    - name: Install pytest, pyyaml, and dependencies
+    - name: Record exact tested commit and tree
       run: |
-        pip install pytest pyyaml
-        if [ -f ../ops/receipts/requirements.txt ]; then
-          pip install -r ../ops/receipts/requirements.txt
-        fi
-    - name: Reproduce combined multi-PR integration tree
+        git rev-parse HEAD
+        git rev-parse 'HEAD^{tree}'
+        find tests -maxdepth 1 -name 'test_*.py' | sort
+    - name: Install complete backend test dependencies
+      run: |
+        python -m pip install -r requirements.txt -r ../ops/receipts/requirements.txt pytest pyyaml
+        python -m pip check
+        python -m pip freeze > backend-dependencies.txt
+    - name: Run complete supported backend suite
+      run: python -m pytest tests -ra --junitxml=backend-full-results.xml
+    - name: Reject unreviewed Linux skips and xfails
+      if: ${{ always() }}
+      run: python ../scripts/verify_backend_junit.py backend-full-results.xml
+    - uses: actions/upload-artifact@v4
+      if: ${{ always() }}
+      with:
+        name: backend-full-results
+        path: |
+          backend/backend-full-results.xml
+          backend/backend-dependencies.txt
+
+  combined-tree-linux-tests:
+    name: Combined Multi-PR Linux & Symlink Integration Tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: backend
+    env:
+      ROBOKASSA_IS_TEST: "1"
+      DELIVERY_WORKER_ENABLED: "0"
+      RETENTION_WORKER_ENABLED: "0"
+      DATABASE_PATH: ${{ runner.temp }}/photodoc-linux-import.db
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-python@v5
+      with:
+        python-version: "3.11"
+    - name: Install Linux safety dependencies
+      run: python -m pip install -r requirements.txt -r ../ops/receipts/requirements.txt pytest pyyaml
+    - name: Record exact integrated checkout without mutating its tree
+      run: |
+        git rev-parse HEAD
+        git rev-parse 'HEAD^{tree}'
+    - name: Run real Linux filesystem and FD checks
+      run: |
+        python -m pytest tests/test_retention_adversarial.py::test_parent_symlink_replacement_cannot_delete_outside_uploads tests/test_photo_cleanup_privacy.py::test_symlink_rejected tests/test_pra_a1_receipts.py::test_linux_openat2_confinement_and_file_identity tests/test_pra_a1_receipts.py::test_linux_socket_fds_and_peer_identity -v --junitxml=linux-safety.xml
+        python ../scripts/verify_backend_junit.py linux-safety.xml
+    - name: Repeat four-worker contention ten independent times
       run: |
         set -eu
-        REPO_ROOT=$(git rev-parse --show-toplevel)
-        git config user.name "github-actions[bot]"
-        git config user.email "github-actions[bot]@users.noreply.github.com"
-
-        PR34_HEAD="909eea829c69e72827fc578b34f774ba8b350e34"
-        PR35_HEAD="7e3291377c096e6656fdd153d9279537a6c9c822"
-        PR36_HEAD="80b2a2b42c24c13e426cb97776e9fe244f1bbe12"
-        PR37_HEAD="2ee11ede1a5dffebeb0ef497a7b3b9e88f5501a1"
-
-        echo "==> Fetching exact heads for PR #34, #35, #36, #37..."
-        git -C "$REPO_ROOT" fetch origin "$PR34_HEAD" "$PR35_HEAD" "$PR36_HEAD" "$PR37_HEAD"
-
-        echo "==> Performing reproducible merge of PR #34 (retention)..."
-        if ! git -C "$REPO_ROOT" merge --no-ff --no-commit "$PR34_HEAD"; then
-          CONFLICTS=$(git -C "$REPO_ROOT" diff --name-only --diff-filter=U)
-          echo "Unmerged conflicts detected during PR #34 merge: $CONFLICTS"
-          for f in $CONFLICTS; do
-            if [ "$f" != ".github/workflows/playwright.yml" ]; then
-              echo "FATAL: Code conflict in $f - failing closed!"
-              git -C "$REPO_ROOT" merge --abort
-              exit 1
-            fi
-          done
-          echo "Resolving workflow conflict explicitly in favor of current workflow"
-          git -C "$REPO_ROOT" checkout HEAD -- .github/workflows/playwright.yml
-          git -C "$REPO_ROOT" add .github/workflows/playwright.yml
-          if [ -n "$(git -C "$REPO_ROOT" status --porcelain)" ]; then
-            git -C "$REPO_ROOT" commit -m "chore(ci): cleanly integrate PR #34"
-          fi
-        else
-          if [ -n "$(git -C "$REPO_ROOT" status --porcelain)" ]; then
-            git -C "$REPO_ROOT" commit -m "chore(ci): cleanly integrate PR #34"
-          fi
-        fi
-
-        echo "==> Installing ops dependencies if introduced by PR #34..."
-        if [ -f "$REPO_ROOT/ops/receipts/requirements.txt" ]; then
-          pip install -r "$REPO_ROOT/ops/receipts/requirements.txt"
-        fi
-
-        echo "==> Performing reproducible merge of PR #35 (consents)..."
-        if ! git -C "$REPO_ROOT" merge --no-ff --no-commit "$PR35_HEAD"; then
-          CONFLICTS=$(git -C "$REPO_ROOT" diff --name-only --diff-filter=U)
-          echo "Unmerged conflicts detected during PR #35 merge: $CONFLICTS"
-          for f in $CONFLICTS; do
-            if [ "$f" != ".github/workflows/playwright.yml" ]; then
-              echo "FATAL: Code conflict in $f - failing closed!"
-              git -C "$REPO_ROOT" merge --abort
-              exit 1
-            fi
-          done
-          echo "Resolving workflow conflict explicitly in favor of current workflow"
-          git -C "$REPO_ROOT" checkout HEAD -- .github/workflows/playwright.yml
-          git -C "$REPO_ROOT" add .github/workflows/playwright.yml
-          if [ -n "$(git -C "$REPO_ROOT" status --porcelain)" ]; then
-            git -C "$REPO_ROOT" commit -m "chore(ci): cleanly integrate PR #35"
-          fi
-        else
-          if [ -n "$(git -C "$REPO_ROOT" status --porcelain)" ]; then
-            git -C "$REPO_ROOT" commit -m "chore(ci): cleanly integrate PR #35"
-          fi
-        fi
-
-        COMBINED_TREE_SHA=$(git -C "$REPO_ROOT" rev-parse HEAD^{tree})
-        echo "COMBINED_TREE_SHA=${COMBINED_TREE_SHA}"
-        echo "COMBINED_TREE_SHA=${COMBINED_TREE_SHA}" >> "$GITHUB_ENV"
-
-    - name: Run Linux symlink regression test (fail-closed if skipped)
-      run: |
-        OUTPUT=$(pytest tests/test_retention_adversarial.py -k test_parent_symlink_replacement_cannot_delete_outside_uploads -v)
-        echo "$OUTPUT"
-        if echo "$OUTPUT" | grep -q "1 skipped"; then
-          echo "FATAL: Linux symlink test was skipped!"
-          exit 1
-        fi
-        if ! echo "$OUTPUT" | grep -q "1 passed"; then
-          echo "FATAL: Linux symlink test did not pass!"
-          exit 1
-        fi
-
-    - name: Run consent enforcement test suite (fail-closed)
-      run: |
-        pytest tests/test_consents.py tests/test_consents_integrity.py tests/test_consent_order_flow.py -v
-
-    - name: Run retention and quarantine test suite (C-01, C-02, H-02)
-      run: |
-        pytest tests/test_retention.py \
-               tests/test_retention_adversarial.py \
-               tests/test_retention_recovery.py \
-               tests/test_retention_payment_gate.py \
-               tests/test_retention_worker.py -v
-
-    - name: Run rotation safety and log rotation execution tests (M-03)
-      run: |
-        pytest tests/test_rotation_safety_enforcement.py -v
-
-    - name: Run operator workflow and source lifecycle delivery tests
-      run: |
-        pytest tests/test_operator_workflow.py \
-               tests/test_real_order_source_lifecycle.py \
-               tests/test_order_delivery.py \
-               tests/test_delivery_concurrency.py -v
-
-    - name: Run migrations and full 16-step customer journey integration
-      run: |
-        pytest tests/test_migration_cleanup_backfill.py \
-               tests/test_migration_reconciliation.py \
-               tests/test_legacy_artifact_role_migration.py \
-               tests/test_stage2_customer_journey.py -v
+        for attempt in $(seq 1 10); do
+          echo "FOUR_WORKER_RUN=${attempt}"
+          timeout 45s python -m pytest tests/test_r1_concurrency_artifact_alias_04.py::test_multiple_concurrent_workers_stream_leases_isolated -q
+        done
+    - uses: actions/upload-artifact@v4
+      if: ${{ always() }}
+      with:
+        name: linux-safety-results
+        path: backend/linux-safety.xml
 
   docker-build:
     name: Docker Build
@@ -755,7 +694,7 @@ jobs:
   publish-images:
     name: Build & Publish GHCR Images
     runs-on: ubuntu-latest
-    needs: [docker-build, payment-security-tests, playwright-tests]
+    needs: [docker-build, payment-security-tests, playwright-tests, backend-full-tests, combined-tree-linux-tests]
     if: ${{ false && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/infra/r4-prebuilt-staging-images' || github.ref == 'refs/heads/infra/r4-safe-staging-bootstrap') }} # RELEASE FENCE (H-03): Publishing hard-disabled until release authorization
     permissions:
       contents: read
