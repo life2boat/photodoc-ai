@@ -8,7 +8,7 @@ on:
         default: 'false'
 jobs:
   deploy:
-    if: ${{ github.event.inputs.confirm_deploy == 'DEPLOY' }}
+    if: ${{ false }} # RELEASE FENCE (H-03): Deployment disabled until production launch is formally authorized
     runs-on: ubuntu-latest
     permissions:
       pages: write

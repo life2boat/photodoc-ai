@@ -756,7 +756,7 @@ jobs:
     name: Build & Publish GHCR Images
     runs-on: ubuntu-latest
     needs: [docker-build, payment-security-tests, playwright-tests]
-    if: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/infra/r4-prebuilt-staging-images' || github.ref == 'refs/heads/infra/r4-safe-staging-bootstrap') }}
+    if: ${{ false && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/infra/r4-prebuilt-staging-images' || github.ref == 'refs/heads/infra/r4-safe-staging-bootstrap') }} # RELEASE FENCE (H-03): Publishing hard-disabled until release authorization
     permissions:
       contents: read
       packages: write

@@ -173,7 +173,7 @@ def test_order_rejected_when_mandatory_documents_unapproved(monkeypatch, setup_i
             "crop": "По стандарту документа",
             "consent_service_terms": "true",
             "consent_personal_data": "true",
-            "consent_doc_version": "2026-11-08",
+            "consent_doc_version": consents.CURRENT_DRAFT_VERSION,
             "consent_doc_hash": consents.CANONICAL_OFFER_HASH,
         },
         files={"files": _dummy_file()},
@@ -316,7 +316,7 @@ def test_order_succeeds_with_valid_consents_and_evidence_query(monkeypatch, setu
             "crop": "По стандарту документа",
             "consent_service_terms": "true",
             "consent_personal_data": "true",
-            "consent_doc_version": "2026-11-08",
+            "consent_doc_version": consents.CURRENT_DRAFT_VERSION,
             "consent_doc_hash": canonical_offer_hash,
         },
         files={"files": _dummy_file()},
@@ -352,7 +352,7 @@ def test_order_with_consents_json_payload(monkeypatch):
     consents_payload = json.dumps({
         "service_terms": True,
         "personal_data_processing": True,
-        "doc_version": "2026-11-08",
+        "doc_version": consents.CURRENT_DRAFT_VERSION,
         "doc_hash": consents.CANONICAL_OFFER_HASH,
     })
 

@@ -134,7 +134,7 @@ def test_complete_16_step_customer_journey(journey_env):
             "comment": "Срочно для визы",
             "consent_service_terms": "true",
             "consent_personal_data": "true",
-            "consent_doc_version": "2026-11-08",
+            "consent_doc_version": consents.CURRENT_DRAFT_VERSION,
             "consent_doc_hash": consents.CANONICAL_OFFER_HASH,
         },
         files={"files": ("source.jpg", io.BytesIO(SOURCE_BYTES), "image/jpeg")},

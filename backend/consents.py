@@ -32,8 +32,8 @@ from typing import Any
 FEATURE_FLAG = "CONSENT_FEATURE_ENABLED"
 
 # Canonical cryptographic hashes of approved legal documents (LF normalized UTF-8 SHA-256)
-CANONICAL_OFFER_HASH = "3eb6615b5b5a7da42d7c4e86b5cd692b3daf20ef5b160481b4cbbed789c2c9c0"
-CANONICAL_PRIVACY_HASH = "7a4e0fde5beaf6f1ef15c5d7b8fa3c6bbab8b9d6633a1e2be5f6c5c8c87fe6cf"
+CANONICAL_OFFER_HASH = "f726912805be16510c6ee26f5ec881835ff5ad166ac8eba004b9f446dbb6607c"
+CANONICAL_PRIVACY_HASH = "26a13f3c0da78ef08c4a464168d149ee21e5e2ddf94b9ca072d4cf4bd08a2bbf"
 
 # Purpose identifiers. Adding a purpose is a deliberate act: the tests assert the exact set.
 PURPOSE_SERVICE = "service_terms"
@@ -45,9 +45,11 @@ PURPOSE_CROSS_BORDER = "cross_border_transfer"
 MANDATORY_PURPOSES = (PURPOSE_SERVICE, PURPOSE_PERSONAL_DATA)
 CONDITIONAL_PURPOSES = (PURPOSE_THIRD_PARTY_IMAGES, PURPOSE_MINOR_IMAGES, PURPOSE_CROSS_BORDER)
 
+CURRENT_DRAFT_VERSION = "2026-11-14-integration-draft"
+
 DOCUMENTS: dict[str, dict[str, Any]] = {
     PURPOSE_SERVICE: {
-        "version": "2026-11-08",
+        "version": CURRENT_DRAFT_VERSION,
         "title": "Публичная оферта",
         "canonical_path": "public-preview/offer.html",
         "pinned_hash": CANONICAL_OFFER_HASH,
@@ -56,7 +58,7 @@ DOCUMENTS: dict[str, dict[str, Any]] = {
         "text": None,
     },
     PURPOSE_PERSONAL_DATA: {
-        "version": "2026-11-08",
+        "version": CURRENT_DRAFT_VERSION,
         "title": "Согласие на обработку персональных данных",
         "canonical_path": "public-preview/privacy.html",
         "pinned_hash": CANONICAL_PRIVACY_HASH,
@@ -65,7 +67,7 @@ DOCUMENTS: dict[str, dict[str, Any]] = {
         "text": None,
     },
     PURPOSE_THIRD_PARTY_IMAGES: {
-        "version": "2026-11-08",
+        "version": CURRENT_DRAFT_VERSION,
         "title": "Подтверждение прав на изображение третьего лица",
         "canonical_path": None,
         "pinned_hash": None,
@@ -74,7 +76,7 @@ DOCUMENTS: dict[str, dict[str, Any]] = {
         "text": "Подтверждение, что заказчик вправе передать изображение и получил согласие изображённого лица.",
     },
     PURPOSE_MINOR_IMAGES: {
-        "version": "2026-11-08",
+        "version": CURRENT_DRAFT_VERSION,
         "title": "Изображение несовершеннолетнего",
         "canonical_path": None,
         "pinned_hash": None,
@@ -83,7 +85,7 @@ DOCUMENTS: dict[str, dict[str, Any]] = {
         "text": "Подтверждение согласия законного представителя на обработку изображения несовершеннолетнего.",
     },
     PURPOSE_CROSS_BORDER: {
-        "version": "2026-11-08",
+        "version": CURRENT_DRAFT_VERSION,
         "title": "Трансграничная передача",
         "canonical_path": None,
         "pinned_hash": None,

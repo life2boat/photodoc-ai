@@ -136,7 +136,7 @@ def test_m02_record_consent_validates_hash_and_version(db, synthetic_approval):
     rec = consents.record_consent(
         db, order_ref="ord-v", purpose=consents.PURPOSE_SERVICE,
         expected_hash=consents.CANONICAL_OFFER_HASH,
-        expected_version="2026-11-08",
+        expected_version=consents.CURRENT_DRAFT_VERSION,
     )
     assert rec["document_hash"] == consents.CANONICAL_OFFER_HASH
 
