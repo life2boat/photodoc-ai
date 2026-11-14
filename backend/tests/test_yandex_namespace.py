@@ -258,7 +258,7 @@ def test_interrupted_upload_retains_source_and_native_retry_verifies_before_clea
     with sqlite3.connect(main.DB_PATH) as c:
         c.execute("INSERT INTO orders(id,name,payment_status) VALUES(1,'Synthetic','paid')")
         delivery.enqueue(c, order_id=1, kind="file", local_path=str(source), remote_path=target,
-            sha256=hashlib.sha256(content).hexdigest(), size=len(content))
+            sha256=hashlib.sha256(content).hexdigest(), size=len(content), artifact_role="result")
     disk = Disk({"app:/", "app:/Stage"})
     disk.interrupt = True
     with install(monkeypatch, disk):

@@ -114,6 +114,7 @@ def create_test_order(client, filenames=("photo1.jpg",), content=JPEG, *, paid=T
         # Cleanup/transport regressions exercise legitimate paid fulfilment.
         with sqlite3.connect(main.DB_PATH) as conn:
             conn.execute("UPDATE orders SET payment_status='paid',paid_at='2026-01-01' WHERE id=?", (resp.json()["order_id"],))
+            conn.execute("UPDATE delivery_jobs SET artifact_role='result' WHERE order_id=? AND kind='file'", (resp.json()["order_id"],))
     return resp.json()
 
 
@@ -439,9 +440,9 @@ def test_path_outside_uploads_rejected(isolated_env, tmp_path):
     with sqlite3.connect(db) as conn:
         conn.execute("INSERT INTO orders(id,payment_status) VALUES(1,'paid')")
         conn.execute(
-            "INSERT INTO delivery_jobs (id, order_id, kind, local_path, content_sha256, content_size, "
+            "INSERT INTO delivery_jobs (id, order_id, kind, artifact_role, local_path, content_sha256, content_size, "
             "state, cleanup_state, next_attempt_at, created_at) "
-            "VALUES (?, 1, 'file', ?, ?, ?, 'delivered', 'pending', ?, ?)",
+            "VALUES (?, 1, 'file', 'result', ?, ?, ?, 'delivered', 'pending', ?, ?)",
             (job_id, str(outside_file), hashlib.sha256(b"sensitive-system-data").hexdigest(), len(b"sensitive-system-data"), utc_now(), utc_now()),
         )
 
@@ -473,14 +474,15 @@ def test_symlink_rejected(isolated_env, tmp_path):
     with sqlite3.connect(db) as conn:
         conn.execute("INSERT INTO orders(id,payment_status) VALUES(1,'paid')")
         conn.execute(
-            "INSERT INTO delivery_jobs (id, order_id, kind, local_path, content_sha256, content_size, "
+            "INSERT INTO delivery_jobs (id, order_id, kind, artifact_role, local_path, content_sha256, content_size, "
             "state, cleanup_state, next_attempt_at, created_at) "
-            "VALUES (?, 1, 'file', ?, ?, ?, 'delivered', 'pending', ?, ?)",
+            "VALUES (?, 1, 'file', 'result', ?, ?, ?, 'delivered', 'pending', ?, ?)",
             (job_id, str(symlink_path), hashlib.sha256(JPEG).hexdigest(), len(JPEG), utc_now(), utc_now()),
         )
 
     res = perform_job_cleanup(db, job_id, uploads_dir=uploads)
     assert res is False
+    assert target.is_file(), "Target file must not be deleted"
 
     with sqlite3.connect(db) as conn:
         row = conn.execute("SELECT cleanup_state, cleanup_error FROM delivery_jobs WHERE id=?", (job_id,)).fetchone()

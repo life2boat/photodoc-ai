@@ -2,16 +2,16 @@ name: CI
 
 on:
   push:
-    branches: [ main, master, fix/p1-order-delivery-hardening, feat/p1-auto-photo-cleanup, infra/r4-prebuilt-staging-images, infra/r4-safe-staging-bootstrap, audit/r4-integrated-privacy-retention, fix/r4-backup-privacy-audit, fix/r4-archive-audit-hardening, fix/r4-audit-boundary-hardening, fix/r4-owner-authorized-archive-replacement, fix/r4-transaction-safe-archive-replacement, fix/r4-commit-failure-recovery ]
+    branches: [ main, master, fix/p1-order-delivery-hardening, feat/p1-auto-photo-cleanup, infra/r4-prebuilt-staging-images, infra/r4-safe-staging-bootstrap, audit/r4-integrated-privacy-retention, fix/r4-backup-privacy-audit, fix/r4-archive-audit-hardening, fix/r4-audit-boundary-hardening, fix/r4-owner-authorized-archive-replacement, fix/r4-transaction-safe-archive-replacement, fix/r4-commit-failure-recovery, fix/photodoc-r1-source-lifecycle-integration, feat/r1-stage2-close-four-findings ]
   pull_request:
-    branches: [ main, master, fix/p0-production-readiness, infra/r2-public-https-preflight, feat/p1-auto-photo-cleanup, infra/r4-prebuilt-staging-images, infra/r4-safe-staging-bootstrap, audit/r4-integrated-privacy-retention, fix/r4-backup-privacy-audit, fix/r4-archive-audit-hardening, fix/r4-audit-boundary-hardening, fix/r4-owner-authorized-archive-replacement, fix/r4-transaction-safe-archive-replacement, fix/r4-commit-failure-recovery ]
+    branches: [ main, master, fix/p0-production-readiness, infra/r2-public-https-preflight, feat/p1-auto-photo-cleanup, infra/r4-prebuilt-staging-images, infra/r4-safe-staging-bootstrap, audit/r4-integrated-privacy-retention, fix/r4-backup-privacy-audit, fix/r4-archive-audit-hardening, fix/r4-audit-boundary-hardening, fix/r4-owner-authorized-archive-replacement, fix/r4-transaction-safe-archive-replacement, fix/r4-commit-failure-recovery, feat/operator-workflow, fix/photodoc-r1-source-lifecycle-integration ]
   workflow_dispatch:
 
 jobs:
   playwright-tests:
     name: Playwright Tests
     timeout-minutes: 60
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     defaults:
       run:
         working-directory: frontend
@@ -30,7 +30,7 @@ jobs:
     - name: Run build
       run: npm run build
     - name: Install Playwright Browsers
-      run: npx playwright install --with-deps chromium
+      run: npx playwright install chromium
     - name: Run Playwright tests
       run: npx playwright test
     - uses: actions/upload-artifact@v4
@@ -51,21 +51,120 @@ jobs:
       ROBOKASSA_PASSWORD1: ci_pass1
       ROBOKASSA_PASSWORD2: ci_pass2
       ROBOKASSA_IS_TEST: "1"
+      CONSENT_FEATURE_ENABLED: "1"
     steps:
     - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
     - uses: actions/setup-python@v5
       with:
         python-version: "3.11"
     - name: Install backend dependencies
       run: pip install -r requirements.txt
     - name: Install pytest and pyyaml
-      run: pip install pytest pyyaml
-    - name: Run backend security, migration, and delivery tests
-      run: pytest tests -v
+      run: |
+        pip install pytest pyyaml
+        # The PR-A A1 host tests import the host-side package under ops/, whose dependency
+        # is declared in ops/receipts/requirements.txt. That file does not exist on branches
+        # without A1, so the step stays a no-op there.
+        if [ -f ../ops/receipts/requirements.txt ]; then
+          pip install -r ../ops/receipts/requirements.txt
+        fi
+    - name: Run fast payment security checks
+      run: python -m pytest tests/test_payment_security.py -v
     - name: Verify preflight scripts
       run: |
         python ../scripts/production_preflight.py --db nonexistent.db || true
         python ../scripts/verify_staging_delivery_preflight.py
+
+  backend-full-tests:
+    name: Full Backend Regression
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: backend
+    env:
+      ROBOKASSA_MERCHANT_LOGIN: ci_merchant
+      ROBOKASSA_PASSWORD1: ci_pass1
+      ROBOKASSA_PASSWORD2: ci_pass2
+      ROBOKASSA_IS_TEST: "1"
+      CONSENT_FEATURE_ENABLED: "1"
+      DELIVERY_WORKER_ENABLED: "0"
+      RETENTION_WORKER_ENABLED: "0"
+      DATABASE_PATH: ${{ github.workspace }}/.ci-full-import.db
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-python@v5
+      with:
+        python-version: "3.11"
+    - name: Record exact tested commit and tree
+      run: |
+        git rev-parse HEAD
+        git rev-parse 'HEAD^{tree}'
+        find tests -maxdepth 1 -name 'test_*.py' | sort
+    - name: Install complete backend test dependencies
+      run: |
+        python -m pip install -r requirements.txt -r ../ops/receipts/requirements.txt pytest pyyaml
+        python -m pip check
+        python -m pip freeze > backend-dependencies.txt
+    - name: Run complete supported backend suite
+      run: python -m pytest tests -ra --junitxml=backend-full-results.xml
+    - name: Reject unreviewed Linux skips and xfails
+      if: ${{ always() }}
+      run: python ../scripts/verify_backend_junit.py backend-full-results.xml
+    - uses: actions/upload-artifact@v4
+      if: ${{ always() }}
+      with:
+        name: backend-full-results
+        path: |
+          backend/backend-full-results.xml
+          backend/backend-dependencies.txt
+
+  combined-tree-linux-tests:
+    name: Combined Multi-PR Linux & Symlink Integration Tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: backend
+    env:
+      ROBOKASSA_IS_TEST: "1"
+      DELIVERY_WORKER_ENABLED: "0"
+      RETENTION_WORKER_ENABLED: "0"
+      DATABASE_PATH: ${{ github.workspace }}/.ci-linux-import.db
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-python@v5
+      with:
+        python-version: "3.11"
+    - name: Install Linux safety dependencies
+      run: python -m pip install -r requirements.txt -r ../ops/receipts/requirements.txt pytest pyyaml
+    - name: Record exact integrated checkout without mutating its tree
+      run: |
+        git rev-parse HEAD
+        git rev-parse 'HEAD^{tree}'
+    - name: Run real Linux filesystem and FD checks
+      run: |
+        python -m pytest tests/test_retention_adversarial.py::test_parent_symlink_replacement_cannot_delete_outside_uploads tests/test_photo_cleanup_privacy.py::test_symlink_rejected tests/test_pra_a1_receipts.py::test_linux_openat2_confinement_and_file_identity tests/test_pra_a1_receipts.py::test_linux_socket_fds_and_peer_identity -v --junitxml=linux-safety.xml
+        python ../scripts/verify_backend_junit.py linux-safety.xml
+    - name: Repeat four-worker contention ten independent times
+      run: |
+        set -eu
+        for attempt in $(seq 1 10); do
+          echo "FOUR_WORKER_RUN=${attempt}"
+          timeout 45s python -m pytest tests/test_r1_concurrency_artifact_alias_04.py::test_multiple_concurrent_workers_stream_leases_isolated -q
+        done
+    - uses: actions/upload-artifact@v4
+      if: ${{ always() }}
+      with:
+        name: linux-safety-results
+        path: backend/linux-safety.xml
 
   docker-build:
     name: Docker Build
@@ -78,6 +177,7 @@ jobs:
       PORT: 8080
       ROBOKASSA_IS_TEST: "1"
       DATABASE_PATH: /data/orders.db
+      CONSENT_FEATURE_ENABLED: "1"
     steps:
     - uses: actions/checkout@v4
     - name: Validate generic Docker Compose config
@@ -594,8 +694,8 @@ jobs:
   publish-images:
     name: Build & Publish GHCR Images
     runs-on: ubuntu-latest
-    needs: [docker-build, payment-security-tests, playwright-tests]
-    if: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/infra/r4-prebuilt-staging-images' || github.ref == 'refs/heads/infra/r4-safe-staging-bootstrap') }}
+    needs: [docker-build, payment-security-tests, playwright-tests, backend-full-tests, combined-tree-linux-tests]
+    if: ${{ false && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/infra/r4-prebuilt-staging-images' || github.ref == 'refs/heads/infra/r4-safe-staging-bootstrap') }} # RELEASE FENCE (H-03): Publishing hard-disabled until release authorization
     permissions:
       contents: read
       packages: write

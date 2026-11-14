@@ -42,10 +42,11 @@ def order(state="unpaid", oid=1, kind="file"):
     source = main.UPLOAD_DIR / f"{oid}_synthetic.jpg"
     content = b"synthetic retained source"
     source.write_bytes(content)
+    role = "result" if kind == "file" else "info" if kind == "info" else None
     with sqlite3.connect(main.DB_PATH) as c:
         c.execute("INSERT INTO orders(id,name,payment_status,order_amount,payment_amount) VALUES(?,'Synthetic',?,'20.00','20.00')", (oid, state))
         jid = delivery.enqueue(c, order_id=oid, kind=kind, local_path=str(source),
-            remote_path=f"PhotoDoc_Orders/Order_{oid}/photo.jpg", sha256=hashlib.sha256(content).hexdigest(), size=len(content))
+            remote_path=f"PhotoDoc_Orders/Order_{oid}/photo.jpg", sha256=hashlib.sha256(content).hexdigest(), size=len(content), artifact_role=role)
     return source, jid
 
 
@@ -118,6 +119,7 @@ def test_claim_execution_and_cleanup_recheck_payment(env, monkeypatch):
 
 def test_payment_revoked_during_upload_preparation_prevents_file_put(env, monkeypatch):
     source, jid = order("paid")
+    claimed = delivery.claim_due(main.DB_PATH)
     puts = []
     def get(url, **kw):
         if url.endswith("/upload"):
@@ -127,7 +129,7 @@ def test_payment_revoked_during_upload_preparation_prevents_file_put(env, monkey
         return httpx.Response(status, json=data, request=httpx.Request("GET", url))
     monkeypatch.setattr(main.httpx, "get", get)
     monkeypatch.setattr(main.httpx, "put", lambda *a, **k: puts.append(a))
-    with pytest.raises(RuntimeError, match="paid"): main.deliver_job(job(jid))
+    with pytest.raises(RuntimeError, match="paid"): main.deliver_job(claimed)
     assert puts == [] and source.is_file()
 
 
@@ -269,7 +271,7 @@ from delivery import process_due
 process_due(main.DB_PATH,main.deliver_job,limit=1)
 '''
     child_env = {**os.environ, "DATABASE_PATH":str(main.DB_PATH), "PYTHONPATH":str(Path(main.__file__).parent), "DELIVERY_WORKER_ENABLED":"0"}
-    result = subprocess.run([sys.executable, "-B", "-c", code, str(receipt), stage], env=child_env, capture_output=True, timeout=20)
+    result = subprocess.run([sys.executable, "-B", "-c", code, str(receipt), stage], env=child_env, cwd=str(Path(main.__file__).parent), capture_output=True, timeout=20)
     assert result.returncode == 73, result.stderr.decode(errors="replace")
     assert receipt.exists() == (stage == "after_data") and email_state()[0] == "sending"
     with sqlite3.connect(main.DB_PATH) as c: c.execute("UPDATE delivery_jobs SET lease_until='2000-01-01' WHERE id=?", (jid,))
