@@ -173,13 +173,15 @@ def _restore(quarantine: Path, target: Path) -> bool:
         return False
 
 
-def _delete_quarantine(quarantine: Path) -> None:
+def _delete_quarantine(quarantine: Path) -> bool:
     try:
         quarantine.unlink()
     except FileNotFoundError:
         pass
     except OSError as exc:
         logger.warning("retention: quarantine cleanup failed for %s: %s", quarantine, exc)
+        return False
+    return True
 
 
 def _handle_interrupted(conn: sqlite3.Connection, uploads: Path, now_iso: str) -> dict[str, int]:
@@ -569,11 +571,13 @@ def purge_quarantines(db_path: Path, uploads_dir: Path | None = None, *,
 
     uploads = Path(uploads_dir) if uploads_dir is not None else get_uploads_dir()
     current = now or datetime.now(timezone.utc)
-    cutoff = (current - timedelta(hours=grace_hours)).isoformat()
+    if grace_hours < 0:
+        raise ValueError("grace_hours must be >= 0")
+    cutoff = current - timedelta(hours=grace_hours)
     quarantine_dir = uploads / ".quarantine"
     summary: dict[str, Any] = {"scanned": 0, "released": 0, "restored": 0,
                                "kept_for_recovery": 0, "errors": []}
-    if not quarantine_dir.is_dir():
+    if quarantine_dir.is_symlink() or not quarantine_dir.is_dir():
         return summary
 
     conn = sqlite3.connect(db_path, timeout=10)
@@ -581,45 +585,63 @@ def purge_quarantines(db_path: Path, uploads_dir: Path | None = None, *,
         for claim in sorted(quarantine_dir.glob("*.claim")):
             summary["scanned"] += 1
             job_id = claim.name.split(".")[0]
-            row = conn.execute(
-                "SELECT order_id, path FROM retention_audit WHERE job_id=? AND action='deleted' "
-                "ORDER BY id DESC LIMIT 1", (job_id,)
-            ).fetchone()
-            if row is None:
-                continue
-            order_id, path = row[0], row[1]
-            if not path:
-                continue
             try:
-                if datetime.fromisoformat(
-                        conn.execute("SELECT created_at FROM retention_audit WHERE job_id=? "
-                                     "AND action='deleted' ORDER BY id DESC LIMIT 1",
-                                     (job_id,)).fetchone()[0]) > datetime.fromisoformat(cutoff):
+                # Lock order: SQLite writer first, then bounded local filesystem work.
+                # Never wait for a payment writer while holding this lock. A payment
+                # commits before this transaction (restore), or after unlink (late
+                # payment / SourceMissingAtPayment). No network calls in this section.
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    "SELECT a.order_id, a.path, a.created_at, j.order_id, j.local_path, "
+                    "j.kind, j.state, o.payment_status, j.artifact_role FROM retention_audit a "
+                    "JOIN delivery_jobs j ON j.id=a.job_id "
+                    "JOIN orders o ON o.id=a.order_id "
+                    "WHERE a.job_id=? AND a.action='deleted' ORDER BY a.id DESC LIMIT 1",
+                    (job_id,),
+                ).fetchone()
+                if row is None:
                     continue
-            except (TypeError, ValueError):
-                continue
-            if dry_run:
-                summary["released"] += 1
-                continue
-            conn.execute("BEGIN IMMEDIATE")
-            status_row = conn.execute("SELECT payment_status FROM orders WHERE id=?", (order_id,)).fetchone()
-            status = status_row[0] if status_row else None
-            if status is not None and status != "unpaid":
-                target = Path(path)
-                if not target.exists() and _restore(claim, target):
-                    conn.execute(
-                        "INSERT OR IGNORE INTO retention_audit (job_id, order_id, action, reason, path, created_at)"
-                        " VALUES (?, ?, 'restored_after_payment', 'quarantine_release', ?, ?)",
-                        (job_id, order_id, str(target), current.isoformat()))
-                    conn.commit()
-                    summary["restored"] += 1
+                order_id, path, created, job_order, job_path, kind, state, status, role = row
+                created = _parse_ts(created)
+                target = _resolve_inside(path or "", uploads.resolve())
+                if (created is None or created > cutoff or target is None
+                        or order_id != job_order or kind not in ("file", "info")
+                        or state in ("processing", "delivered")
+                        or role not in (None, "source", "info")
+                        or not target.name.startswith(f"{order_id}_")
+                        or _resolve_inside(job_path or "", uploads.resolve()) != target):
                     continue
+                # Revalidate physical containment immediately before restore/unlink.
+                if (quarantine_dir.is_symlink() or claim.is_symlink()
+                        or not claim.is_file() or claim.resolve().parent != quarantine_dir.resolve()):
+                    raise ValueError("Unsafe quarantine artifact")
+                if status not in ("unpaid", "paid", "pending"):
+                    summary["kept_for_recovery"] += 1
+                    continue
+                if dry_run:
+                    summary["released" if status == "unpaid" else "kept_for_recovery"] += 1
+                    continue
+                if status != "unpaid":
+                    if not target.exists() and _restore(claim, target):
+                        conn.execute(
+                            "INSERT OR IGNORE INTO retention_audit (job_id, order_id, action, reason, path, created_at)"
+                            " VALUES (?, ?, 'restored_after_payment', 'quarantine_release', ?, ?)",
+                            (job_id, order_id, str(target), current.isoformat()))
+                        conn.commit()
+                        summary["restored"] += 1
+                    else:
+                        summary["kept_for_recovery"] += 1
+                    continue
+                if not _delete_quarantine(claim):
+                    raise OSError("Quarantine unlink failed; retained for retry")
+                # Release the writer lock ONLY after the irreversible filesystem step.
                 conn.commit()
-                summary["kept_for_recovery"] += 1
-                continue
-            conn.commit()
-            _delete_quarantine(claim)
-            summary["released"] += 1
+                summary["released"] += 1
+            except (sqlite3.Error, OSError, ValueError) as exc:
+                summary["errors"].append(f"{job_id}: {exc}")
+            finally:
+                # Also release on ineligible rows/failure; the next cycle can retry.
+                conn.rollback()
     finally:
         conn.close()
     return summary
