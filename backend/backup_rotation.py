@@ -76,6 +76,18 @@ def validate_backup_rotation_params(
             )
 
 
+def configured_policy() -> dict[str, int | None]:
+    """Load and validate the same policy for startup and every worker cycle."""
+    maximum = os.getenv("BACKUP_MAX_AGE_DAYS")
+    policy = {
+        "retention_days": int(os.getenv("BACKUP_RETENTION_DAYS", str(DEFAULT_RETENTION_DAYS))),
+        "keep_min": int(os.getenv("BACKUP_KEEP_MIN", str(DEFAULT_KEEP_MIN))),
+        "max_age_days": int(maximum) if maximum else None,
+    }
+    validate_backup_rotation_params(**policy)
+    return policy
+
+
 def validate_backup_dir_safety(backup_dir: Path | str) -> Path:
     """Strict validation for backup directory: exists, dir, not symlink, not root."""
     path = Path(backup_dir)

@@ -169,6 +169,16 @@ def run_retention_cycle(
 
     validate_retention_safety(db_path, uploads_dir)
 
+    # Validate before ANY lifecycle mutations, including when called without app startup.
+    backup_policy = None
+    b_dir = None
+    if os.getenv("BACKUP_ROTATION_ENABLED", "0") == "1":
+        configured_dir = backup_dir or os.getenv("BACKUP_DIR")
+        if not configured_dir:
+            raise RuntimeError("BACKUP_ROTATION_ENABLED is 1 but BACKUP_DIR is not set")
+        b_dir = backup_rotation.validate_backup_dir_safety(configured_dir)
+        backup_policy = backup_rotation.configured_policy()
+
     conn = sqlite3.connect(db_path, timeout=10)
     try:
         # Step 0: Acquire lease fence
@@ -212,13 +222,12 @@ def run_retention_cycle(
 
         # Step 4: Backup rotation if enabled
         rotation_summary: dict[str, Any] = {"removed": [], "kept": 0}
-        backup_env_enabled = os.getenv("BACKUP_ROTATION_ENABLED", "0") == "1"
-        b_dir = backup_dir or (Path(os.getenv("BACKUP_DIR")) if os.getenv("BACKUP_DIR") else None)
-        if backup_env_enabled and b_dir and b_dir.is_dir():
+        if backup_policy is not None:
             rotation_summary = backup_rotation.rotate(
                 b_dir,
                 now=current,
                 dry_run=dry_run,
+                **backup_policy,
             )
 
         # Step 5: Application log rotation if enabled

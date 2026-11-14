@@ -138,11 +138,7 @@ def validate_rotation_safety() -> None:
             raise RuntimeError("BACKUP_ROTATION_ENABLED is 1 but BACKUP_DIR is not set")
         try:
             backup_rotation.validate_backup_dir_safety(backup_dir)
-            retention_days = int(os.getenv("BACKUP_RETENTION_DAYS", str(backup_rotation.DEFAULT_RETENTION_DAYS)))
-            keep_min = int(os.getenv("BACKUP_KEEP_MIN", str(backup_rotation.DEFAULT_KEEP_MIN)))
-            max_age_env = os.getenv("BACKUP_MAX_AGE_DAYS")
-            max_age = int(max_age_env) if max_age_env else None
-            backup_rotation.validate_backup_rotation_params(retention_days, keep_min, max_age)
+            backup_rotation.configured_policy()
         except ValueError as err:
             raise RuntimeError(f"Backup rotation configuration safety violation: {err}") from err
 
