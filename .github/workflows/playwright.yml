@@ -94,7 +94,7 @@ jobs:
       CONSENT_FEATURE_ENABLED: "1"
       DELIVERY_WORKER_ENABLED: "0"
       RETENTION_WORKER_ENABLED: "0"
-      DATABASE_PATH: ${{ runner.temp }}/photodoc-full-import.db
+      DATABASE_PATH: ${{ github.workspace }}/.ci-full-import.db
       PYTHONDONTWRITEBYTECODE: "1"
     steps:
     - uses: actions/checkout@v4
@@ -137,7 +137,7 @@ jobs:
       ROBOKASSA_IS_TEST: "1"
       DELIVERY_WORKER_ENABLED: "0"
       RETENTION_WORKER_ENABLED: "0"
-      DATABASE_PATH: ${{ runner.temp }}/photodoc-linux-import.db
+      DATABASE_PATH: ${{ github.workspace }}/.ci-linux-import.db
     steps:
     - uses: actions/checkout@v4
     - uses: actions/setup-python@v5

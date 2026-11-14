@@ -1,5 +1,6 @@
 """CI must collect the complete suite and keep unexpected skips visible."""
 from pathlib import Path
+import re
 
 import pytest
 import yaml
@@ -14,6 +15,13 @@ def test_full_backend_job_uses_entire_test_directory_and_release_fences():
     assert "python -m pytest tests -ra --junitxml=" in commands
     assert " -k " not in commands and "--ignore" not in commands
     assert "verify_backend_junit.py" in commands
+    # Job-level env is evaluated before a runner exists. In particular,
+    # runner.temp is valid in steps, but rejects the entire workflow here.
+    allowed_job_contexts = {"github", "inputs", "matrix", "needs", "secrets", "strategy", "vars"}
+    for job in jobs.values():
+        for value in job.get("env", {}).values():
+            contexts = set(re.findall(r"\$\{\{\s*(\w+)\.", str(value)))
+            assert contexts <= allowed_job_contexts
     assert "false &&" in jobs["publish-images"]["if"]
     deploy = yaml.safe_load((root / ".github/workflows/deploy.yml").read_text())
     assert deploy["jobs"]["deploy"]["if"] == "${{ false }}"
