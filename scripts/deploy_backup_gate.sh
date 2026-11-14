@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # PhotoDoc AI — deployment backup gate wrapper (S6-01).
+# Line endings: POSIX LF (enforced by .gitattributes).
 #
 # Decides whether a cutover may proceed. Extracted from the deployment script so
 # it can be exercised without Docker, against synthetic fixtures.
