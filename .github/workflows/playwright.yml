@@ -60,7 +60,12 @@ jobs:
       with:
         python-version: "3.11"
     - name: Install backend dependencies
-      run: pip install -r requirements.txt
+      run: |
+        if [ -f requirements.lock ]; then
+          pip install --no-cache-dir --default-timeout=100 --retries=5 --only-binary=:all: --require-hashes -r requirements.lock
+        else
+          pip install -r requirements.txt
+        fi
     - name: Install pytest and pyyaml
       run: |
         pip install pytest pyyaml
@@ -108,7 +113,15 @@ jobs:
         find tests -maxdepth 1 -name 'test_*.py' | sort
     - name: Install complete backend test dependencies
       run: |
-        python -m pip install -r requirements.txt -r ../ops/receipts/requirements.txt pytest pyyaml
+        if [ -f requirements.lock ]; then
+          python -m pip install --no-cache-dir --default-timeout=100 --retries=5 --only-binary=:all: --require-hashes -r requirements.lock
+        else
+          python -m pip install -r requirements.txt
+        fi
+        if [ -f ../ops/receipts/requirements.txt ]; then
+          python -m pip install -r ../ops/receipts/requirements.txt
+        fi
+        python -m pip install pytest pyyaml
         python -m pip check
         python -m pip freeze > backend-dependencies.txt
     - name: Run complete supported backend suite
@@ -144,7 +157,16 @@ jobs:
       with:
         python-version: "3.11"
     - name: Install Linux safety dependencies
-      run: python -m pip install -r requirements.txt -r ../ops/receipts/requirements.txt pytest pyyaml
+      run: |
+        if [ -f requirements.lock ]; then
+          python -m pip install --no-cache-dir --default-timeout=100 --retries=5 --only-binary=:all: --require-hashes -r requirements.lock
+        else
+          python -m pip install -r requirements.txt
+        fi
+        if [ -f ../ops/receipts/requirements.txt ]; then
+          python -m pip install -r ../ops/receipts/requirements.txt
+        fi
+        python -m pip install pytest pyyaml
     - name: Record exact integrated checkout without mutating its tree
       run: |
         git rev-parse HEAD
